@@ -89,9 +89,7 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
     except AttributeError:
         raise ValueError(f"Invalid log_level: {log_level_str}")
 
-    default_workdir_str = (
-        config["project"].get("default_workdir", "./work").strip()
-    )
+    default_workdir_str = config["project"].get("default_workdir", "./work").strip()
     default_workdir = Path(default_workdir_str)
 
     job_tags = []
@@ -119,16 +117,12 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
         if not agg_vector:
             raise ValueError(f"[job:{tag}] missing agg_vector")
         if not agg_vector.exists():
-            raise FileNotFoundError(
-                f"[job:{tag}] agg_vector not found: {agg_vector}"
-            )
+            raise FileNotFoundError(f"[job:{tag}] agg_vector not found: {agg_vector}")
 
         base_raster_str = job.get("base_raster", "").strip()
         base_raster = Path(base_raster_str) if base_raster_str else None
         if base_raster is not None and not base_raster.exists():
-            raise FileNotFoundError(
-                f"[job:{tag}] base_raster not found: {base_raster}"
-            )
+            raise FileNotFoundError(f"[job:{tag}] base_raster not found: {base_raster}")
 
         agg_layer = job.get("agg_layer", "").strip()
         if not agg_layer:
@@ -148,9 +142,7 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
         ops_raw = job.get("operations", "").strip()
         if not ops_raw:
             raise ValueError(f"[job:{tag}] missing operations")
-        operations = [
-            o.strip().lower() for o in ops_raw.split(",") if o.strip()
-        ]
+        operations = [o.strip().lower() for o in ops_raw.split(",") if o.strip()]
         if not operations:
             raise ValueError(f"[job:{tag}] operations is empty")
 
@@ -238,9 +230,7 @@ def run_zonal_stats_job(
         elif vector_layer.crs:
             vector_layer_crs = CRS.from_user_input(vector_layer.crs)
 
-        raster_dataset_crs = (
-            CRS.from_user_input(raster_crs) if raster_crs else None
-        )
+        raster_dataset_crs = CRS.from_user_input(raster_crs) if raster_crs else None
 
         geometry_transformer = None
         if (
@@ -277,9 +267,7 @@ def run_zonal_stats_job(
             shapely_geometry = shape(feature_geometry)
 
             if geometry_transformer is not None:
-                shapely_geometry = shapely_transform(
-                    reproject_xy, shapely_geometry
-                )
+                shapely_geometry = shapely_transform(reproject_xy, shapely_geometry)
 
             shapely_geometry = shapely_geometry.simplify(
                 geometry_simplify_tolerance,
@@ -322,22 +310,16 @@ def run_zonal_stats_job(
     }
 
     normalized_operations = [
-        operation.strip().lower()
-        for operation in operations
-        if operation.strip()
+        operation.strip().lower() for operation in operations if operation.strip()
     ]
 
     if "count" in normalized_operations:
         for zone_id in range(1, max_zone_id + 1):
-            per_zone_results[zone_id]["count"] = float(
-                per_zone_pixel_counts[zone_id]
-            )
+            per_zone_results[zone_id]["count"] = float(per_zone_pixel_counts[zone_id])
 
     if "sum" in normalized_operations:
         for zone_id in range(1, max_zone_id + 1):
-            per_zone_results[zone_id]["sum"] = float(
-                per_zone_value_sums[zone_id]
-            )
+            per_zone_results[zone_id]["sum"] = float(per_zone_value_sums[zone_id])
 
     if "avg" in normalized_operations:
         for zone_id in range(1, max_zone_id + 1):
@@ -374,25 +356,19 @@ def run_zonal_stats_job(
         if "min" in normalized_operations:
             for zone_id, zone_values in per_zone_value_arrays.items():
                 per_zone_results[zone_id]["min"] = (
-                    float(np.min(zone_values))
-                    if zone_values.size
-                    else float("nan")
+                    float(np.min(zone_values)) if zone_values.size else float("nan")
                 )
 
         if "max" in normalized_operations:
             for zone_id, zone_values in per_zone_value_arrays.items():
                 per_zone_results[zone_id]["max"] = (
-                    float(np.max(zone_values))
-                    if zone_values.size
-                    else float("nan")
+                    float(np.max(zone_values)) if zone_values.size else float("nan")
                 )
 
         if "median" in normalized_operations:
             for zone_id, zone_values in per_zone_value_arrays.items():
                 per_zone_results[zone_id]["median"] = (
-                    float(np.median(zone_values))
-                    if zone_values.size
-                    else float("nan")
+                    float(np.median(zone_values)) if zone_values.size else float("nan")
                 )
 
         if "stdev" in normalized_operations:
@@ -420,17 +396,13 @@ def run_zonal_stats_job(
             for zone_id, zone_values in per_zone_value_arrays.items():
                 if not zone_values.size:
                     for percentile_operation in requested_percentile_operations:
-                        per_zone_results[zone_id][percentile_operation] = float(
-                            "nan"
-                        )
+                        per_zone_results[zone_id][percentile_operation] = float("nan")
                     continue
                 for percentile_operation in requested_percentile_operations:
                     per_zone_results[zone_id][percentile_operation] = float(
                         np.percentile(
                             zone_values,
-                            percentile_name_to_percent_value[
-                                percentile_operation
-                            ],
+                            percentile_name_to_percent_value[percentile_operation],
                         )
                     )
 
@@ -441,13 +413,9 @@ def run_zonal_stats_job(
         csv_writer = csv.DictWriter(output_file, fieldnames=output_csv_columns)
         csv_writer.writeheader()
         for zone_id in range(1, max_zone_id + 1):
-            output_row = {
-                output_group_field_name: zone_id_to_zone_value[zone_id]
-            }
+            output_row = {output_group_field_name: zone_id_to_zone_value[zone_id]}
             for operation in normalized_operations:
-                operation_value = per_zone_results[zone_id].get(
-                    operation, float("nan")
-                )
+                operation_value = per_zone_results[zone_id].get(operation, float("nan"))
                 if isinstance(operation_value, float) and (
                     math.isnan(operation_value) or math.isinf(operation_value)
                 ):
