@@ -1,0 +1,9 @@
+numpy
+scipy
+shapely
+rtree
+psutil
+numexpr
+cython
+retrying
+PYyaml
