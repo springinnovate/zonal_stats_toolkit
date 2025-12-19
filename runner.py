@@ -5,6 +5,7 @@ import csv
 import logging
 import math
 
+from ecoshard import taskgraph
 from pyproj import CRS, Transformer
 from rasterio.features import rasterize
 from shapely.geometry import shape, mapping
@@ -12,6 +13,7 @@ from shapely.ops import transform as shapely_transform
 import fiona
 import numpy as np
 import rasterio
+
 
 VALID_OPERATIONS = {
     "avg",
@@ -173,7 +175,7 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                     f'[job:{tag}] agg_field "{agg_field}" not found in layer "{agg_layer}" of {agg_vector}. '
                     f"Available fields: {sorted(props.keys())}"
                 )
-        outdir = global_output_dir / Path(tag)
+        outdir = global_output_dir
         workdir = global_work_dir / Path(tag)
         outdir.mkdir(parents=True, exist_ok=True)
         workdir.mkdir(parents=True, exist_ok=True)
@@ -184,7 +186,7 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                 "agg_vector": agg_vector,
                 "agg_layer": agg_layer,
                 "agg_field": agg_field,
-                "base_raster_list": base_raster_path_list,
+                "base_raster_path_list": base_raster_path_list,
                 "operations": operations,
                 "workdir": workdir,
                 "output_csv": outdir / f"{tag}.csv",
@@ -201,20 +203,17 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
     }
 
 
-def run_zonal_stats_job(
-    base_raster: Path,
+def _collect_valid_zone_values_for_raster(
+    raster_path: Path,
     agg_vector: Path,
     agg_layer: str,
     agg_field: str,
-    operations: list[str],
-    output_csv: Path,
-    workdir: Path,
-) -> None:
-    """ """
-    workdir.mkdir(parents=True, exist_ok=True)
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-
-    with rasterio.open(base_raster) as raster_dataset:
+    zone_value_to_zone_id: dict[str, int],
+    zone_id_to_zone_value: dict[int, str],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    logger = logging.getLogger(__name__)
+    logger.info("opening raster %s", raster_path)
+    with rasterio.open(raster_path) as raster_dataset:
         raster_band_array = raster_dataset.read(1)
         raster_transform = raster_dataset.transform
         raster_nodata_value = raster_dataset.nodata
@@ -223,16 +222,17 @@ def run_zonal_stats_job(
     pixel_width = abs(raster_transform.a)
     pixel_height = abs(raster_transform.e)
     geometry_simplify_tolerance = 0.5 * max(pixel_width, pixel_height)
+    logger.info(
+        "raster loaded (width=%d, height=%d, nodata=%s, simplify_tol=%f)",
+        raster_band_array.shape[1],
+        raster_band_array.shape[0],
+        str(raster_nodata_value),
+        geometry_simplify_tolerance,
+    )
 
-    if raster_nodata_value is None:
-        raster_valid_data_mask = np.ones(raster_band_array.shape, dtype=bool)
-    else:
-        raster_valid_data_mask = raster_band_array != raster_nodata_value
+    shapes_with_zone_ids: list[tuple[dict, int]] = []
 
-    zone_value_to_zone_id: dict[str, int] = {}
-    zone_id_to_zone_value: dict[int, str] = {}
-    rasterize_shapes_with_zone_ids: list[tuple[dict, int]] = []
-
+    logger.info("opening vector %s (layer=%s)", agg_vector, agg_layer or "<first>")
     with fiona.open(agg_vector, layer=agg_layer) as vector_layer:
         vector_layer_crs = None
         if vector_layer.crs_wkt:
@@ -248,19 +248,36 @@ def run_zonal_stats_job(
             and raster_dataset_crs
             and vector_layer_crs != raster_dataset_crs
         ):
+            logger.info(
+                "reprojecting vector from %s to %s",
+                vector_layer_crs.to_string(),
+                raster_dataset_crs.to_string(),
+            )
             geometry_transformer = Transformer.from_crs(
                 vector_layer_crs,
                 raster_dataset_crs,
                 always_xy=True,
             )
+        else:
+            logger.info("no reprojection needed (vector and raster CRS compatible)")
 
         def reproject_xy(x, y, z=None):
             return geometry_transformer.transform(x, y)
 
+        feature_count = 0
+        used_feature_count = 0
         for feature in vector_layer:
+            feature_count += 1
+            logger.info("processed %d features so far", feature_count)
+
             feature_properties = feature.get("properties") or {}
             zone_value = feature_properties.get(agg_field)
             if zone_value is None:
+                logger.debug(
+                    'feature %d skipped: missing agg_field "%s"',
+                    feature_count,
+                    agg_field,
+                )
                 continue
 
             zone_value_string = str(zone_value)
@@ -269,9 +286,19 @@ def run_zonal_stats_job(
                 zone_id = len(zone_value_to_zone_id) + 1
                 zone_value_to_zone_id[zone_value_string] = zone_id
                 zone_id_to_zone_value[zone_id] = zone_value_string
+                logger.debug(
+                    'created new zone_id=%d for value="%s"',
+                    zone_id,
+                    zone_value_string,
+                )
 
             feature_geometry = feature.get("geometry")
             if not feature_geometry:
+                logger.debug(
+                    "feature %d (zone_id=%d) skipped: no geometry",
+                    feature_count,
+                    zone_id,
+                )
                 continue
 
             shapely_geometry = shape(feature_geometry)
@@ -284,20 +311,53 @@ def run_zonal_stats_job(
                 preserve_topology=True,
             )
 
-            if not shapely_geometry.is_empty:
-                rasterize_shapes_with_zone_ids.append(
-                    (mapping(shapely_geometry), zone_id)
+            if shapely_geometry.is_empty:
+                logger.debug(
+                    "feature %d (zone_id=%d) skipped: geometry empty after simplify",
+                    feature_count,
+                    zone_id,
                 )
+                continue
 
+            shapes_with_zone_ids.append((mapping(shapely_geometry), zone_id))
+            used_feature_count += 1
+
+    logger.info(
+        "vector processed: %d features read, %d geometries used after simplify",
+        feature_count,
+        used_feature_count,
+    )
+
+    if not shapes_with_zone_ids:
+        logger.info("no geometries to rasterize; returning empty arrays")
+        return (
+            np.array([], dtype=np.int64),
+            np.array([], dtype=np.int64),
+            np.array([], dtype=np.float64),
+        )
+
+    logger.info(
+        "rasterizing %d geometries to zone-id raster", len(shapes_with_zone_ids)
+    )
     zone_id_raster = rasterize(
-        shapes=rasterize_shapes_with_zone_ids,
+        shapes=shapes_with_zone_ids,
         out_shape=raster_band_array.shape,
         transform=raster_transform,
         fill=0,
         dtype="int32",
         all_touched=False,
     )
-    valid_zone_and_data_mask = (zone_id_raster > 0) & raster_valid_data_mask
+
+    if raster_nodata_value is None:
+        valid_zone_and_data_mask = zone_id_raster > 0
+    else:
+        valid_zone_and_data_mask = (zone_id_raster > 0) & (
+            raster_band_array != raster_nodata_value
+        )
+
+    zone_pixel_mask = zone_id_raster > 0
+
+    all_zone_ids = zone_id_raster[zone_pixel_mask].astype(np.int64, copy=False)
     valid_zone_ids = zone_id_raster[valid_zone_and_data_mask].astype(
         np.int64, copy=False
     )
@@ -305,9 +365,62 @@ def run_zonal_stats_job(
         np.float64, copy=False
     )
 
+    logger.info(
+        "zonal mask stats: total_zoned_pixels=%d, valid_zoned_pixels=%d",
+        int(all_zone_ids.size),
+        int(valid_zone_ids.size),
+    )
+
+    return all_zone_ids, valid_zone_ids, valid_raster_values
+
+
+def run_zonal_stats_job(
+    base_raster_path_list: list[Path],
+    agg_vector: Path,
+    agg_layer: str,
+    agg_field: str,
+    operations: list[str],
+    output_csv: Path,
+    workdir: Path,
+    tag: str,
+) -> None:
+    workdir.mkdir(parents=True, exist_ok=True)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    zone_value_to_zone_id: dict[str, int] = {}
+    zone_id_to_zone_value: dict[int, str] = {}
+
+    all_valid_zone_ids: list[np.ndarray] = []
+    all_valid_raster_values: list[np.ndarray] = []
+
+    for raster_path in base_raster_path_list:
+        (
+            all_zone_ids,
+            valid_zone_ids,
+            valid_raster_values,
+        ) = _collect_valid_zone_values_for_raster(
+            raster_path,
+            agg_vector,
+            agg_layer,
+            agg_field,
+            zone_value_to_zone_id,
+            zone_id_to_zone_value,
+        )
+        if valid_zone_ids.size:
+            all_valid_zone_ids.append(valid_zone_ids)
+            all_valid_raster_values.append(valid_raster_values)
+
+    if all_valid_zone_ids:
+        valid_zone_ids = np.concatenate(all_valid_zone_ids)
+        valid_raster_values = np.concatenate(all_valid_raster_values)
+    else:
+        valid_zone_ids = np.array([], dtype=np.int64)
+        valid_raster_values = np.array([], dtype=np.float64)
+
     max_zone_id = len(zone_value_to_zone_id)
     per_zone_pixel_counts = np.bincount(
-        valid_zone_ids, minlength=max_zone_id + 1
+        valid_zone_ids,
+        minlength=max_zone_id + 1,
     ).astype(np.int64, copy=False)
     per_zone_value_sums = np.bincount(
         valid_zone_ids,
@@ -323,9 +436,34 @@ def run_zonal_stats_job(
         operation.strip().lower() for operation in operations if operation.strip()
     ]
 
-    if "count" in normalized_operations:
+    percentile_operations: dict[str, int] = {}
+    for operation in normalized_operations:
+        if operation.startswith("p") and operation[1:].isdigit():
+            percentile_value = int(operation[1:])
+            if 0 <= percentile_value <= 100:
+                percentile_operations[operation] = percentile_value
+
+    total_zone_pixel_counts = np.bincount(
+        all_zone_ids,
+        minlength=max_zone_id + 1,
+    ).astype(np.int64, copy=False)
+
+    valid_zone_pixel_counts = np.bincount(
+        valid_zone_ids,
+        minlength=max_zone_id + 1,
+    ).astype(np.int64, copy=False)
+
+    if "valid_count" in normalized_operations:
         for zone_id in range(1, max_zone_id + 1):
-            per_zone_results[zone_id]["count"] = float(per_zone_pixel_counts[zone_id])
+            per_zone_results[zone_id]["valid_count"] = float(
+                valid_zone_pixel_counts[zone_id]
+            )
+
+    if "total_count" in normalized_operations:
+        for zone_id in range(1, max_zone_id + 1):
+            per_zone_results[zone_id]["total_count"] = float(
+                total_zone_pixel_counts[zone_id]
+            )
 
     if "sum" in normalized_operations:
         for zone_id in range(1, max_zone_id + 1):
@@ -342,19 +480,8 @@ def run_zonal_stats_job(
 
     operations_requiring_per_zone_value_arrays = any(
         operation in normalized_operations
-        for operation in (
-            "min",
-            "max",
-            "stdev",
-            "median",
-            "p05",
-            "p10",
-            "p25",
-            "p75",
-            "p90",
-            "p95",
-        )
-    )
+        for operation in ("min", "max", "stdev", "median")
+    ) or bool(percentile_operations)
 
     if operations_requiring_per_zone_value_arrays:
         per_zone_value_arrays: dict[int, np.ndarray] = {}
@@ -389,31 +516,18 @@ def run_zonal_stats_job(
                     else float("nan")
                 )
 
-        percentile_name_to_percent_value = {
-            "p05": 5,
-            "p10": 10,
-            "p25": 25,
-            "p75": 75,
-            "p90": 90,
-            "p95": 95,
-        }
-        requested_percentile_operations = [
-            operation
-            for operation in normalized_operations
-            if operation in percentile_name_to_percent_value
-        ]
-        if requested_percentile_operations:
+        if percentile_operations:
             for zone_id, zone_values in per_zone_value_arrays.items():
                 if not zone_values.size:
-                    for percentile_operation in requested_percentile_operations:
+                    for percentile_operation in percentile_operations:
                         per_zone_results[zone_id][percentile_operation] = float("nan")
                     continue
-                for percentile_operation in requested_percentile_operations:
+                for (
+                    percentile_operation,
+                    percentile_value,
+                ) in percentile_operations.items():
                     per_zone_results[zone_id][percentile_operation] = float(
-                        np.percentile(
-                            zone_values,
-                            percentile_name_to_percent_value[percentile_operation],
-                        )
+                        np.percentile(zone_values, percentile_value)
                     )
 
     output_group_field_name = agg_field
@@ -455,13 +569,18 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d: %(message)s",
     )
     logger = logging.getLogger(cfg["project"]["name"])
-
     logger.info("Loaded config %s", str(cfg_path))
+    task_graph = taskgraph.TaskGraph(cfg["project"]["global_work_dir"], -1)
     for job in cfg["job_list"]:
         logger.info(
             "Validated job:%s (operations=%s)",
             job["tag"],
             ",".join(job["operations"]),
+        )
+        task_graph.add_task(
+            func=run_zonal_stats_job(**job),
+            target_path_list=[job["output_csv"]],
+            task_name=f"zonal stats {job['tag']}",
         )
     logger.info("All jobs validated (%d)", len(cfg["job_list"]))
 
