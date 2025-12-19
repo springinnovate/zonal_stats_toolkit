@@ -7,3 +7,4 @@ numexpr
 cython
 retrying
 PYyaml
+tqdm

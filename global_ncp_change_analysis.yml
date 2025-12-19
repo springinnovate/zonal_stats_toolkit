@@ -9,5 +9,5 @@ agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_corresponden
 agg_field = nev_name
 operations = avg,stdev,valid_count,total_count,p5,p95
 row_col_order=agg_field,raster_base
-base_raster_pattern=./jeronimodata/global_n_export_ESAmar_1992_fertilizer_current_valid_md5_f4b421_10x.tif
+base_raster_pattern=./jeronimodata/*.tif
 #./jeronimodata/Spring/Inspring/*.tif,./jeronimodata/change_calc/*.tif
