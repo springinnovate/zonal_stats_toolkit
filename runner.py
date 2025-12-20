@@ -19,8 +19,8 @@ import numpy as np
 import rasterio
 from shapely.geometry import box
 from shapely.strtree import STRtree
-from rasterio.windows import bounds as window_bounds
-
+from rasterio.windows import bounds as window_bounds, Window
+from shapely import make_valid
 
 logger = logging.getLogger(__name__)
 
@@ -51,73 +51,89 @@ def collect_zone_arrays_windowed(
     shapely_geometries = [
         shape(geom_mapping) for geom_mapping, _ in shapes_with_zone_ids
     ]
-    geometry_id_to_zone_id = {
-        id(geom): zone_id
-        for geom, (_, zone_id) in zip(shapely_geometries, shapes_with_zone_ids)
-    }
+    zone_id_list = [zone_id for _, zone_id in shapes_with_zone_ids]
     spatial_index = STRtree(shapely_geometries)
 
     all_zone_ids_list: list[np.ndarray] = []
     valid_zone_ids_list: list[np.ndarray] = []
     valid_raster_values_list: list[np.ndarray] = []
 
-    total_windows = sum(1 for _ in raster_dataset.block_windows(1))
-    logger.info("windowed rasterization: %d windows", total_windows)
+    shapely_geometries = [make_valid(g) for g in shapely_geometries]
+    shapes_mappings = [mapping(g) for g in shapely_geometries]
+    block_h, block_w = raster_dataset.block_shapes[0]
+    H, W = raster_dataset.height, raster_dataset.width
 
-    for _, window in tqdm(
-        raster_dataset.block_windows(1),
-        total=total_windows,
-        desc="raster windows",
-    ):
-        window_transform = rasterio.windows.transform(window, raster_dataset.transform)
-        window_minx, window_miny, window_maxx, window_maxy = window_bounds(
-            window, raster_dataset.transform
-        )
-        window_bbox = box(window_minx, window_miny, window_maxx, window_maxy)
+    block_rows = 10
+    block_cols = 10
 
-        candidate_geometries = spatial_index.query(window_bbox)
-        if not candidate_geometries:
-            continue
+    step_h = block_h * block_rows
+    step_w = block_w * block_cols
 
-        candidate_shapes = [
-            (
-                mapping(candidate_geometry),
-                geometry_id_to_zone_id[id(candidate_geometry)],
+    total_windows = ((H + step_h - 1) // step_h) * ((W + step_w - 1) // step_w)
+    pbar = tqdm(total=total_windows, desc="raster windows")
+    for row_off in range(0, H, step_h):
+        for col_off in range(0, W, step_w):
+            h = min(step_h, H - row_off)
+            w = min(step_w, W - col_off)
+            window = Window(col_off=col_off, row_off=row_off, width=w, height=h)
+
+            window_transform = rasterio.windows.transform(
+                window, raster_dataset.transform
             )
-            for candidate_geometry in candidate_geometries
-        ]
-
-        zone_id_window = rasterize(
-            shapes=candidate_shapes,
-            out_shape=(window.height, window.width),
-            transform=window_transform,
-            fill=0,
-            dtype="int32",
-            all_touched=False,
-        )
-
-        zone_pixel_mask = zone_id_window > 0
-        if not np.any(zone_pixel_mask):
-            continue
-
-        raster_window_values = raster_dataset.read(1, window=window)
-
-        all_zone_ids_list.append(
-            zone_id_window[zone_pixel_mask].astype(np.int64, copy=False)
-        )
-
-        if raster_nodata_value is None:
-            valid_mask = zone_pixel_mask
-        else:
-            valid_mask = zone_pixel_mask & (raster_window_values != raster_nodata_value)
-
-        if np.any(valid_mask):
-            valid_zone_ids_list.append(
-                zone_id_window[valid_mask].astype(np.int64, copy=False)
+            window_minx, window_miny, window_maxx, window_maxy = window_bounds(
+                window, raster_dataset.transform
             )
-            valid_raster_values_list.append(
-                raster_window_values[valid_mask].astype(np.float64, copy=False)
+            window_bbox = box(window_minx, window_miny, window_maxx, window_maxy)
+
+            candidate_indexes = spatial_index.query(window_bbox)
+            if candidate_indexes is None or len(candidate_indexes) == 0:
+                pbar.update(1)
+                continue
+
+            candidate_shapes = []
+            for i in candidate_indexes:
+                if shapely_geometries[i].intersects(window_bbox):
+                    candidate_shapes.append((shapes_mappings[i], zone_id_list[i]))
+
+            if not candidate_shapes:
+                pbar.update(1)
+                continue
+
+            zone_id_window = rasterize(
+                shapes=candidate_shapes,
+                out_shape=(int(window.height), int(window.width)),
+                transform=window_transform,
+                fill=0,
+                dtype="int32",
+                all_touched=False,
             )
+
+            zone_pixel_mask = zone_id_window > 0
+            if not np.any(zone_pixel_mask):
+                pbar.update(1)
+                continue
+
+            raster_window_values = raster_dataset.read(1, window=window)
+
+            all_zone_ids_list.append(
+                zone_id_window[zone_pixel_mask].astype(np.int64, copy=False)
+            )
+
+            if raster_nodata_value is None:
+                valid_mask = zone_pixel_mask
+            else:
+                valid_mask = zone_pixel_mask & (
+                    raster_window_values != raster_nodata_value
+                )
+
+            if np.any(valid_mask):
+                valid_zone_ids_list.append(
+                    zone_id_window[valid_mask].astype(np.int64, copy=False)
+                )
+                valid_raster_values_list.append(
+                    raster_window_values[valid_mask].astype(np.float64, copy=False)
+                )
+            pbar.update(1)
 
     all_zone_ids = (
         np.concatenate(all_zone_ids_list)
@@ -451,7 +467,7 @@ def _collect_valid_zone_values_for_raster(
 
             return record_index, mapping(shapely_geometry), zone_id
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=64) as executor:
             futures = [
                 executor.submit(process_record, record) for record in feature_records
             ]
