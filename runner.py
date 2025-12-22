@@ -268,7 +268,6 @@ def fast_zonal_statistics(
     aggregate_vector_field,
     aggregate_layer_name=None,
     ignore_nodata=True,
-    polygons_might_overlap=True,
     working_dir=None,
     clean_working_dir=True,
     percentile_list=None,
@@ -276,14 +275,13 @@ def fast_zonal_statistics(
     raster_path, raster_band_index = base_raster_path_band
 
     logger.info(
-        "fast_zonal_statistics start | raster=%s band=%s | vector=%s layer=%s field=%s | ignore_nodata=%s overlap=%s | working_dir=%s clean=%s | percentiles=%s",
+        "fast_zonal_statistics start | raster=%s band=%s | vector=%s layer=%s field=%s | ignore_nodata=%s | working_dir=%s clean=%s | percentiles=%s",
         raster_path,
         raster_band_index,
         str(aggregate_vector_path),
         aggregate_layer_name,
         aggregate_vector_field,
         ignore_nodata,
-        polygons_might_overlap,
         working_dir,
         clean_working_dir,
         percentile_list,
@@ -324,14 +322,30 @@ def fast_zonal_statistics(
         "sumsq": 0.0,
     }
 
-    def _open_vector_layer(vector_path, layer_name, vector_label):
-        vector_dataset = gdal.OpenEx(str(vector_path), gdal.OF_VECTOR)
+    def _open_vector_layer(
+        vector_path, layer_name, vector_label, writable=False
+    ):
+        open_flags = gdal.OF_VECTOR | (gdal.OF_UPDATE if writable else 0)
+        vector_dataset = gdal.OpenEx(str(vector_path), open_flags)
+        if vector_dataset is None:
+            raise RuntimeError(
+                f"Could not open {vector_label} vector at {vector_path}"
+            )
+
         if layer_name is not None:
-            logger.info("selecting vector layer by name: %s", layer_name)
+            logger.info(
+                "selecting %s layer by name: %s", vector_label, layer_name
+            )
             vector_layer = vector_dataset.GetLayerByName(layer_name)
         else:
-            logger.info("selecting default vector layer")
+            logger.info("selecting default %s layer", vector_label)
             vector_layer = vector_dataset.GetLayer()
+
+        if vector_layer is None:
+            raise RuntimeError(
+                f"Could not open layer {layer_name} on {vector_label} vector {vector_path}"
+            )
+
         return vector_dataset, vector_layer
 
     raster_info = geoprocessing.get_raster_info(raster_path)
@@ -401,7 +415,10 @@ def fast_zonal_statistics(
         source_layer = None
 
         aggregate_vector, aggregate_layer = _open_vector_layer(
-            projected_vector_path, aggregate_layer_name, "projected"
+            projected_vector_path,
+            aggregate_layer_name,
+            "projected",
+            writable=True,
         )
 
         logger.info(
@@ -477,6 +494,22 @@ def fast_zonal_statistics(
             raster_band_index,
         )
 
+        # we need to put an 'fid' code into the vector because otherwise we are
+        # not guarnateed to have one
+        local_aggregate_field_name = "original_fid"
+        if aggregate_layer.FindFieldIndex(local_aggregate_field_name, 1) == -1:
+            aggregate_layer.CreateField(
+                ogr.FieldDefn(local_aggregate_field_name, ogr.OFTInteger)
+            )
+
+        aggregate_layer.ResetReading()
+        aggregate_layer.StartTransaction()
+        for feat in aggregate_layer:
+            feat.SetField(local_aggregate_field_name, feat.GetFID())
+            aggregate_layer.SetFeature(feat)
+        aggregate_layer.CommitTransaction()
+        aggregate_layer.ResetReading()
+
         local_aggregate_field_name = "original_fid"
         rasterize_layer_args = {
             "options": [
@@ -485,25 +518,8 @@ def fast_zonal_statistics(
             ]
         }
 
-        memory_driver = ogr.GetDriverByName("MEMORY")
-        disjoint_vector = memory_driver.CreateDataSource("disjoint_vector")
-        spatial_reference = aggregate_layer.GetSpatialRef()
-
         logger.info(
-            "building disjoint polygon sets | polygons_might_overlap=%s",
-            polygons_might_overlap,
-        )
-        if polygons_might_overlap:
-            disjoint_feature_id_sets = (
-                geoprocessing.calculate_disjoint_polygon_set(
-                    projected_vector_path, bounding_box=raster_bounding_box
-                )
-            )
-        else:
-            disjoint_feature_id_sets = [feature_id_set]
-        logger.info(
-            "disjoint sets ready | sets=%d | total_features=%d",
-            len(disjoint_feature_id_sets),
+            "disjoint sets ready total_features=%d",
             len(feature_id_set),
         )
 
@@ -514,354 +530,129 @@ def fast_zonal_statistics(
             collections.defaultdict(list) if percentile_list else None
         )
 
-        last_log_time = time.time()
-        logger.info(
-            "processing %d disjoint polygon sets", len(disjoint_feature_id_sets)
+        feature_id_raster_path = os.path.join(temp_working_dir, "agg_fid.tif")
+        feature_id_raster_nodata = -1
+        logger.info("creating agg fid raster: %s", feature_id_raster_path)
+        geoprocessing.new_raster_from_base(
+            raster_path_for_stats,
+            feature_id_raster_path,
+            gdal.GDT_Int32,
+            [feature_id_raster_nodata],
         )
-        for set_index, disjoint_feature_id_set in enumerate(
-            disjoint_feature_id_sets
-        ):
-            logger.info(
-                "set %d/%d start | polygons_in_set=%d",
-                set_index + 1,
-                len(disjoint_feature_id_sets),
-                len(disjoint_feature_id_set),
-            )
 
-            last_log_time = _invoke_timed_callback(
-                last_log_time,
-                lambda: logger.info(
-                    "zonal stats approximately %.1f%% complete on %s",
+        feature_id_raster_offsets = list(
+            geoprocessing.iterblocks(
+                (feature_id_raster_path, 1), offset_only=True
+            )
+        )
+        logger.info(
+            "iterblocks prepared | blocks=%d",
+            len(feature_id_raster_offsets),
+        )
+
+        feature_id_raster_dataset = gdal.OpenEx(
+            feature_id_raster_path, gdal.GA_Update | gdal.OF_RASTER
+        )
+        feature_id_raster_band = feature_id_raster_dataset.GetRasterBand(1)
+
+        logger.info("populating disjoint layer features (transaction start)")
+        logger.info(
+            "populating disjoint layer features done (transaction commit)"
+        )
+
+        rasterize_callback_message = "rasterizing polygons %.1f%% complete %s"
+        rasterize_callback = _make_logger_callback(rasterize_callback_message)
+
+        logger.info("rasterize start")
+        aggregate_layer.ResetReading()
+        gdal.RasterizeLayer(
+            feature_id_raster_dataset,
+            [1],
+            aggregate_layer,
+            callback=rasterize_callback,
+            **rasterize_layer_args,
+        )
+        feature_id_raster_dataset.FlushCache()
+        logger.info("rasterize done")
+
+        logger.info("gathering stats from raster blocks")
+        block_log_time = time.time()
+        for block_index, feature_id_offset in enumerate(
+            feature_id_raster_offsets
+        ):
+            block_log_time = _invoke_timed_callback(
+                block_log_time,
+                lambda block_index_value=block_index: logger.info(
+                    "block processing | %.1f%% (%d/%d blocks)",
                     100.0
-                    * float(set_index + 1)
-                    / len(disjoint_feature_id_sets),
-                    os.path.basename(projected_vector_path),
+                    * float(block_index_value + 1)
+                    / len(feature_id_raster_offsets),
+                    block_index_value + 1,
+                    len(feature_id_raster_offsets),
                 ),
                 _LOGGING_PERIOD,
             )
 
-            feature_id_raster_path = os.path.join(
-                temp_working_dir, f"agg_fid_{set_index}.tif"
+            feature_id_block = feature_id_raster_band.ReadAsArray(
+                **feature_id_offset
             )
-            feature_id_raster_nodata = -1
-            logger.info("creating agg fid raster: %s", feature_id_raster_path)
-            geoprocessing.new_raster_from_base(
-                raster_path_for_stats,
-                feature_id_raster_path,
-                gdal.GDT_Int32,
-                [feature_id_raster_nodata],
-            )
+            raster_value_block = raster_band.ReadAsArray(**feature_id_offset)
 
-            feature_id_raster_offsets = list(
-                geoprocessing.iterblocks(
-                    (feature_id_raster_path, 1), offset_only=True
-                )
-            )
-            logger.info(
-                "iterblocks prepared | blocks=%d",
-                len(feature_id_raster_offsets),
-            )
-
-            feature_id_raster_dataset = gdal.OpenEx(
-                feature_id_raster_path, gdal.GA_Update | gdal.OF_RASTER
-            )
-            feature_id_raster_band = feature_id_raster_dataset.GetRasterBand(1)
-
-            disjoint_layer = disjoint_vector.CreateLayer(
-                "disjoint_vector", spatial_reference, ogr.wkbPolygon
-            )
-            disjoint_layer.CreateField(
-                ogr.FieldDefn(local_aggregate_field_name, ogr.OFTInteger)
-            )
-            disjoint_layer_definition = disjoint_layer.GetLayerDefn()
-
-            logger.info(
-                "populating disjoint layer features (transaction start)"
-            )
-            disjoint_layer.StartTransaction()
-            for feature_index, feature_id in enumerate(disjoint_feature_id_set):
-                last_log_time = _invoke_timed_callback(
-                    last_log_time,
-                    lambda feature_index_value=feature_index: logger.info(
-                        "polygon set %d/%d approximately %.1f%% processed on %s",
-                        set_index + 1,
-                        len(disjoint_feature_id_sets),
-                        100.0
-                        * float(feature_index_value + 1)
-                        / len(disjoint_feature_id_set),
-                        os.path.basename(projected_vector_path),
-                    ),
-                    _LOGGING_PERIOD,
-                )
-
-                aggregate_feature = aggregate_layer.GetFeature(feature_id)
-                aggregate_geometry_ref = aggregate_feature.GetGeometryRef()
-
-                disjoint_feature = ogr.Feature(disjoint_layer_definition)
-                disjoint_feature.SetGeometry(aggregate_geometry_ref.Clone())
-                disjoint_feature.SetField(
-                    local_aggregate_field_name, feature_id
-                )
-                disjoint_layer.CreateFeature(disjoint_feature)
-
-            disjoint_layer.CommitTransaction()
-            logger.info(
-                "populating disjoint layer features done (transaction commit)"
-            )
-
-            rasterize_callback_message = (
-                f"rasterizing polygon {set_index + 1} of {len(disjoint_feature_id_set)} "
-                f"set %.1f%% complete %s"
-            )
-            rasterize_callback = _make_logger_callback(
-                rasterize_callback_message
-            )
-
-            logger.info(
-                "rasterize start | set %d/%d",
-                set_index + 1,
-                len(disjoint_feature_id_sets),
-            )
-            gdal.RasterizeLayer(
-                feature_id_raster_dataset,
-                [1],
-                disjoint_layer,
-                callback=rasterize_callback,
-                **rasterize_layer_args,
-            )
-            feature_id_raster_dataset.FlushCache()
-            logger.info(
-                "rasterize done | set %d/%d",
-                set_index + 1,
-                len(disjoint_feature_id_sets),
-            )
-
-            disjoint_layer = None
-            disjoint_vector.DeleteLayer(0)
-
-            logger.info(
-                "gathering stats from raster blocks | set %d/%d",
-                set_index + 1,
-                len(disjoint_feature_id_sets),
-            )
-            block_log_time = time.time()
-            for block_index, feature_id_offset in enumerate(
-                feature_id_raster_offsets
-            ):
-                block_log_time = _invoke_timed_callback(
-                    block_log_time,
-                    lambda block_index_value=block_index: logger.info(
-                        "block processing | set %d/%d | %.1f%% (%d/%d blocks)",
-                        set_index + 1,
-                        len(disjoint_feature_id_sets),
-                        100.0
-                        * float(block_index_value + 1)
-                        / len(feature_id_raster_offsets),
-                        block_index_value + 1,
-                        len(feature_id_raster_offsets),
-                    ),
-                    _LOGGING_PERIOD,
-                )
-
-                feature_id_block = feature_id_raster_band.ReadAsArray(
-                    **feature_id_offset
-                )
-                raster_value_block = raster_band.ReadAsArray(
-                    **feature_id_offset
-                )
-
-                in_polygon_mask = feature_id_block != feature_id_raster_nodata
-                if not np.any(in_polygon_mask):
-                    continue
-
-                block_feature_ids = feature_id_block[in_polygon_mask]
-                block_raster_values = raster_value_block[in_polygon_mask]
-
-                for feature_id in np.unique(block_feature_ids):
-                    feature_values = block_raster_values[
-                        block_feature_ids == feature_id
-                    ]
-                    total_count = feature_values.size
-                    if total_count == 0:
-                        continue
-
-                    feature_nodata_mask = _raster_nodata_mask(feature_values)
-                    nodata_count = int(np.count_nonzero(feature_nodata_mask))
-
-                    feature_stats = feature_stats_by_id[feature_id]
-                    feature_stats["count"] += total_count
-                    feature_stats["nodata_count"] += nodata_count
-
-                    if ignore_nodata:
-                        feature_values = feature_values[~feature_nodata_mask]
-                    if feature_values.size == 0:
-                        continue
-
-                    if group_value_chunks is not None:
-                        group_value = feature_id_to_group_value[feature_id]
-                        group_value_chunks[group_value].append(
-                            feature_values.astype(np.float32, copy=False)
-                        )
-
-                    block_min_value = np.min(feature_values)
-                    block_max_value = np.max(feature_values)
-                    if feature_stats["min"] is None:
-                        feature_stats["min"] = block_min_value
-                        feature_stats["max"] = block_max_value
-                    else:
-                        feature_stats["min"] = min(
-                            feature_stats["min"], block_min_value
-                        )
-                        feature_stats["max"] = max(
-                            feature_stats["max"], block_max_value
-                        )
-
-                    feature_stats["sum"] += np.sum(feature_values)
-                    feature_stats["sumsq"] += np.sum(
-                        feature_values * feature_values, dtype=np.float64
-                    )
-
-            logger.info(
-                "set %d/%d done | fids_with_any_stats_so_far=%d",
-                set_index + 1,
-                len(disjoint_feature_id_sets),
-                len(feature_stats_by_id),
-            )
-
-            feature_id_raster_band = None
-            feature_id_raster_dataset = None
-
-        unset_feature_ids = feature_id_set.difference(feature_stats_by_id)
-        logger.info(
-            "unset fid pass start | unset_fids=%d", len(unset_feature_ids)
-        )
-
-        # Fallback for polygons that did not rasterize any pixels: sample the raster window
-        # of each polygon's envelope so every feature can contribute stats to its group.
-        raster_geotransform = np.array(
-            raster_dataset.GetGeoTransform(), dtype=np.float32
-        )
-        for unset_feature_id in unset_feature_ids:
-            unset_feature = aggregate_layer.GetFeature(unset_feature_id)
-            unset_geometry_ref = unset_feature.GetGeometryRef()
-            if unset_geometry_ref is None:
-                logger.warning(
-                    "no geometry in %s FID: %s",
-                    projected_vector_path,
-                    unset_feature_id,
-                )
+            in_polygon_mask = feature_id_block != feature_id_raster_nodata
+            if not np.any(in_polygon_mask):
                 continue
 
-            shapely_geometry = shapely.wkb.loads(
-                bytes(unset_geometry_ref.ExportToWkb())
-            )
-            try:
-                shapely_geometry_parts = list(shapely_geometry)
-            except TypeError:
-                shapely_geometry_parts = [shapely_geometry]
-            unset_geometry_ref = None
+            block_feature_ids = feature_id_block[in_polygon_mask]
+            block_raster_values = raster_value_block[in_polygon_mask]
 
-            for shapely_part_geometry in shapely_geometry_parts:
-                ogr_geometry = ogr.CreateGeometryFromWkt(
-                    shapely_part_geometry.wkt
-                )
-                geometry_envelope = list(ogr_geometry.GetEnvelope())
-                ogr_geometry = None
-
-                if raster_geotransform[1] < 0:
-                    geometry_envelope[0], geometry_envelope[1] = (
-                        geometry_envelope[1],
-                        geometry_envelope[0],
-                    )
-                if raster_geotransform[5] < 0:
-                    geometry_envelope[2], geometry_envelope[3] = (
-                        geometry_envelope[3],
-                        geometry_envelope[2],
-                    )
-
-                window_x_offset = int(
-                    (geometry_envelope[0] - raster_geotransform[0])
-                    / raster_geotransform[1]
-                )
-                window_y_offset = int(
-                    (geometry_envelope[2] - raster_geotransform[3])
-                    / raster_geotransform[5]
-                )
-
-                window_width_pixels = (
-                    int(
-                        np.ceil(
-                            (geometry_envelope[1] - raster_geotransform[0])
-                            / raster_geotransform[1]
-                        )
-                    )
-                    - window_x_offset
-                )
-                window_height_pixels = (
-                    int(
-                        np.ceil(
-                            (geometry_envelope[3] - raster_geotransform[3])
-                            / raster_geotransform[5]
-                        )
-                    )
-                    - window_y_offset
-                )
-
-                if window_x_offset < 0:
-                    window_width_pixels += window_x_offset
-                    window_x_offset = 0
-                if window_y_offset < 0:
-                    window_height_pixels += window_y_offset
-                    window_y_offset = 0
-                if window_x_offset + window_width_pixels > raster_band.XSize:
-                    window_width_pixels = raster_band.XSize - window_x_offset
-                if window_y_offset + window_height_pixels > raster_band.YSize:
-                    window_height_pixels = raster_band.YSize - window_y_offset
-                if window_width_pixels <= 0 or window_height_pixels <= 0:
+            for feature_id in np.unique(block_feature_ids):
+                feature_values = block_raster_values[
+                    block_feature_ids == feature_id
+                ]
+                total_count = feature_values.size
+                if total_count == 0:
                     continue
 
-                unset_window_values = raster_band.ReadAsArray(
-                    xoff=window_x_offset,
-                    yoff=window_y_offset,
-                    win_xsize=window_width_pixels,
-                    win_ysize=window_height_pixels,
-                )
+                feature_nodata_mask = _raster_nodata_mask(feature_values)
+                nodata_count = int(np.count_nonzero(feature_nodata_mask))
 
-                unset_window_nodata_mask = _raster_nodata_mask(
-                    unset_window_values
-                )
+                feature_stats = feature_stats_by_id[feature_id]
+                feature_stats["count"] += total_count
+                feature_stats["nodata_count"] += nodata_count
+
                 if ignore_nodata:
-                    unset_valid_values = unset_window_values[
-                        ~unset_window_nodata_mask
-                    ]
-                else:
-                    unset_valid_values = unset_window_values
+                    feature_values = feature_values[~feature_nodata_mask]
+                if feature_values.size == 0:
+                    continue
 
-                feature_stats = feature_stats_by_id[unset_feature_id]
-                feature_stats["count"] = unset_window_values.size
-                feature_stats["nodata_count"] = int(
-                    np.count_nonzero(unset_window_nodata_mask)
+                if group_value_chunks is not None:
+                    group_value = feature_id_to_group_value[feature_id]
+                    group_value_chunks[group_value].append(
+                        feature_values.astype(np.float32, copy=False)
+                    )
+
+                block_min_value = np.min(feature_values)
+                block_max_value = np.max(feature_values)
+                if feature_stats["min"] is None:
+                    feature_stats["min"] = block_min_value
+                    feature_stats["max"] = block_max_value
+                else:
+                    feature_stats["min"] = min(
+                        feature_stats["min"], block_min_value
+                    )
+                    feature_stats["max"] = max(
+                        feature_stats["max"], block_max_value
+                    )
+
+                feature_stats["sum"] += np.sum(feature_values)
+                feature_stats["sumsq"] += np.sum(
+                    feature_values * feature_values, dtype=np.float64
                 )
 
-                if unset_valid_values.size == 0:
-                    feature_stats["min"] = 0.0
-                    feature_stats["max"] = 0.0
-                    feature_stats["sum"] = 0.0
-                    feature_stats["sumsq"] = 0.0
-                else:
-                    feature_stats["min"] = np.min(unset_valid_values)
-                    feature_stats["max"] = np.max(unset_valid_values)
-                    feature_stats["sum"] = np.sum(unset_valid_values)
-                    feature_stats["sumsq"] = np.sum(
-                        unset_valid_values * unset_valid_values,
-                        dtype=np.float64,
-                    )
+        logger.info("aggregating done")
 
-                if group_value_chunks is not None and unset_valid_values.size:
-                    group_value = feature_id_to_group_value[unset_feature_id]
-                    group_value_chunks[group_value].append(
-                        unset_valid_values.astype(np.float32, copy=False)
-                    )
+        feature_id_raster_band = None
+        feature_id_raster_dataset = None
 
         remaining_unset_feature_ids = feature_id_set.difference(
             feature_stats_by_id
@@ -875,11 +666,8 @@ def fast_zonal_statistics(
             len(feature_id_set),
         )
 
-        spatial_reference = None
         raster_band = None
         raster_dataset = None
-        disjoint_layer = None
-        disjoint_vector = None
         aggregate_layer = None
 
         logger.info("grouping fid stats -> %s values", aggregate_vector_field)
@@ -1088,7 +876,6 @@ def run_fast_zonal_statistics_test_case(
     aggregate_vector_field="group_id",
     aggregate_layer_name="polys",
     ignore_nodata=True,
-    polygons_might_overlap=True,
     percentile_list=None,
     raster_nodata=None,
     pixel_size=10.0,
@@ -1320,7 +1107,6 @@ def run_fast_zonal_statistics_test_case(
             aggregate_vector_field,
             aggregate_layer_name=aggregate_layer_name,
             ignore_nodata=ignore_nodata,
-            polygons_might_overlap=polygons_might_overlap,
             working_dir=temp_dir,
             clean_working_dir=False,
             percentile_list=percentile_list,
@@ -1605,7 +1391,6 @@ def example_fast_zonal_statistics_test_case(*, fast_zonal_statistics_fn):
         aggregate_vector_field="group_id",
         aggregate_layer_name="polys",
         ignore_nodata=True,
-        polygons_might_overlap=False,
         percentile_list=[50, 90],
         raster_nodata=-9999,
         pixel_size=10.0,
