@@ -6,6 +6,7 @@ import collections
 import configparser
 import csv
 import logging
+import math
 import os
 import shutil
 import tempfile
@@ -272,10 +273,12 @@ def fast_zonal_statistics(
     clean_working_dir=True,
     percentile_list=None,
 ):
+    raster_path, raster_band_index = base_raster_path_band
+
     logger.info(
         "fast_zonal_statistics start | raster=%s band=%s | vector=%s layer=%s field=%s | ignore_nodata=%s overlap=%s | working_dir=%s clean=%s | percentiles=%s",
-        base_raster_path_band[0],
-        base_raster_path_band[1],
+        raster_path,
+        raster_band_index,
         str(aggregate_vector_path),
         aggregate_layer_name,
         aggregate_vector_field,
@@ -287,15 +290,54 @@ def fast_zonal_statistics(
     )
 
     percentile_list = [] if percentile_list is None else list(percentile_list)
-    percentile_list = sorted(set(float(p) for p in percentile_list))
+    percentile_list = sorted(
+        {float(percentile_value) for percentile_value in percentile_list}
+    )
     percentile_keys = [
-        f"p{int(p) if float(p).is_integer() else p}" for p in percentile_list
+        f"p{int(percentile_value) if percentile_value.is_integer() else percentile_value}"
+        for percentile_value in percentile_list
     ]
+    percentile_default_values = {
+        percentile_key: None for percentile_key in percentile_keys
+    }
 
-    raster_info = geoprocessing.get_raster_info(base_raster_path_band[0])
-    raster_nodata = raster_info["nodata"][base_raster_path_band[1] - 1]
-    pixel_width = abs(raster_info["pixel_size"][0])
-    tolerance = pixel_width * 0.5
+    empty_group_stats_template = {
+        "min": None,
+        "max": None,
+        "count": 0,
+        "nodata_count": 0,
+        "valid_count": 0,
+        "sum": 0.0,
+        "stdev": None,
+        **percentile_default_values,
+    }
+    grouped_stats_working_template = {
+        **empty_group_stats_template,
+        "sumsq": 0.0,
+    }
+    feature_stats_template = {
+        "min": None,
+        "max": None,
+        "count": 0,
+        "nodata_count": 0,
+        "sum": 0.0,
+        "sumsq": 0.0,
+    }
+
+    def _open_vector_layer(vector_path, layer_name, vector_label):
+        vector_dataset = gdal.OpenEx(str(vector_path), gdal.OF_VECTOR)
+        if layer_name is not None:
+            logger.info("selecting vector layer by name: %s", layer_name)
+            vector_layer = vector_dataset.GetLayerByName(layer_name)
+        else:
+            logger.info("selecting default vector layer")
+            vector_layer = vector_dataset.GetLayer()
+        return vector_dataset, vector_layer
+
+    raster_info = geoprocessing.get_raster_info(raster_path)
+    raster_nodata = raster_info["nodata"][raster_band_index - 1]
+    raster_pixel_width = abs(raster_info["pixel_size"][0])
+    simplify_tolerance = raster_pixel_width * 0.5
 
     logger.info(
         "raster loaded | nodata=%s | pixel_size=%s | bbox=%s",
@@ -308,32 +350,16 @@ def fast_zonal_statistics(
     raster_srs.ImportFromWkt(raster_info["projection_wkt"])
     raster_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
 
-    logger.info("opening source vector: %s", str(aggregate_vector_path))
-    src_vector = gdal.OpenEx(str(aggregate_vector_path), gdal.OF_VECTOR)
-    if src_vector is None:
-        raise RuntimeError(
-            "Could not open aggregate vector at %s" % str(aggregate_vector_path)
-        )
+    source_vector, source_layer = _open_vector_layer(
+        aggregate_vector_path, aggregate_layer_name, "source"
+    )
 
-    if aggregate_layer_name is not None:
-        logger.info("selecting vector layer by name: %s", aggregate_layer_name)
-        src_layer = src_vector.GetLayerByName(aggregate_layer_name)
-    else:
-        logger.info("selecting default vector layer")
-        src_layer = src_vector.GetLayer()
-
-    if src_layer is None:
-        raise RuntimeError(
-            "Could not open layer %s on %s"
-            % (aggregate_layer_name, str(aggregate_vector_path))
-        )
-
-    src_srs = src_layer.GetSpatialRef()
+    source_srs = source_layer.GetSpatialRef()
     needs_reproject = True
-    if src_srs is not None:
-        src_srs = src_srs.Clone()
-        src_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-        needs_reproject = not src_srs.IsSame(raster_srs)
+    if source_srs is not None:
+        source_srs = source_srs.Clone()
+        source_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        needs_reproject = not source_srs.IsSame(raster_srs)
         logger.info("vector SRS detected | needs_reproject=%s", needs_reproject)
     else:
         logger.info(
@@ -346,584 +372,587 @@ def fast_zonal_statistics(
     )
     logger.info("created temp working dir: %s", temp_working_dir)
 
-    translate_kwargs = {
-        "simplifyTolerance": tolerance,
-        "format": "GPKG",
-    }
-    if needs_reproject:
-        translate_kwargs["dstSRS"] = raster_info["projection_wkt"]
+    def _raster_nodata_mask(value_array):
+        if raster_nodata is None:
+            return np.zeros(value_array.shape, dtype=bool)
+        return np.isclose(value_array, raster_nodata)
 
-    logger.info(
-        "vector translate start | output=%s | simplifyTolerance=%s | reproject=%s",
-        projected_vector_path,
-        tolerance,
-        needs_reproject,
-    )
-    gdal.VectorTranslate(
-        projected_vector_path, str(aggregate_vector_path), **translate_kwargs
-    )
-    logger.info("vector translate done | output=%s", projected_vector_path)
+    try:
+        vector_translate_kwargs = {
+            "simplifyTolerance": simplify_tolerance,
+            "format": "GPKG",
+        }
+        if needs_reproject:
+            vector_translate_kwargs["dstSRS"] = raster_info["projection_wkt"]
 
-    src_layer = None
-    src_vector = None
-
-    logger.info("opening projected vector: %s", projected_vector_path)
-    aggregate_vector = gdal.OpenEx(projected_vector_path, gdal.OF_VECTOR)
-    if aggregate_vector is None:
-        raise RuntimeError(
-            "Could not open aggregate vector at %s" % projected_vector_path
-        )
-
-    if aggregate_layer_name is not None:
-        aggregate_layer = aggregate_vector.GetLayerByName(aggregate_layer_name)
-    else:
-        aggregate_layer = aggregate_vector.GetLayer()
-
-    if aggregate_layer is None:
-        raise RuntimeError(
-            "Could not open layer %s on %s"
-            % (aggregate_layer_name, projected_vector_path)
-        )
-
-    logger.info(
-        "scanning vector for grouping field values: %s", aggregate_vector_field
-    )
-    aggregate_layer_fid_set = set()
-    fid_to_group_value = {}
-    unique_group_values = set()
-    aggregate_layer.ResetReading()
-    for feat in aggregate_layer:
-        fid = feat.GetFID()
-        group_value = feat.GetField(aggregate_vector_field)
-        aggregate_layer_fid_set.add(fid)
-        fid_to_group_value[fid] = group_value
-        unique_group_values.add(group_value)
-    aggregate_layer.ResetReading()
-    logger.info(
-        "vector scan done | features=%d | unique %s=%d",
-        len(aggregate_layer_fid_set),
-        aggregate_vector_field,
-        len(unique_group_values),
-    )
-
-    raster_bbox = raster_info["bounding_box"]
-    vec_extent = aggregate_layer.GetExtent()
-    logger.info(
-        "extent check | raster_bbox=%s | vector_extent=%s",
-        raster_bbox,
-        vec_extent,
-    )
-
-    v_minx, v_maxx, v_miny, v_maxy = vec_extent
-    r_minx, r_miny, r_maxx, r_maxy = raster_bbox
-
-    no_intersection = (
-        v_maxx < r_minx or v_minx > r_maxx or v_maxy < r_miny or v_miny > r_maxy
-    )
-
-    if no_intersection:
-        logger.error(
-            f"aggregate vector {aggregate_vector_path} does not intersect with "
-            f"the raster {base_raster_path_band[0]}: vector extent {vec_extent} vs raster bounding box {raster_bbox}"
-        )
-        group_stats = collections.defaultdict(
-            lambda: {
-                "min": None,
-                "max": None,
-                "count": 0,
-                "nodata_count": 0,
-                "valid_count": 0,
-                "sum": 0.0,
-                "stdev": None,
-                **{k: None for k in percentile_keys},
-            }
-        )
-        for group_value in unique_group_values:
-            _ = group_stats[group_value]
         logger.info(
-            "returning empty stats for %d groups (no intersection)",
+            "vector translate start | output=%s | simplifyTolerance=%s | reproject=%s",
+            projected_vector_path,
+            simplify_tolerance,
+            needs_reproject,
+        )
+        gdal.VectorTranslate(
+            projected_vector_path,
+            str(aggregate_vector_path),
+            **vector_translate_kwargs,
+        )
+        logger.info("vector translate done | output=%s", projected_vector_path)
+
+        source_layer = None
+
+        aggregate_vector, aggregate_layer = _open_vector_layer(
+            projected_vector_path, aggregate_layer_name, "projected"
+        )
+
+        logger.info(
+            "scanning vector for grouping field values: %s",
+            aggregate_vector_field,
+        )
+        feature_id_set = set()
+        feature_id_to_group_value = {}
+        unique_group_values = set()
+
+        aggregate_layer.ResetReading()
+        for feature in aggregate_layer:
+            feature_id = feature.GetFID()
+            group_value = feature.GetField(aggregate_vector_field)
+            feature_id_set.add(feature_id)
+            feature_id_to_group_value[feature_id] = group_value
+            unique_group_values.add(group_value)
+        aggregate_layer.ResetReading()
+
+        logger.info(
+            "vector scan done | features=%d | unique %s=%d",
+            len(feature_id_set),
+            aggregate_vector_field,
             len(unique_group_values),
         )
-        if clean_working_dir:
-            logger.info("cleaning temp working dir: %s", temp_working_dir)
-            shutil.rmtree(temp_working_dir)
-        return dict(group_stats)
 
-    clipped_raster_path = base_raster_path_band[0]
-    logger.info("opening raster for read: %s", clipped_raster_path)
-    clipped_raster = gdal.OpenEx(clipped_raster_path, gdal.OF_RASTER)
-    clipped_band = clipped_raster.GetRasterBand(base_raster_path_band[1])
-    logger.info(
-        "raster opened | size=%dx%d | band=%d",
-        clipped_band.XSize,
-        clipped_band.YSize,
-        base_raster_path_band[1],
-    )
-
-    local_aggregate_field_name = "original_fid"
-    rasterize_layer_args = {
-        "options": [
-            "ALL_TOUCHED=FALSE",
-            "ATTRIBUTE=%s" % local_aggregate_field_name,
-        ]
-    }
-
-    driver = ogr.GetDriverByName("MEMORY")
-    disjoint_vector = driver.CreateDataSource("disjoint_vector")
-    spat_ref = aggregate_layer.GetSpatialRef()
-
-    logger.info(
-        "building disjoint polygon sets | polygons_might_overlap=%s",
-        polygons_might_overlap,
-    )
-    if polygons_might_overlap:
-        disjoint_fid_sets = geoprocessing.calculate_disjoint_polygon_set(
-            projected_vector_path, bounding_box=raster_bbox
+        raster_bounding_box = raster_info["bounding_box"]
+        vector_extent = aggregate_layer.GetExtent()
+        logger.info(
+            "extent check | raster_bbox=%s | vector_extent=%s",
+            raster_bounding_box,
+            vector_extent,
         )
-    else:
-        disjoint_fid_sets = [aggregate_layer_fid_set]
-    logger.info(
-        "disjoint sets ready | sets=%d | total_features=%d",
-        len(disjoint_fid_sets),
-        len(aggregate_layer_fid_set),
-    )
 
-    aggregate_stats = collections.defaultdict(
-        lambda: {
-            "min": None,
-            "max": None,
-            "count": 0,
-            "nodata_count": 0,
-            "sum": 0.0,
-            "sumsq": 0.0,
+        vector_min_x, vector_max_x, vector_min_y, vector_max_y = vector_extent
+        raster_min_x, raster_min_y, raster_max_x, raster_max_y = (
+            raster_bounding_box
+        )
+        has_no_intersection = (
+            vector_max_x < raster_min_x
+            or vector_min_x > raster_max_x
+            or vector_max_y < raster_min_y
+            or vector_min_y > raster_max_y
+        )
+
+        if has_no_intersection:
+            logger.error(
+                "aggregate vector %s does not intersect with the raster %s: vector extent %s vs raster bounding box %s",
+                str(aggregate_vector_path),
+                raster_path,
+                vector_extent,
+                raster_bounding_box,
+            )
+            grouped_stats = {
+                group_value: dict(empty_group_stats_template)
+                for group_value in unique_group_values
+            }
+            logger.info(
+                "returning empty stats for %d groups (no intersection)",
+                len(unique_group_values),
+            )
+            aggregate_layer = None
+            return grouped_stats
+
+        raster_path_for_stats = raster_path
+        logger.info("opening raster for read: %s", raster_path_for_stats)
+        raster_dataset = gdal.OpenEx(raster_path_for_stats, gdal.OF_RASTER)
+        raster_band = raster_dataset.GetRasterBand(raster_band_index)
+        logger.info(
+            "raster opened | size=%dx%d | band=%d",
+            raster_band.XSize,
+            raster_band.YSize,
+            raster_band_index,
+        )
+
+        local_aggregate_field_name = "original_fid"
+        rasterize_layer_args = {
+            "options": [
+                "ALL_TOUCHED=FALSE",
+                f"ATTRIBUTE={local_aggregate_field_name}",
+            ]
         }
-    )
 
-    fid_value_chunks = None
-    if percentile_list:
-        fid_value_chunks = collections.defaultdict(list)
+        memory_driver = ogr.GetDriverByName("MEMORY")
+        disjoint_vector = memory_driver.CreateDataSource("disjoint_vector")
+        spatial_reference = aggregate_layer.GetSpatialRef()
+
         logger.info(
-            "percentiles enabled | collecting values in memory | percentiles=%s",
-            percentile_list,
+            "building disjoint polygon sets | polygons_might_overlap=%s",
+            polygons_might_overlap,
         )
-
-    last_time = time.time()
-    logger.info("processing %d disjoint polygon sets", len(disjoint_fid_sets))
-    for set_index, disjoint_fid_set in enumerate(disjoint_fid_sets):
+        if polygons_might_overlap:
+            disjoint_feature_id_sets = (
+                geoprocessing.calculate_disjoint_polygon_set(
+                    projected_vector_path, bounding_box=raster_bounding_box
+                )
+            )
+        else:
+            disjoint_feature_id_sets = [feature_id_set]
         logger.info(
-            "set %d/%d start | polygons_in_set=%d",
-            set_index + 1,
-            len(disjoint_fid_sets),
-            len(disjoint_fid_set),
+            "disjoint sets ready | sets=%d | total_features=%d",
+            len(disjoint_feature_id_sets),
+            len(feature_id_set),
         )
 
-        last_time = _invoke_timed_callback(
-            last_time,
-            lambda: logger.info(
-                "zonal stats approximately %.1f%% complete on %s",
-                100.0 * float(set_index + 1) / len(disjoint_fid_sets),
-                os.path.basename(projected_vector_path),
-            ),
-            _LOGGING_PERIOD,
+        feature_stats_by_id = collections.defaultdict(
+            lambda: dict(feature_stats_template)
+        )
+        group_value_chunks = (
+            collections.defaultdict(list) if percentile_list else None
         )
 
-        agg_fid_raster_path = os.path.join(
-            temp_working_dir, f"agg_fid_{set_index}.tif"
+        last_log_time = time.time()
+        logger.info(
+            "processing %d disjoint polygon sets", len(disjoint_feature_id_sets)
         )
-        agg_fid_nodata = -1
-        logger.info("creating agg fid raster: %s", agg_fid_raster_path)
-        geoprocessing.new_raster_from_base(
-            clipped_raster_path,
-            agg_fid_raster_path,
-            gdal.GDT_Int32,
-            [agg_fid_nodata],
-        )
+        for set_index, disjoint_feature_id_set in enumerate(
+            disjoint_feature_id_sets
+        ):
+            logger.info(
+                "set %d/%d start | polygons_in_set=%d",
+                set_index + 1,
+                len(disjoint_feature_id_sets),
+                len(disjoint_feature_id_set),
+            )
 
-        agg_fid_offset_list = list(
-            geoprocessing.iterblocks((agg_fid_raster_path, 1), offset_only=True)
-        )
-        logger.info("iterblocks prepared | blocks=%d", len(agg_fid_offset_list))
-
-        agg_fid_raster = gdal.OpenEx(
-            agg_fid_raster_path, gdal.GA_Update | gdal.OF_RASTER
-        )
-        agg_fid_band = agg_fid_raster.GetRasterBand(1)
-
-        disjoint_layer = disjoint_vector.CreateLayer(
-            "disjoint_vector", spat_ref, ogr.wkbPolygon
-        )
-        disjoint_layer.CreateField(
-            ogr.FieldDefn(local_aggregate_field_name, ogr.OFTInteger)
-        )
-        disjoint_layer_defn = disjoint_layer.GetLayerDefn()
-
-        logger.info("populating disjoint layer features (transaction start)")
-        disjoint_layer.StartTransaction()
-        for index, feature_fid in enumerate(disjoint_fid_set):
-            last_time = _invoke_timed_callback(
-                last_time,
-                lambda i=index: logger.info(
-                    "polygon set %d/%d approximately %.1f%% processed on %s",
-                    set_index + 1,
-                    len(disjoint_fid_sets),
-                    100.0 * float(i + 1) / len(disjoint_fid_set),
+            last_log_time = _invoke_timed_callback(
+                last_log_time,
+                lambda: logger.info(
+                    "zonal stats approximately %.1f%% complete on %s",
+                    100.0
+                    * float(set_index + 1)
+                    / len(disjoint_feature_id_sets),
                     os.path.basename(projected_vector_path),
                 ),
                 _LOGGING_PERIOD,
             )
-            agg_feat = aggregate_layer.GetFeature(feature_fid)
-            agg_geom_ref = agg_feat.GetGeometryRef()
-            disjoint_feat = ogr.Feature(disjoint_layer_defn)
-            disjoint_feat.SetGeometry(agg_geom_ref.Clone())
-            agg_geom_ref = None
-            disjoint_feat.SetField(local_aggregate_field_name, feature_fid)
-            disjoint_layer.CreateFeature(disjoint_feat)
 
-        agg_feat = None
-        disjoint_layer.CommitTransaction()
-        logger.info(
-            "populating disjoint layer features done (transaction commit)"
-        )
-
-        rasterize_callback = _make_logger_callback(
-            "rasterizing polygon "
-            + str(set_index + 1)
-            + " of "
-            + str(len(disjoint_fid_set))
-            + " set %.1f%% complete %s"
-        )
-
-        logger.info(
-            "rasterize start | set %d/%d", set_index + 1, len(disjoint_fid_sets)
-        )
-        gdal.RasterizeLayer(
-            agg_fid_raster,
-            [1],
-            disjoint_layer,
-            callback=rasterize_callback,
-            **rasterize_layer_args,
-        )
-        agg_fid_raster.FlushCache()
-        logger.info(
-            "rasterize done | set %d/%d", set_index + 1, len(disjoint_fid_sets)
-        )
-
-        disjoint_layer = None
-        disjoint_vector.DeleteLayer(0)
-
-        logger.info(
-            "gathering stats from raster blocks | set %d/%d",
-            set_index + 1,
-            len(disjoint_fid_sets),
-        )
-        block_last_time = time.time()
-        for block_index, agg_fid_offset in enumerate(agg_fid_offset_list):
-            block_last_time = _invoke_timed_callback(
-                block_last_time,
-                lambda bi=block_index: logger.info(
-                    "block processing | set %d/%d | %.1f%% (%d/%d blocks)",
-                    set_index + 1,
-                    len(disjoint_fid_sets),
-                    100.0 * float(bi + 1) / len(agg_fid_offset_list),
-                    bi + 1,
-                    len(agg_fid_offset_list),
-                ),
-                _LOGGING_PERIOD,
+            feature_id_raster_path = os.path.join(
+                temp_working_dir, f"agg_fid_{set_index}.tif"
+            )
+            feature_id_raster_nodata = -1
+            logger.info("creating agg fid raster: %s", feature_id_raster_path)
+            geoprocessing.new_raster_from_base(
+                raster_path_for_stats,
+                feature_id_raster_path,
+                gdal.GDT_Int32,
+                [feature_id_raster_nodata],
             )
 
-            agg_fid_block = agg_fid_band.ReadAsArray(**agg_fid_offset)
-            clipped_block = clipped_band.ReadAsArray(**agg_fid_offset)
-            valid_mask = agg_fid_block != agg_fid_nodata
-            valid_agg_fids = agg_fid_block[valid_mask]
-            valid_clipped = clipped_block[valid_mask]
+            feature_id_raster_offsets = list(
+                geoprocessing.iterblocks(
+                    (feature_id_raster_path, 1), offset_only=True
+                )
+            )
+            logger.info(
+                "iterblocks prepared | blocks=%d",
+                len(feature_id_raster_offsets),
+            )
 
-            for agg_fid in np.unique(valid_agg_fids):
-                masked_clipped_block = valid_clipped[valid_agg_fids == agg_fid]
-                total_count = masked_clipped_block.size
+            feature_id_raster_dataset = gdal.OpenEx(
+                feature_id_raster_path, gdal.GA_Update | gdal.OF_RASTER
+            )
+            feature_id_raster_band = feature_id_raster_dataset.GetRasterBand(1)
 
-                if raster_nodata is not None:
-                    clipped_nodata_mask = np.isclose(
-                        masked_clipped_block, raster_nodata
-                    )
-                else:
-                    clipped_nodata_mask = np.zeros(
-                        masked_clipped_block.shape, dtype=bool
-                    )
+            disjoint_layer = disjoint_vector.CreateLayer(
+                "disjoint_vector", spatial_reference, ogr.wkbPolygon
+            )
+            disjoint_layer.CreateField(
+                ogr.FieldDefn(local_aggregate_field_name, ogr.OFTInteger)
+            )
+            disjoint_layer_definition = disjoint_layer.GetLayerDefn()
 
-                nodata_count = np.count_nonzero(clipped_nodata_mask)
-                aggregate_stats[agg_fid]["count"] += total_count
-                aggregate_stats[agg_fid]["nodata_count"] += nodata_count
+            logger.info(
+                "populating disjoint layer features (transaction start)"
+            )
+            disjoint_layer.StartTransaction()
+            for feature_index, feature_id in enumerate(disjoint_feature_id_set):
+                last_log_time = _invoke_timed_callback(
+                    last_log_time,
+                    lambda feature_index_value=feature_index: logger.info(
+                        "polygon set %d/%d approximately %.1f%% processed on %s",
+                        set_index + 1,
+                        len(disjoint_feature_id_sets),
+                        100.0
+                        * float(feature_index_value + 1)
+                        / len(disjoint_feature_id_set),
+                        os.path.basename(projected_vector_path),
+                    ),
+                    _LOGGING_PERIOD,
+                )
 
-                if ignore_nodata:
-                    masked_clipped_block = masked_clipped_block[
-                        ~clipped_nodata_mask
-                    ]
-                if masked_clipped_block.size == 0:
+                aggregate_feature = aggregate_layer.GetFeature(feature_id)
+                aggregate_geometry_ref = aggregate_feature.GetGeometryRef()
+
+                disjoint_feature = ogr.Feature(disjoint_layer_definition)
+                disjoint_feature.SetGeometry(aggregate_geometry_ref.Clone())
+                disjoint_feature.SetField(
+                    local_aggregate_field_name, feature_id
+                )
+                disjoint_layer.CreateFeature(disjoint_feature)
+
+            disjoint_layer.CommitTransaction()
+            logger.info(
+                "populating disjoint layer features done (transaction commit)"
+            )
+
+            rasterize_callback_message = (
+                f"rasterizing polygon {set_index + 1} of {len(disjoint_feature_id_set)} "
+                f"set %.1f%% complete %s"
+            )
+            rasterize_callback = _make_logger_callback(
+                rasterize_callback_message
+            )
+
+            logger.info(
+                "rasterize start | set %d/%d",
+                set_index + 1,
+                len(disjoint_feature_id_sets),
+            )
+            gdal.RasterizeLayer(
+                feature_id_raster_dataset,
+                [1],
+                disjoint_layer,
+                callback=rasterize_callback,
+                **rasterize_layer_args,
+            )
+            feature_id_raster_dataset.FlushCache()
+            logger.info(
+                "rasterize done | set %d/%d",
+                set_index + 1,
+                len(disjoint_feature_id_sets),
+            )
+
+            disjoint_layer = None
+            disjoint_vector.DeleteLayer(0)
+
+            logger.info(
+                "gathering stats from raster blocks | set %d/%d",
+                set_index + 1,
+                len(disjoint_feature_id_sets),
+            )
+            block_log_time = time.time()
+            for block_index, feature_id_offset in enumerate(
+                feature_id_raster_offsets
+            ):
+                block_log_time = _invoke_timed_callback(
+                    block_log_time,
+                    lambda block_index_value=block_index: logger.info(
+                        "block processing | set %d/%d | %.1f%% (%d/%d blocks)",
+                        set_index + 1,
+                        len(disjoint_feature_id_sets),
+                        100.0
+                        * float(block_index_value + 1)
+                        / len(feature_id_raster_offsets),
+                        block_index_value + 1,
+                        len(feature_id_raster_offsets),
+                    ),
+                    _LOGGING_PERIOD,
+                )
+
+                feature_id_block = feature_id_raster_band.ReadAsArray(
+                    **feature_id_offset
+                )
+                raster_value_block = raster_band.ReadAsArray(
+                    **feature_id_offset
+                )
+
+                in_polygon_mask = feature_id_block != feature_id_raster_nodata
+                if not np.any(in_polygon_mask):
                     continue
 
-                if fid_value_chunks is not None:
-                    fid_value_chunks[agg_fid].append(
-                        masked_clipped_block.astype(np.float32, copy=False)
+                block_feature_ids = feature_id_block[in_polygon_mask]
+                block_raster_values = raster_value_block[in_polygon_mask]
+
+                for feature_id in np.unique(block_feature_ids):
+                    feature_values = block_raster_values[
+                        block_feature_ids == feature_id
+                    ]
+                    total_count = feature_values.size
+                    if total_count == 0:
+                        continue
+
+                    feature_nodata_mask = _raster_nodata_mask(feature_values)
+                    nodata_count = int(np.count_nonzero(feature_nodata_mask))
+
+                    feature_stats = feature_stats_by_id[feature_id]
+                    feature_stats["count"] += total_count
+                    feature_stats["nodata_count"] += nodata_count
+
+                    if ignore_nodata:
+                        feature_values = feature_values[~feature_nodata_mask]
+                    if feature_values.size == 0:
+                        continue
+
+                    if group_value_chunks is not None:
+                        group_value = feature_id_to_group_value[feature_id]
+                        group_value_chunks[group_value].append(
+                            feature_values.astype(np.float32, copy=False)
+                        )
+
+                    block_min_value = np.min(feature_values)
+                    block_max_value = np.max(feature_values)
+                    if feature_stats["min"] is None:
+                        feature_stats["min"] = block_min_value
+                        feature_stats["max"] = block_max_value
+                    else:
+                        feature_stats["min"] = min(
+                            feature_stats["min"], block_min_value
+                        )
+                        feature_stats["max"] = max(
+                            feature_stats["max"], block_max_value
+                        )
+
+                    feature_stats["sum"] += np.sum(feature_values)
+                    feature_stats["sumsq"] += np.sum(
+                        feature_values * feature_values, dtype=np.float64
                     )
 
-                if aggregate_stats[agg_fid]["min"] is None:
-                    aggregate_stats[agg_fid]["min"] = masked_clipped_block[0]
-                    aggregate_stats[agg_fid]["max"] = masked_clipped_block[0]
+            logger.info(
+                "set %d/%d done | fids_with_any_stats_so_far=%d",
+                set_index + 1,
+                len(disjoint_feature_id_sets),
+                len(feature_stats_by_id),
+            )
 
-                aggregate_stats[agg_fid]["min"] = min(
-                    np.min(masked_clipped_block),
-                    aggregate_stats[agg_fid]["min"],
-                )
-                aggregate_stats[agg_fid]["max"] = max(
-                    np.max(masked_clipped_block),
-                    aggregate_stats[agg_fid]["max"],
-                )
-                aggregate_stats[agg_fid]["sum"] += np.sum(masked_clipped_block)
-                aggregate_stats[agg_fid]["sumsq"] += np.sum(
-                    masked_clipped_block * masked_clipped_block,
-                    dtype=np.float64,
-                )
+            feature_id_raster_band = None
+            feature_id_raster_dataset = None
 
+        unset_feature_ids = feature_id_set.difference(feature_stats_by_id)
         logger.info(
-            "set %d/%d done | fids_with_any_stats_so_far=%d",
-            set_index + 1,
-            len(disjoint_fid_sets),
-            len(aggregate_stats),
+            "unset fid pass start | unset_fids=%d", len(unset_feature_ids)
         )
 
-        agg_fid_band = None
-        agg_fid_raster = None
-
-    unset_fids = aggregate_layer_fid_set.difference(aggregate_stats)
-    logger.info("unset fid pass start | unset_fids=%d", len(unset_fids))
-
-    clipped_gt = np.array(clipped_raster.GetGeoTransform(), dtype=np.float32)
-    for unset_fid in unset_fids:
-        unset_feat = aggregate_layer.GetFeature(unset_fid)
-        unset_geom_ref = unset_feat.GetGeometryRef()
-        if unset_geom_ref is None:
-            logger.warning(
-                "no geometry in %s FID: %s", projected_vector_path, unset_fid
-            )
-            continue
-
-        shapely_geom = shapely.wkb.loads(bytes(unset_geom_ref.ExportToWkb()))
-        try:
-            shapely_geom_list = list(shapely_geom)
-        except TypeError:
-            shapely_geom_list = [shapely_geom]
-        unset_geom_ref = None
-
-        for shapely_geom in shapely_geom_list:
-            single_geom = ogr.CreateGeometryFromWkt(shapely_geom.wkt)
-            unset_geom_envelope = list(single_geom.GetEnvelope())
-            single_geom = None
-
-            if clipped_gt[1] < 0:
-                unset_geom_envelope[0], unset_geom_envelope[1] = (
-                    unset_geom_envelope[1],
-                    unset_geom_envelope[0],
+        # Fallback for polygons that did not rasterize any pixels: sample the raster window
+        # of each polygon's envelope so every feature can contribute stats to its group.
+        raster_geotransform = np.array(
+            raster_dataset.GetGeoTransform(), dtype=np.float32
+        )
+        for unset_feature_id in unset_feature_ids:
+            unset_feature = aggregate_layer.GetFeature(unset_feature_id)
+            unset_geometry_ref = unset_feature.GetGeometryRef()
+            if unset_geometry_ref is None:
+                logger.warning(
+                    "no geometry in %s FID: %s",
+                    projected_vector_path,
+                    unset_feature_id,
                 )
-            if clipped_gt[5] < 0:
-                unset_geom_envelope[2], unset_geom_envelope[3] = (
-                    unset_geom_envelope[3],
-                    unset_geom_envelope[2],
-                )
-
-            xoff = int((unset_geom_envelope[0] - clipped_gt[0]) / clipped_gt[1])
-            yoff = int((unset_geom_envelope[2] - clipped_gt[3]) / clipped_gt[5])
-            win_xsize = (
-                int(
-                    np.ceil(
-                        (unset_geom_envelope[1] - clipped_gt[0]) / clipped_gt[1]
-                    )
-                )
-                - xoff
-            )
-            win_ysize = (
-                int(
-                    np.ceil(
-                        (unset_geom_envelope[3] - clipped_gt[3]) / clipped_gt[5]
-                    )
-                )
-                - yoff
-            )
-
-            if xoff < 0:
-                win_xsize += xoff
-                xoff = 0
-            if yoff < 0:
-                win_ysize += yoff
-                yoff = 0
-            if xoff + win_xsize > clipped_band.XSize:
-                win_xsize = clipped_band.XSize - xoff
-            if yoff + win_ysize > clipped_band.YSize:
-                win_ysize = clipped_band.YSize - yoff
-            if win_xsize <= 0 or win_ysize <= 0:
                 continue
 
-            unset_fid_block = clipped_band.ReadAsArray(
-                xoff=xoff, yoff=yoff, win_xsize=win_xsize, win_ysize=win_ysize
+            shapely_geometry = shapely.wkb.loads(
+                bytes(unset_geometry_ref.ExportToWkb())
             )
+            try:
+                shapely_geometry_parts = list(shapely_geometry)
+            except TypeError:
+                shapely_geometry_parts = [shapely_geometry]
+            unset_geometry_ref = None
 
-            if raster_nodata is not None:
-                unset_fid_nodata_mask = np.isclose(
-                    unset_fid_block, raster_nodata
+            for shapely_part_geometry in shapely_geometry_parts:
+                ogr_geometry = ogr.CreateGeometryFromWkt(
+                    shapely_part_geometry.wkt
                 )
-            else:
-                unset_fid_nodata_mask = np.zeros(
-                    unset_fid_block.shape, dtype=bool
+                geometry_envelope = list(ogr_geometry.GetEnvelope())
+                ogr_geometry = None
+
+                if raster_geotransform[1] < 0:
+                    geometry_envelope[0], geometry_envelope[1] = (
+                        geometry_envelope[1],
+                        geometry_envelope[0],
+                    )
+                if raster_geotransform[5] < 0:
+                    geometry_envelope[2], geometry_envelope[3] = (
+                        geometry_envelope[3],
+                        geometry_envelope[2],
+                    )
+
+                window_x_offset = int(
+                    (geometry_envelope[0] - raster_geotransform[0])
+                    / raster_geotransform[1]
+                )
+                window_y_offset = int(
+                    (geometry_envelope[2] - raster_geotransform[3])
+                    / raster_geotransform[5]
                 )
 
-            if ignore_nodata:
-                valid_unset_fid_block = unset_fid_block[~unset_fid_nodata_mask]
-            else:
-                valid_unset_fid_block = unset_fid_block
+                window_width_pixels = (
+                    int(
+                        np.ceil(
+                            (geometry_envelope[1] - raster_geotransform[0])
+                            / raster_geotransform[1]
+                        )
+                    )
+                    - window_x_offset
+                )
+                window_height_pixels = (
+                    int(
+                        np.ceil(
+                            (geometry_envelope[3] - raster_geotransform[3])
+                            / raster_geotransform[5]
+                        )
+                    )
+                    - window_y_offset
+                )
 
-            aggregate_stats[unset_fid]["count"] = unset_fid_block.size
-            aggregate_stats[unset_fid]["nodata_count"] = np.count_nonzero(
-                unset_fid_nodata_mask
+                if window_x_offset < 0:
+                    window_width_pixels += window_x_offset
+                    window_x_offset = 0
+                if window_y_offset < 0:
+                    window_height_pixels += window_y_offset
+                    window_y_offset = 0
+                if window_x_offset + window_width_pixels > raster_band.XSize:
+                    window_width_pixels = raster_band.XSize - window_x_offset
+                if window_y_offset + window_height_pixels > raster_band.YSize:
+                    window_height_pixels = raster_band.YSize - window_y_offset
+                if window_width_pixels <= 0 or window_height_pixels <= 0:
+                    continue
+
+                unset_window_values = raster_band.ReadAsArray(
+                    xoff=window_x_offset,
+                    yoff=window_y_offset,
+                    win_xsize=window_width_pixels,
+                    win_ysize=window_height_pixels,
+                )
+
+                unset_window_nodata_mask = _raster_nodata_mask(
+                    unset_window_values
+                )
+                if ignore_nodata:
+                    unset_valid_values = unset_window_values[
+                        ~unset_window_nodata_mask
+                    ]
+                else:
+                    unset_valid_values = unset_window_values
+
+                feature_stats = feature_stats_by_id[unset_feature_id]
+                feature_stats["count"] = unset_window_values.size
+                feature_stats["nodata_count"] = int(
+                    np.count_nonzero(unset_window_nodata_mask)
+                )
+
+                if unset_valid_values.size == 0:
+                    feature_stats["min"] = 0.0
+                    feature_stats["max"] = 0.0
+                    feature_stats["sum"] = 0.0
+                    feature_stats["sumsq"] = 0.0
+                else:
+                    feature_stats["min"] = np.min(unset_valid_values)
+                    feature_stats["max"] = np.max(unset_valid_values)
+                    feature_stats["sum"] = np.sum(unset_valid_values)
+                    feature_stats["sumsq"] = np.sum(
+                        unset_valid_values * unset_valid_values,
+                        dtype=np.float64,
+                    )
+
+                if group_value_chunks is not None and unset_valid_values.size:
+                    group_value = feature_id_to_group_value[unset_feature_id]
+                    group_value_chunks[group_value].append(
+                        unset_valid_values.astype(np.float32, copy=False)
+                    )
+
+        remaining_unset_feature_ids = feature_id_set.difference(
+            feature_stats_by_id
+        )
+        for missing_feature_id in remaining_unset_feature_ids:
+            feature_stats_by_id[missing_feature_id]
+
+        logger.info(
+            "unset fid pass done | remaining_unset=%d | total_fids=%d",
+            len(remaining_unset_feature_ids),
+            len(feature_id_set),
+        )
+
+        spatial_reference = None
+        raster_band = None
+        raster_dataset = None
+        disjoint_layer = None
+        disjoint_vector = None
+        aggregate_layer = None
+
+        logger.info("grouping fid stats -> %s values", aggregate_vector_field)
+        grouped_stats = collections.defaultdict(
+            lambda: dict(grouped_stats_working_template)
+        )
+
+        for feature_id in feature_id_set:
+            group_value = feature_id_to_group_value[feature_id]
+            feature_stats = feature_stats_by_id[feature_id]
+            group_stats = grouped_stats[group_value]
+
+            group_stats["count"] += feature_stats["count"]
+            group_stats["nodata_count"] += feature_stats["nodata_count"]
+            group_stats["sum"] += feature_stats["sum"]
+            group_stats["sumsq"] += feature_stats["sumsq"]
+
+            feature_valid_count = (
+                feature_stats["count"] - feature_stats["nodata_count"]
             )
-
-            if valid_unset_fid_block.size == 0:
-                aggregate_stats[unset_fid]["min"] = 0.0
-                aggregate_stats[unset_fid]["max"] = 0.0
-                aggregate_stats[unset_fid]["sum"] = 0.0
-                aggregate_stats[unset_fid]["sumsq"] = 0.0
-            else:
-                aggregate_stats[unset_fid]["min"] = np.min(
-                    valid_unset_fid_block
-                )
-                aggregate_stats[unset_fid]["max"] = np.max(
-                    valid_unset_fid_block
-                )
-                aggregate_stats[unset_fid]["sum"] = np.sum(
-                    valid_unset_fid_block
-                )
-                aggregate_stats[unset_fid]["sumsq"] = np.sum(
-                    valid_unset_fid_block * valid_unset_fid_block,
-                    dtype=np.float64,
-                )
-
-            if fid_value_chunks is not None and valid_unset_fid_block.size:
-                fid_value_chunks[unset_fid].append(
-                    valid_unset_fid_block.astype(np.float32, copy=False)
-                )
-
-    unset_fids = aggregate_layer_fid_set.difference(aggregate_stats)
-    for fid in unset_fids:
-        _ = aggregate_stats[fid]
-
-    logger.info(
-        "unset fid pass done | remaining_unset=%d | total_fids=%d",
-        len(unset_fids),
-        len(aggregate_layer_fid_set),
-    )
-
-    if fid_value_chunks is not None:
-        logger.info(
-            "computing per-fid percentiles | percentiles=%s", percentile_list
-        )
-        fid_percentiles = {}
-        for fid, chunks in fid_value_chunks.items():
-            if not chunks:
-                fid_percentiles[fid] = [None] * len(percentile_list)
-                continue
-            vals = np.concatenate(chunks)
-            fid_percentiles[fid] = np.percentile(vals, percentile_list).tolist()
-        logger.info(
-            "computing per-fid percentiles done | fids=%d", len(fid_percentiles)
-        )
-    else:
-        fid_percentiles = None
-
-    spat_ref = None
-    clipped_band = None
-    clipped_raster = None
-    disjoint_layer = None
-    disjoint_vector = None
-    aggregate_layer = None
-    aggregate_vector = None
-
-    logger.info("grouping fid stats -> %s values", aggregate_vector_field)
-    grouped_stats = collections.defaultdict(
-        lambda: {
-            "min": None,
-            "max": None,
-            "count": 0,
-            "nodata_count": 0,
-            "valid_count": 0,
-            "sum": 0.0,
-            "sumsq": 0.0,
-            "stdev": None,
-            **{k: None for k in percentile_keys},
-        }
-    )
-
-    group_value_chunks = None
-    if percentile_list:
-        group_value_chunks = collections.defaultdict(list)
-
-    for fid in aggregate_layer_fid_set:
-        group_value = fid_to_group_value[fid]
-        fid_stats = aggregate_stats[fid]
-        g = grouped_stats[group_value]
-
-        g["count"] += fid_stats["count"]
-        g["nodata_count"] += fid_stats["nodata_count"]
-        g["sum"] += fid_stats["sum"]
-        g["sumsq"] += fid_stats["sumsq"]
-
-        fid_valid_count = fid_stats["count"] - fid_stats["nodata_count"]
-        if fid_valid_count > 0:
-            if g["min"] is None:
-                g["min"] = fid_stats["min"]
-                g["max"] = fid_stats["max"]
-            else:
-                g["min"] = min(g["min"], fid_stats["min"])
-                g["max"] = max(g["max"], fid_stats["max"])
+            if feature_valid_count > 0:
+                if group_stats["min"] is None:
+                    group_stats["min"] = feature_stats["min"]
+                    group_stats["max"] = feature_stats["max"]
+                else:
+                    group_stats["min"] = min(
+                        group_stats["min"], feature_stats["min"]
+                    )
+                    group_stats["max"] = max(
+                        group_stats["max"], feature_stats["max"]
+                    )
 
         if group_value_chunks is not None:
-            chunks = fid_value_chunks.get(fid)
-            if chunks:
-                group_value_chunks[group_value].extend(chunks)
+            logger.info(
+                "computing grouped percentiles | groups=%d | percentiles=%s",
+                len(group_value_chunks),
+                percentile_list,
+            )
+            for group_value, value_chunks in group_value_chunks.items():
+                if not value_chunks:
+                    continue
+                values = np.concatenate(value_chunks)
+                group_percentile_values = np.percentile(values, percentile_list)
+                for percentile_key, percentile_value in zip(
+                    percentile_keys, group_percentile_values.tolist()
+                ):
+                    grouped_stats[group_value][
+                        percentile_key
+                    ] = percentile_value
+            logger.info("computing grouped percentiles done")
 
-    if group_value_chunks is not None:
-        logger.info(
-            "computing grouped percentiles | groups=%d | percentiles=%s",
-            len(group_value_chunks),
-            percentile_list,
-        )
-        for group_value, chunks in group_value_chunks.items():
-            if not chunks:
-                continue
-            vals = np.concatenate(chunks)
-            pct_vals = np.percentile(vals, percentile_list)
-            for k, v in zip(percentile_keys, pct_vals.tolist()):
-                grouped_stats[group_value][k] = v
-        logger.info("computing grouped percentiles done")
+        for group_value, group_stats in grouped_stats.items():
+            valid_count = group_stats["count"] - group_stats["nodata_count"]
+            group_stats["valid_count"] = valid_count
+            if valid_count > 0:
+                mean_value = group_stats["sum"] / valid_count
+                variance_value = (
+                    group_stats["sumsq"] / valid_count - mean_value * mean_value
+                )
+                if variance_value < 0:
+                    variance_value = 0.0
+                group_stats["stdev"] = float(np.sqrt(variance_value))
+            else:
+                group_stats["stdev"] = None
+            del group_stats["sumsq"]
 
-    for group_value, g in grouped_stats.items():
-        valid_count = g["count"] - g["nodata_count"]
-        g["valid_count"] = valid_count
-        if valid_count > 0:
-            mean = g["sum"] / valid_count
-            var = g["sumsq"] / valid_count - mean * mean
-            if var < 0:
-                var = 0.0
-            g["stdev"] = float(np.sqrt(var))
-        else:
-            g["stdev"] = None
-        del g["sumsq"]
-
-    logger.info("grouping done | groups=%d", len(grouped_stats))
-
-    if clean_working_dir:
-        logger.info("cleaning temp working dir: %s", temp_working_dir)
-        shutil.rmtree(temp_working_dir)
-
-    logger.info("fast_zonal_statistics done")
-    return dict(grouped_stats)
+        logger.info("grouping done | groups=%d", len(grouped_stats))
+        logger.info("fast_zonal_statistics done")
+        return dict(grouped_stats)
+    finally:
+        if clean_working_dir:
+            logger.info("cleaning temp working dir: %s", temp_working_dir)
+            shutil.rmtree(temp_working_dir)
 
 
 def run_zonal_stats_job(
@@ -1051,6 +1080,546 @@ def _invoke_timed_callback(reference_time, callback_lambda, callback_period):
     return reference_time
 
 
+def run_fast_zonal_statistics_test_case(
+    *,
+    fast_zonal_statistics_fn,
+    raster_values,
+    polygons,
+    aggregate_vector_field="group_id",
+    aggregate_layer_name="polys",
+    ignore_nodata=True,
+    polygons_might_overlap=True,
+    percentile_list=None,
+    raster_nodata=None,
+    pixel_size=10.0,
+    origin_x=1000.0,
+    origin_y=2000.0,
+    epsg=3857,
+    allclose_rtol=1e-6,
+    allclose_atol=1e-6,
+    expect_grouped_stats=None,
+    compare_keys=None,
+    working_dir=None,
+    clean_working_dir=True,
+):
+    import collections
+    import math
+    import os
+    import shutil
+    import tempfile
+
+    import numpy as np
+    from osgeo import gdal, ogr, osr
+
+    raster_values = np.asarray(raster_values)
+    if raster_values.ndim != 2:
+        raise ValueError("raster_values must be 2D")
+
+    percentile_list = [] if percentile_list is None else list(percentile_list)
+    percentile_list = sorted(
+        {float(percentile_value) for percentile_value in percentile_list}
+    )
+    percentile_keys = [
+        f"p{int(percentile_value) if percentile_value.is_integer() else percentile_value}"
+        for percentile_value in percentile_list
+    ]
+
+    if compare_keys is None:
+        compare_keys = [
+            "min",
+            "max",
+            "count",
+            "nodata_count",
+            "valid_count",
+            "sum",
+            "stdev",
+        ] + percentile_keys
+
+    temp_dir = tempfile.mkdtemp(dir=working_dir)
+    raster_path = os.path.join(temp_dir, "test_raster.tif")
+    vector_path = os.path.join(temp_dir, "test_vector.gpkg")
+
+    def _close_enough(left_value, right_value):
+        if left_value is None and right_value is None:
+            return True
+        if left_value is None or right_value is None:
+            return False
+        if isinstance(left_value, (int, np.integer)) and isinstance(
+            right_value, (int, np.integer)
+        ):
+            return int(left_value) == int(right_value)
+        if isinstance(left_value, (float, np.floating)) or isinstance(
+            right_value, (float, np.floating)
+        ):
+            return bool(
+                np.isclose(
+                    float(left_value),
+                    float(right_value),
+                    rtol=allclose_rtol,
+                    atol=allclose_atol,
+                )
+            )
+        return left_value == right_value
+
+    def _assert_group_stats_equal(
+        actual_stats, expected_stats, group_value, key_name
+    ):
+        if not _close_enough(
+            actual_stats.get(key_name), expected_stats.get(key_name)
+        ):
+            raise AssertionError(
+                f"Group={group_value!r} key={key_name!r} actual={actual_stats.get(key_name)!r} expected={expected_stats.get(key_name)!r}"
+            )
+
+    def _pixel_window_to_polygon_wkt(window):
+        x_offset, y_offset, width_pixels, height_pixels = window
+        left = origin_x + x_offset * pixel_size
+        right = origin_x + (x_offset + width_pixels) * pixel_size
+        top = origin_y - y_offset * pixel_size
+        bottom = origin_y - (y_offset + height_pixels) * pixel_size
+        return f"POLYGON(({left} {top},{right} {top},{right} {bottom},{left} {bottom},{left} {top}))"
+
+    def _masked_stats(values_1d, percentile_values):
+        if values_1d.size == 0:
+            return {
+                "min": None,
+                "max": None,
+                "count": int(0),
+                "nodata_count": int(0),
+                "valid_count": int(0),
+                "sum": 0.0,
+                "stdev": None,
+                **{k: None for k in percentile_values},
+            }
+
+        if raster_nodata is None:
+            nodata_mask = np.zeros(values_1d.shape, dtype=bool)
+        else:
+            nodata_mask = np.isclose(values_1d, raster_nodata)
+
+        count_value = int(values_1d.size)
+        nodata_count_value = int(np.count_nonzero(nodata_mask))
+        if ignore_nodata:
+            valid_values = values_1d[~nodata_mask].astype(
+                np.float64, copy=False
+            )
+        else:
+            valid_values = values_1d.astype(np.float64, copy=False)
+
+        valid_count_value = int(valid_values.size)
+        if valid_count_value == 0:
+            stats = {
+                "min": 0.0,
+                "max": 0.0,
+                "count": count_value,
+                "nodata_count": nodata_count_value,
+                "valid_count": 0,
+                "sum": 0.0,
+                "stdev": None,
+                **{k: None for k in percentile_values},
+            }
+            return stats
+
+        sum_value = float(np.sum(valid_values))
+        mean_value = sum_value / valid_count_value
+        sumsq_value = float(np.sum(valid_values * valid_values))
+        variance_value = (
+            sumsq_value / valid_count_value - mean_value * mean_value
+        )
+        if variance_value < 0:
+            variance_value = 0.0
+        stdev_value = float(math.sqrt(variance_value))
+
+        stats = {
+            "min": float(np.min(valid_values)),
+            "max": float(np.max(valid_values)),
+            "count": count_value,
+            "nodata_count": nodata_count_value,
+            "valid_count": valid_count_value,
+            "sum": sum_value,
+            "stdev": stdev_value,
+        }
+
+        if percentile_list:
+            pct_values = np.percentile(
+                valid_values.astype(np.float64, copy=False), percentile_list
+            ).tolist()
+            for percentile_key, percentile_value in zip(
+                percentile_values, pct_values
+            ):
+                stats[percentile_key] = float(percentile_value)
+        else:
+            for percentile_key in percentile_values:
+                stats[percentile_key] = None
+
+        return stats
+
+    try:
+        spatial_reference = osr.SpatialReference()
+        spatial_reference.ImportFromEPSG(int(epsg))
+        spatial_reference.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+
+        raster_driver = gdal.GetDriverByName("GTiff")
+        raster_dataset = raster_driver.Create(
+            raster_path,
+            int(raster_values.shape[1]),
+            int(raster_values.shape[0]),
+            1,
+            gdal.GDT_Float32,
+        )
+        raster_dataset.SetGeoTransform(
+            (origin_x, pixel_size, 0.0, origin_y, 0.0, -pixel_size)
+        )
+        raster_dataset.SetProjection(spatial_reference.ExportToWkt())
+        raster_band = raster_dataset.GetRasterBand(1)
+        if raster_nodata is not None:
+            raster_band.SetNoDataValue(float(raster_nodata))
+        raster_band.WriteArray(raster_values.astype(np.float32, copy=False))
+        raster_band.FlushCache()
+        raster_band = None
+        raster_dataset.FlushCache()
+        raster_dataset = None
+
+        vector_driver = ogr.GetDriverByName("GPKG")
+        if os.path.exists(vector_path):
+            vector_driver.DeleteDataSource(vector_path)
+        vector_dataset = vector_driver.CreateDataSource(vector_path)
+        vector_layer = vector_dataset.CreateLayer(
+            aggregate_layer_name, spatial_reference, ogr.wkbPolygon
+        )
+
+        if polygons and isinstance(polygons[0].get("group_value"), str):
+            group_field_type = ogr.OFTString
+        else:
+            group_field_type = ogr.OFTInteger
+
+        vector_layer.CreateField(
+            ogr.FieldDefn(aggregate_vector_field, group_field_type)
+        )
+        layer_definition = vector_layer.GetLayerDefn()
+
+        for polygon_spec in polygons:
+            group_value = polygon_spec["group_value"]
+            window = polygon_spec["window"]
+            polygon_wkt = polygon_spec.get(
+                "wkt"
+            ) or _pixel_window_to_polygon_wkt(window)
+            polygon_geometry = ogr.CreateGeometryFromWkt(polygon_wkt)
+
+            feature = ogr.Feature(layer_definition)
+            feature.SetGeometry(polygon_geometry)
+            feature.SetField(aggregate_vector_field, group_value)
+            vector_layer.CreateFeature(feature)
+
+        vector_layer = None
+        vector_dataset = None
+
+        actual_grouped_stats = fast_zonal_statistics_fn(
+            (raster_path, 1),
+            vector_path,
+            aggregate_vector_field,
+            aggregate_layer_name=aggregate_layer_name,
+            ignore_nodata=ignore_nodata,
+            polygons_might_overlap=polygons_might_overlap,
+            working_dir=temp_dir,
+            clean_working_dir=False,
+            percentile_list=percentile_list,
+        )
+
+        if expect_grouped_stats is None:
+            expected_values_by_group = collections.defaultdict(list)
+            expected_counts_by_group = collections.defaultdict(
+                lambda: {"count": 0, "nodata_count": 0}
+            )
+
+            for polygon_spec in polygons:
+                group_value = polygon_spec["group_value"]
+                x_offset, y_offset, width_pixels, height_pixels = polygon_spec[
+                    "window"
+                ]
+                window_values = raster_values[
+                    y_offset : y_offset + height_pixels,
+                    x_offset : x_offset + width_pixels,
+                ].ravel()
+
+                expected_values_by_group[group_value].append(window_values)
+
+                if raster_nodata is None:
+                    nodata_mask = np.zeros(window_values.shape, dtype=bool)
+                else:
+                    nodata_mask = np.isclose(window_values, raster_nodata)
+
+                expected_counts_by_group[group_value]["count"] += int(
+                    window_values.size
+                )
+                expected_counts_by_group[group_value]["nodata_count"] += int(
+                    np.count_nonzero(nodata_mask)
+                )
+
+            expect_grouped_stats = {}
+            for group_value, chunk_list in expected_values_by_group.items():
+                combined_values = (
+                    np.concatenate(chunk_list)
+                    if chunk_list
+                    else np.array([], dtype=np.float64)
+                )
+                group_stats = _masked_stats(combined_values, percentile_keys)
+                group_stats["count"] = int(
+                    expected_counts_by_group[group_value]["count"]
+                )
+                group_stats["nodata_count"] = int(
+                    expected_counts_by_group[group_value]["nodata_count"]
+                )
+                group_stats["valid_count"] = int(
+                    group_stats["count"] - group_stats["nodata_count"]
+                )
+                expect_grouped_stats[group_value] = group_stats
+
+        actual_group_keys = set(actual_grouped_stats.keys())
+        expected_group_keys = set(expect_grouped_stats.keys())
+        if actual_group_keys != expected_group_keys:
+            raise AssertionError(
+                f"Group keys mismatch actual={sorted(actual_group_keys)!r} expected={sorted(expected_group_keys)!r}"
+            )
+
+        for group_value, expected_stats in expect_grouped_stats.items():
+            actual_stats = actual_grouped_stats[group_value]
+            for key_name in compare_keys:
+                _assert_group_stats_equal(
+                    actual_stats, expected_stats, group_value, key_name
+                )
+
+        return {
+            "temp_dir": temp_dir,
+            "raster_path": raster_path,
+            "vector_path": vector_path,
+            "actual": actual_grouped_stats,
+            "expected": expect_grouped_stats,
+        }
+    finally:
+        if clean_working_dir and os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir)
+
+
+def example_fast_zonal_statistics_test_case(*, fast_zonal_statistics_fn):
+    import numpy as np
+
+    raster_values = np.array(
+        [
+            [1, 2, 3, 4, 5],
+            [6, 7, 8, 9, 10],
+            [11, 12, -9999, 14, 15],
+            [16, 17, 18, 19, 20],
+            [21, 22, 23, 24, 25],
+        ],
+        dtype=np.float32,
+    )
+
+    polygons = [
+        {"group_value": 10, "window": (0, 0, 2, 2)},
+        {"group_value": 10, "window": (2, 0, 3, 1)},
+        {"group_value": 20, "window": (1, 2, 3, 2)},
+    ]
+
+    return polygons, run_fast_zonal_statistics_test_case(
+        fast_zonal_statistics_fn=fast_zonal_statistics_fn,
+        raster_values=raster_values,
+        polygons=polygons,
+        aggregate_vector_field="group_id",
+        aggregate_layer_name="polys",
+        ignore_nodata=True,
+        polygons_might_overlap=False,
+        percentile_list=[50, 90],
+        raster_nodata=-9999,
+        pixel_size=10.0,
+        origin_x=1000.0,
+        origin_y=2000.0,
+        epsg=3857,
+        allclose_rtol=1e-6,
+        allclose_atol=1e-6,
+        clean_working_dir=True,
+    )
+
+
+def pretty_print_zonal_stats_result_with_polygon_values(
+    polygons,
+    result,
+    *,
+    raster_values,
+    raster_nodata=None,
+    ignore_nodata=True,
+    title_key="group_id",
+    stats_root_key="actual",
+    sort_groups=True,
+    sort_stats=True,
+    preferred_stat_order=None,
+    float_digits=6,
+):
+    import numpy as np
+
+    raster_values = np.asarray(raster_values)
+    if raster_values.ndim != 2:
+        raise ValueError("raster_values must be a 2D array")
+
+    if preferred_stat_order is None:
+        preferred_stat_order = [
+            "min",
+            "max",
+            "count",
+            "nodata_count",
+            "valid_count",
+            "sum",
+            "stdev",
+        ]
+
+    stats_by_group = result[stats_root_key]
+
+    group_to_values_all = {}
+    group_to_values_valid = {}
+
+    def _format_value(value):
+        if value is None:
+            return "None"
+        if isinstance(value, float):
+            return f"{value:.{float_digits}f}"
+        return str(value)
+
+    def _format_array(array_values):
+        array_values = np.asarray(array_values)
+        if array_values.size == 0:
+            return "[]"
+        if np.issubdtype(array_values.dtype, np.integer):
+            return (
+                "["
+                + ", ".join(str(int(v)) for v in array_values.tolist())
+                + "]"
+            )
+        return (
+            "["
+            + ", ".join(
+                f"{float(v):.{float_digits}f}".rstrip("0").rstrip(".")
+                for v in array_values.tolist()
+            )
+            + "]"
+        )
+
+    def _nodata_mask(values_1d):
+        if raster_nodata is None:
+            return np.zeros(values_1d.shape, dtype=bool)
+        return np.isclose(values_1d, raster_nodata)
+
+    for polygon_id, polygon_spec in enumerate(polygons):
+        group_value = polygon_spec["group_value"]
+        x_offset, y_offset, width_pixels, height_pixels = polygon_spec["window"]
+
+        window_values = raster_values[
+            y_offset : y_offset + height_pixels,
+            x_offset : x_offset + width_pixels,
+        ].ravel()
+
+        nodata_mask = _nodata_mask(window_values)
+        valid_values = (
+            window_values[~nodata_mask] if ignore_nodata else window_values
+        )
+
+        group_to_values_all.setdefault(group_value, []).append(
+            window_values.astype(np.float64, copy=False)
+        )
+        group_to_values_valid.setdefault(group_value, []).append(
+            valid_values.astype(np.float64, copy=False)
+        )
+
+        print(
+            f'polygon_id={polygon_id} ({title_key}={group_value}, window={polygon_spec["window"]})'
+        )
+        print(
+            f"  - selected_values_all: {_format_array(window_values.astype(np.float64, copy=False))}"
+        )
+        print(
+            f"  - selected_values_valid: {_format_array(valid_values.astype(np.float64, copy=False))}"
+        )
+        print("")
+
+    group_items = list(stats_by_group.items())
+    if sort_groups:
+        group_items.sort(key=lambda item: str(item[0]))
+
+    for group_value, stats in group_items:
+        all_group_values = (
+            np.concatenate(group_to_values_all.get(group_value, []))
+            if group_to_values_all.get(group_value)
+            else np.array([], dtype=np.float64)
+        )
+        valid_group_values = (
+            np.concatenate(group_to_values_valid.get(group_value, []))
+            if group_to_values_valid.get(group_value)
+            else np.array([], dtype=np.float64)
+        )
+
+        print(f"{title_key}={group_value}")
+        print(f"  - selected_values_all: {_format_array(all_group_values)}")
+        print(f"  - selected_values_valid: {_format_array(valid_group_values)}")
+
+        stat_items = list(stats.items())
+        if sort_stats:
+            stat_items.sort(
+                key=lambda item: (
+                    (
+                        preferred_stat_order.index(item[0])
+                        if item[0] in preferred_stat_order
+                        else 10_000
+                    ),
+                    item[0],
+                )
+            )
+
+        for stat_key, stat_value in stat_items:
+            print(f"  - {stat_key}: {_format_value(stat_value)}")
+        print("")
+
+
+def example_fast_zonal_statistics_test_case(*, fast_zonal_statistics_fn):
+    import numpy as np
+
+    raster_values = np.array(
+        [
+            [1, 2, 3, 4, 5],
+            [6, 7, 8, 9, 10],
+            [11, 12, -9999, 14, 15],
+            [16, 17, 18, 19, 20],
+            [21, 22, 23, 24, 25],
+        ],
+        dtype=np.float32,
+    )
+
+    polygons = [
+        {"group_value": 10, "window": (0, 0, 2, 2)},
+        {"group_value": 10, "window": (2, 0, 3, 1)},
+        {"group_value": 20, "window": (1, 2, 3, 2)},
+    ]
+
+    result = run_fast_zonal_statistics_test_case(
+        fast_zonal_statistics_fn=fast_zonal_statistics_fn,
+        raster_values=raster_values,
+        polygons=polygons,
+        aggregate_vector_field="group_id",
+        aggregate_layer_name="polys",
+        ignore_nodata=True,
+        polygons_might_overlap=False,
+        percentile_list=[50, 90],
+        raster_nodata=-9999,
+        pixel_size=10.0,
+        origin_x=1000.0,
+        origin_y=2000.0,
+        epsg=3857,
+        allclose_rtol=1e-6,
+        allclose_atol=1e-6,
+        clean_working_dir=True,
+    )
+
+    return polygons, raster_values, result
+
+
 def main():
     """CLI entrypoint for validating a zonal-stats runner configuration.
 
@@ -1058,6 +1627,78 @@ def main():
     validates it via `parse_and_validate_config`, configures logging based on the
     `[project].log_level` setting, and logs a validation summary for each job.
     """
+    polygons, raster_values, result = example_fast_zonal_statistics_test_case(
+        fast_zonal_statistics_fn=fast_zonal_statistics
+    )
+    print(result["actual"][10])
+    expected = {
+        10: {
+            "min": 1.0,
+            "max": 7.0,
+            "count": 7,
+            "nodata_count": 0,
+            "valid_count": 7,
+            "sum": 28.0,
+            "stdev": 2.000000,
+            "p50": 4.000000,
+            "p90": 6.400000,
+        },
+        20: {
+            "min": 12.0,
+            "max": 19.0,
+            "count": 6,
+            "nodata_count": 1,
+            "valid_count": 5,
+            "sum": 80.0,
+            "stdev": 2.607681,
+            "p50": 17.000000,
+            "p90": 18.600000,
+        },
+    }
+
+    def assert_actual_matches_expected(actual, expected, float_tol=1e-6):
+        for gid, exp in expected.items():
+            if gid not in actual:
+                raise AssertionError(
+                    f"missing group_id={gid} in actual results"
+                )
+            a = actual[gid]
+            for k, v in exp.items():
+                if k not in a:
+                    raise AssertionError(
+                        f"missing key={k} for group_id={gid} in actual results"
+                    )
+                av = a[k]
+                if isinstance(v, float):
+                    if av is None or not math.isclose(
+                        float(av), float(v), rel_tol=0.0, abs_tol=float_tol
+                    ):
+                        raise AssertionError(
+                            f"group_id={gid} key={k} expected={v} actual={av}"
+                        )
+                else:
+                    if av != v:
+                        raise AssertionError(
+                            f"group_id={gid} key={k} expected={v} actual={av}"
+                        )
+
+    polygons, raster_values, result = example_fast_zonal_statistics_test_case(
+        fast_zonal_statistics_fn=fast_zonal_statistics
+    )
+
+    assert_actual_matches_expected(result["actual"], expected)
+
+    pretty_print_zonal_stats_result_with_polygon_values(
+        polygons,
+        result,
+        raster_values=raster_values,
+        raster_nodata=-9999,
+        ignore_nodata=True,
+        title_key="group_id",
+        stats_root_key="actual",
+        float_digits=6,
+    )
+    return
     parser = argparse.ArgumentParser()
     parser.add_argument("config", help="Path to INI configuration file")
     args = parser.parse_args()
