@@ -546,6 +546,8 @@ def fast_zonal_statistics(
                 (feature_id_raster_path, 1), offset_only=True
             )
         )
+        logger.info(feature_id_raster_offsets)
+        sys.exit()
         logger.info(
             "iterblocks prepared | blocks=%d",
             len(feature_id_raster_offsets),
@@ -578,7 +580,6 @@ def fast_zonal_statistics(
 
         logger.info("gathering stats from raster blocks")
         block_log_time = time.time()
-        group_digest = None
         group_sketch = None
         if percentile_list:
             group_sketch = defaultdict(lambda: kll_floats_sketch(k=200))
@@ -705,6 +706,13 @@ def fast_zonal_statistics(
                     group_stats["max"] = max(
                         group_stats["max"], feature_stats["max"]
                     )
+
+        for group_value, group_stats in grouped_stats.items():
+            valid_count = group_stats["count"] - group_stats["nodata_count"]
+            group_stats["valid_count"] = valid_count
+            group_stats["mean"] = (
+                (group_stats["sum"] / valid_count) if valid_count > 0 else None
+            )
 
         if group_sketch is not None:
             for group_value, sk in group_sketch.items():
