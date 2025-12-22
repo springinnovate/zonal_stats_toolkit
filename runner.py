@@ -1,9 +1,10 @@
 from __future__ import annotations
+from threading import Thread
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-import argparse
 import collections
+import argparse
 import configparser
 import csv
 import logging
@@ -19,24 +20,18 @@ import fiona
 import numpy as np
 from datasketches import kll_floats_sketch
 
+
 logger = logging.getLogger(__name__)
 
 _LOGGING_PERIOD = 10.0
 VALID_OPERATIONS = {
-    "avg",
+    "mean",
     "stdev",
     "min",
     "max",
     "sum",
     "total_count",
     "valid_count",
-    "median",
-    "p5",
-    "p10",
-    "p25",
-    "p75",
-    "p90",
-    "p95",
 }
 
 
@@ -207,7 +202,8 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
             raise ValueError(f"[job:{tag}] operations is empty")
 
         invalid_ops = sorted(set(operations) - VALID_OPERATIONS)
-        if invalid_ops:
+        # allow any p, but all others need to match
+        if any([op for op in invalid_ops if not op.startswith("p")]):
             raise ValueError(
                 f"[job:{tag}] invalid operations: {invalid_ops}. "
                 f"Valid operations: {sorted(VALID_OPERATIONS)}"
@@ -238,7 +234,6 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
         workdir = global_work_dir / Path(tag)
         outdir.mkdir(parents=True, exist_ok=True)
         workdir.mkdir(parents=True, exist_ok=True)
-
         job_list.append(
             {
                 "tag": tag,
@@ -303,7 +298,7 @@ def fast_zonal_statistics(
     empty_group_stats_template = {
         "min": None,
         "max": None,
-        "count": 0,
+        "total_count": 0,
         "nodata_count": 0,
         "valid_count": 0,
         "sum": 0.0,
@@ -317,7 +312,7 @@ def fast_zonal_statistics(
     feature_stats_template = {
         "min": None,
         "max": None,
-        "count": 0,
+        "total_count": 0,
         "nodata_count": 0,
         "sum": 0.0,
         "sumsq": 0.0,
@@ -527,9 +522,6 @@ def fast_zonal_statistics(
         feature_stats_by_id = collections.defaultdict(
             lambda: dict(feature_stats_template)
         )
-        group_value_chunks = (
-            collections.defaultdict(list) if percentile_list else None
-        )
 
         feature_id_raster_path = os.path.join(temp_working_dir, "agg_fid.tif")
         feature_id_raster_nodata = -1
@@ -543,11 +535,11 @@ def fast_zonal_statistics(
 
         feature_id_raster_offsets = list(
             geoprocessing.iterblocks(
-                (feature_id_raster_path, 1), offset_only=True
+                (feature_id_raster_path, 1),
+                offset_only=True,
+                largest_block=2**28,
             )
         )
-        logger.info(feature_id_raster_offsets)
-        sys.exit()
         logger.info(
             "iterblocks prepared | blocks=%d",
             len(feature_id_raster_offsets),
@@ -623,7 +615,7 @@ def fast_zonal_statistics(
                 nodata_count = int(np.count_nonzero(feature_nodata_mask))
 
                 feature_stats = feature_stats_by_id[feature_id]
-                feature_stats["count"] += total_count
+                feature_stats["total_count"] += total_count
                 feature_stats["nodata_count"] += nodata_count
 
                 if ignore_nodata:
@@ -687,13 +679,13 @@ def fast_zonal_statistics(
             feature_stats = feature_stats_by_id[feature_id]
             group_stats = grouped_stats[group_value]
 
-            group_stats["count"] += feature_stats["count"]
+            group_stats["total_count"] += feature_stats["total_count"]
             group_stats["nodata_count"] += feature_stats["nodata_count"]
             group_stats["sum"] += feature_stats["sum"]
             group_stats["sumsq"] += feature_stats["sumsq"]
 
             feature_valid_count = (
-                feature_stats["count"] - feature_stats["nodata_count"]
+                feature_stats["total_count"] - feature_stats["nodata_count"]
             )
             if feature_valid_count > 0:
                 if group_stats["min"] is None:
@@ -708,7 +700,9 @@ def fast_zonal_statistics(
                     )
 
         for group_value, group_stats in grouped_stats.items():
-            valid_count = group_stats["count"] - group_stats["nodata_count"]
+            valid_count = (
+                group_stats["total_count"] - group_stats["nodata_count"]
+            )
             group_stats["valid_count"] = valid_count
             group_stats["mean"] = (
                 (group_stats["sum"] / valid_count) if valid_count > 0 else None
@@ -722,7 +716,9 @@ def fast_zonal_statistics(
                     ] = sk.get_quantile(p / 100.0)
 
         for group_value, group_stats in grouped_stats.items():
-            valid_count = group_stats["count"] - group_stats["nodata_count"]
+            valid_count = (
+                group_stats["total_count"] - group_stats["nodata_count"]
+            )
             group_stats["valid_count"] = valid_count
             if valid_count > 0:
                 mean_value = group_stats["sum"] / valid_count
@@ -755,44 +751,46 @@ def run_zonal_stats_job(
     workdir: Path,
     tag: str,
     row_col_order: str,
+    task_graph,
 ):
     raster_stems = []
     raster_stats_by_stem = {}
     all_groups = set()
-    stat_fields = None
 
     percentile_list = [
         float(op[1:])
         for op in operations
         if op.startswith("p") and op[1:].replace(".", "", 1).isdigit()
     ]
-
     for raster_path in base_raster_path_list:
         stem = raster_path.stem
         raster_stems.append(stem)
-        stats = fast_zonal_statistics(
-            (str(raster_path), 1),
-            str(agg_vector),
-            agg_field,
-            aggregate_layer_name=agg_layer,
-            ignore_nodata=True,
-            working_dir=str(workdir),
-            clean_working_dir=False,
-            percentile_list=percentile_list,
+        stats_task = task_graph.add_task(
+            func=fast_zonal_statistics,
+            args=(
+                (str(raster_path), 1),
+                str(agg_vector),
+                agg_field,
+            ),
+            kwargs={
+                "aggregate_layer_name": agg_layer,
+                "ignore_nodata": True,
+                "working_dir": str(workdir),
+                "clean_working_dir": False,
+                "percentile_list": percentile_list,
+            },
+            store_result=True,
+            task_name=f"stats for {tag}",
         )
+        stats = stats_task.get()
         raster_stats_by_stem[stem] = stats
         all_groups.update(stats.keys())
-        if stat_fields is None and stats:
-            stat_fields = list(next(iter(stats.values())).keys())
-
-    if stat_fields is None:
-        stat_fields = ["min", "max", "count", "nodata_count", "sum"]
 
     parts = [p.strip() for p in row_col_order.split(",") if p.strip()]
     if parts == ["agg_field", "base_raster"]:
         first_col = agg_field
         columns = [
-            f"{field}_{stem}" for stem in raster_stems for field in stat_fields
+            f"{field}_{stem}" for stem in raster_stems for field in operations
         ]
 
         def row_iter():
@@ -804,7 +802,7 @@ def run_zonal_stats_job(
                 }
                 for stem in raster_stems:
                     s = raster_stats_by_stem[stem][group_value]
-                    for field in stat_fields:
+                    for field in operations:
                         row[f"{field}_{stem}"] = s[field]
                 yield row
 
@@ -813,7 +811,7 @@ def run_zonal_stats_job(
         columns = [
             f'{field}_{"" if gv is None else str(gv)}'
             for gv in sorted(all_groups, key=lambda v: (v is None, str(v)))
-            for field in stat_fields
+            for field in operations
         ]
 
         ordered_groups = sorted(all_groups, key=lambda v: (v is None, str(v)))
@@ -827,7 +825,7 @@ def run_zonal_stats_job(
                     group_label = (
                         "" if group_value is None else str(group_value)
                     )
-                    for field in stat_fields:
+                    for field in operations:
                         row[f"{field}_{group_label}"] = s[field]
                 yield row
 
@@ -890,15 +888,6 @@ def run_fast_zonal_statistics_test_case(
     working_dir=None,
     clean_working_dir=True,
 ):
-    import collections
-    import math
-    import os
-    import shutil
-    import tempfile
-
-    import numpy as np
-    from osgeo import gdal, ogr, osr
-
     raster_values = np.asarray(raster_values)
     if raster_values.ndim != 2:
         raise ValueError("raster_values must be 2D")
@@ -916,7 +905,7 @@ def run_fast_zonal_statistics_test_case(
         compare_keys = [
             "min",
             "max",
-            "count",
+            "total_count",
             "nodata_count",
             "valid_count",
             "sum",
@@ -972,7 +961,7 @@ def run_fast_zonal_statistics_test_case(
             return {
                 "min": None,
                 "max": None,
-                "count": int(0),
+                "total_count": int(0),
                 "nodata_count": int(0),
                 "valid_count": int(0),
                 "sum": 0.0,
@@ -999,7 +988,7 @@ def run_fast_zonal_statistics_test_case(
             stats = {
                 "min": 0.0,
                 "max": 0.0,
-                "count": count_value,
+                "total_count": count_value,
                 "nodata_count": nodata_count_value,
                 "valid_count": 0,
                 "sum": 0.0,
@@ -1021,7 +1010,7 @@ def run_fast_zonal_statistics_test_case(
         stats = {
             "min": float(np.min(valid_values)),
             "max": float(np.max(valid_values)),
-            "count": count_value,
+            "total_count": count_value,
             "nodata_count": nodata_count_value,
             "valid_count": valid_count_value,
             "sum": sum_value,
@@ -1116,7 +1105,7 @@ def run_fast_zonal_statistics_test_case(
         if expect_grouped_stats is None:
             expected_values_by_group = collections.defaultdict(list)
             expected_counts_by_group = collections.defaultdict(
-                lambda: {"count": 0, "nodata_count": 0}
+                lambda: {"total_count": 0, "nodata_count": 0}
             )
 
             for polygon_spec in polygons:
@@ -1136,7 +1125,7 @@ def run_fast_zonal_statistics_test_case(
                 else:
                     nodata_mask = np.isclose(window_values, raster_nodata)
 
-                expected_counts_by_group[group_value]["count"] += int(
+                expected_counts_by_group[group_value]["total_count"] += int(
                     window_values.size
                 )
                 expected_counts_by_group[group_value]["nodata_count"] += int(
@@ -1151,14 +1140,14 @@ def run_fast_zonal_statistics_test_case(
                     else np.array([], dtype=np.float64)
                 )
                 group_stats = _masked_stats(combined_values, percentile_keys)
-                group_stats["count"] = int(
-                    expected_counts_by_group[group_value]["count"]
+                group_stats["total_count"] = int(
+                    expected_counts_by_group[group_value]["total_count"]
                 )
                 group_stats["nodata_count"] = int(
                     expected_counts_by_group[group_value]["nodata_count"]
                 )
                 group_stats["valid_count"] = int(
-                    group_stats["count"] - group_stats["nodata_count"]
+                    group_stats["total_count"] - group_stats["nodata_count"]
                 )
                 expect_grouped_stats[group_value] = group_stats
 
@@ -1188,46 +1177,6 @@ def run_fast_zonal_statistics_test_case(
             shutil.rmtree(temp_dir)
 
 
-def example_fast_zonal_statistics_test_case(*, fast_zonal_statistics_fn):
-    import numpy as np
-
-    raster_values = np.array(
-        [
-            [1, 2, 3, 4, 5],
-            [6, 7, 8, 9, 10],
-            [11, 12, -9999, 14, 15],
-            [16, 17, 18, 19, 20],
-            [21, 22, 23, 24, 25],
-        ],
-        dtype=np.float32,
-    )
-
-    polygons = [
-        {"group_value": 10, "window": (0, 0, 2, 2)},
-        {"group_value": 10, "window": (2, 0, 3, 1)},
-        {"group_value": 20, "window": (1, 2, 3, 2)},
-    ]
-
-    return polygons, run_fast_zonal_statistics_test_case(
-        fast_zonal_statistics_fn=fast_zonal_statistics_fn,
-        raster_values=raster_values,
-        polygons=polygons,
-        aggregate_vector_field="group_id",
-        aggregate_layer_name="polys",
-        ignore_nodata=True,
-        polygons_might_overlap=False,
-        percentile_list=[50, 90],
-        raster_nodata=-9999,
-        pixel_size=10.0,
-        origin_x=1000.0,
-        origin_y=2000.0,
-        epsg=3857,
-        allclose_rtol=1e-6,
-        allclose_atol=1e-6,
-        clean_working_dir=True,
-    )
-
-
 def pretty_print_zonal_stats_result_with_polygon_values(
     polygons,
     result,
@@ -1252,7 +1201,7 @@ def pretty_print_zonal_stats_result_with_polygon_values(
         preferred_stat_order = [
             "min",
             "max",
-            "count",
+            "total_count",
             "nodata_count",
             "valid_count",
             "sum",
@@ -1406,6 +1355,81 @@ def example_fast_zonal_statistics_test_case(*, fast_zonal_statistics_fn):
     return polygons, raster_values, result
 
 
+def run_test():
+    polygons, raster_values, result = example_fast_zonal_statistics_test_case(
+        fast_zonal_statistics_fn=fast_zonal_statistics
+    )
+    print(result["actual"][10])
+    expected = {
+        10: {
+            "min": 1.0,
+            "max": 7.0,
+            "total_count": 7,
+            "nodata_count": 0,
+            "valid_count": 7,
+            "sum": 28.0,
+            "stdev": 2.000000,
+            "p50": 4.000000,
+            "p90": 7,
+        },
+        20: {
+            "min": 12.0,
+            "max": 19.0,
+            "total_count": 6,
+            "nodata_count": 1,
+            "valid_count": 5,
+            "sum": 80.0,
+            "stdev": 2.607681,
+            "p50": 17.000000,
+            "p90": 19,
+        },
+    }
+
+    def assert_actual_matches_expected(actual, expected, float_tol=1e-6):
+        for gid, exp in expected.items():
+            if gid not in actual:
+                raise AssertionError(
+                    f"missing group_id={gid} in actual results"
+                )
+            a = actual[gid]
+            for k, v in exp.items():
+                if k not in a:
+                    raise AssertionError(
+                        f"missing key={k} for group_id={gid} in actual results"
+                    )
+                av = a[k]
+                if isinstance(v, float):
+                    if av is None or not math.isclose(
+                        float(av), float(v), rel_tol=0.0, abs_tol=float_tol
+                    ):
+                        raise AssertionError(
+                            f"group_id={gid} key={k} expected={v} actual={av}"
+                        )
+                else:
+                    if av != v:
+                        raise AssertionError(
+                            f"group_id={gid} key={k} expected={v} actual={av}"
+                        )
+
+    polygons, raster_values, result = example_fast_zonal_statistics_test_case(
+        fast_zonal_statistics_fn=fast_zonal_statistics
+    )
+
+    assert_actual_matches_expected(result["actual"], expected)
+
+    pretty_print_zonal_stats_result_with_polygon_values(
+        polygons,
+        result,
+        raster_values=raster_values,
+        raster_nodata=-9999,
+        ignore_nodata=True,
+        title_key="group_id",
+        stats_root_key="actual",
+        float_digits=6,
+    )
+    return
+
+
 def main():
     """CLI entrypoint for validating a zonal-stats runner configuration.
 
@@ -1413,81 +1437,14 @@ def main():
     validates it via `parse_and_validate_config`, configures logging based on the
     `[project].log_level` setting, and logs a validation summary for each job.
     """
-    # polygons, raster_values, result = example_fast_zonal_statistics_test_case(
-    #     fast_zonal_statistics_fn=fast_zonal_statistics
-    # )
-    # print(result["actual"][10])
-    # expected = {
-    #     10: {
-    #         "min": 1.0,
-    #         "max": 7.0,
-    #         "count": 7,
-    #         "nodata_count": 0,
-    #         "valid_count": 7,
-    #         "sum": 28.0,
-    #         "stdev": 2.000000,
-    #         "p50": 4.000000,
-    #         "p90": 7,
-    #     },
-    #     20: {
-    #         "min": 12.0,
-    #         "max": 19.0,
-    #         "count": 6,
-    #         "nodata_count": 1,
-    #         "valid_count": 5,
-    #         "sum": 80.0,
-    #         "stdev": 2.607681,
-    #         "p50": 17.000000,
-    #         "p90": 19,
-    #     },
-    # }
-
-    # def assert_actual_matches_expected(actual, expected, float_tol=1e-6):
-    #     for gid, exp in expected.items():
-    #         if gid not in actual:
-    #             raise AssertionError(
-    #                 f"missing group_id={gid} in actual results"
-    #             )
-    #         a = actual[gid]
-    #         for k, v in exp.items():
-    #             if k not in a:
-    #                 raise AssertionError(
-    #                     f"missing key={k} for group_id={gid} in actual results"
-    #                 )
-    #             av = a[k]
-    #             if isinstance(v, float):
-    #                 if av is None or not math.isclose(
-    #                     float(av), float(v), rel_tol=0.0, abs_tol=float_tol
-    #                 ):
-    #                     raise AssertionError(
-    #                         f"group_id={gid} key={k} expected={v} actual={av}"
-    #                     )
-    #             else:
-    #                 if av != v:
-    #                     raise AssertionError(
-    #                         f"group_id={gid} key={k} expected={v} actual={av}"
-    #                     )
-
-    # polygons, raster_values, result = example_fast_zonal_statistics_test_case(
-    #     fast_zonal_statistics_fn=fast_zonal_statistics
-    # )
-
-    # assert_actual_matches_expected(result["actual"], expected)
-
-    # pretty_print_zonal_stats_result_with_polygon_values(
-    #     polygons,
-    #     result,
-    #     raster_values=raster_values,
-    #     raster_nodata=-9999,
-    #     ignore_nodata=True,
-    #     title_key="group_id",
-    #     stats_root_key="actual",
-    #     float_digits=6,
-    # )
-    # return
     parser = argparse.ArgumentParser()
     parser.add_argument("config", help="Path to INI configuration file")
+    parser.add_argument("--test", action="store_true")
     args = parser.parse_args()
+
+    if args.test:
+        run_test()
+        return
 
     cfg_path = Path(args.config)
     cfg = parse_and_validate_config(cfg_path)
@@ -1505,6 +1462,8 @@ def main():
 
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 
+    thread_list = []
+
     for job in cfg["job_list"]:
         logger.info(
             "Validated job:%s (operations=%s)",
@@ -1516,13 +1475,13 @@ def main():
             f"{output_path.stem}_{timestamp}{output_path.suffix}"
         )
         job["output_csv"] = output_path_timestamped
+        job["task_graph"] = task_graph
 
-        task_graph.add_task(
-            func=run_zonal_stats_job,
-            kwargs=job,
-            target_path_list=[output_path_timestamped],
-            task_name=f"zonal stats {job['tag']}",
-        )
+        thread = Thread(target=run_zonal_stats_job, kwargs=job)
+        thread.start()
+        thread_list.append(thread)
+    for thread in thread_list:
+        thread.join()
     logger.info("All jobs validated (%d)", len(cfg["job_list"]))
     task_graph.join()
     task_graph.close()
