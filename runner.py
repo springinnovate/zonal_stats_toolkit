@@ -1,6 +1,7 @@
 from __future__ import annotations
 from threading import Thread
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 import collections
@@ -119,10 +120,10 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
     job_tags = []
     jobs_sections = []
     for section in config.sections():
-        if section == "projects":
-            continue
         section_clean = section.strip()
         section_lower = section_clean.lower()
+        if section_lower == "project":
+            continue
         if section_lower.startswith("raster_job:") or section_lower.startswith(
             "vector_job:"
         ):
@@ -817,6 +818,14 @@ def fast_zonal_statistics(
             shutil.rmtree(temp_working_dir)
 
 
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+from pyproj import CRS, Transformer
+from shapely.strtree import STRtree
+from tqdm import tqdm
+
+
 def run_vector_stats_job(
     base_vector_path_list,
     base_vector_fields,
@@ -834,35 +843,68 @@ def run_vector_stats_job(
     if job_type != "vector":
         raise ValueError(f"unexpected job type for run_vector_stats_job: {job_type}")
 
-    agg_gdf = gpd.read_file(agg_vector, layer=agg_layer)
-    agg_crs = CRS.from_user_input(agg_gdf.crs) if agg_gdf.crs else None
+    logger.info("parsing operations for tag=%s", tag)
+    ops = [o.strip().lower() for o in operations if str(o).strip()]
+    core_ops = []
+    pct_list = []
+    for op in ops:
+        if op.startswith("p") and len(op) > 1:
+            pct_list.append(float(op[1:]))
+        else:
+            core_ops.append(op)
+    core_ops = list(dict.fromkeys(core_ops))
+    pct_list = sorted(set(pct_list))
+    logger.info(
+        "operations parsed for tag=%s core_ops=%s pct_list=%s",
+        tag,
+        core_ops,
+        pct_list,
+    )
 
+    logger.info(
+        "reading agg vector for tag=%s path=%s layer=%s",
+        tag,
+        agg_vector,
+        agg_layer,
+    )
+    agg_gdf = gpd.read_file(agg_vector, layer=agg_layer)
+    logger.info("agg vector read for tag=%s features=%d", tag, len(agg_gdf))
+
+    agg_crs = CRS.from_user_input(agg_gdf.crs) if agg_gdf.crs else None
+    logger.info("agg CRS for tag=%s crs=%s", tag, str(agg_crs) if agg_crs else None)
+
+    logger.info("dissolving agg features for tag=%s by=%s", tag, agg_field)
     agg_groups = agg_gdf.dissolve(by=agg_field)
+    logger.info("dissolve complete for tag=%s groups=%d", tag, len(agg_groups))
+
     group_geoms = list(agg_groups.geometry.values)
     group_keys = list(agg_groups.index)
     group_keys_arr = np.asarray(group_keys, dtype=object)
+    n_groups = len(group_keys_arr)
 
+    logger.info("building STRtree for tag=%s groups=%d", tag, n_groups)
     tree = STRtree(group_geoms)
+    logger.info("STRtree built for tag=%s", tag)
+
+    logger.info("building geometry-id index map for tag=%s groups=%d", tag, n_groups)
+    geom_id_to_idx = {id(g): i for i, g in enumerate(group_geoms)}
+    logger.info("geometry-id index map built for tag=%s", tag)
 
     transformers_by_stem = {}
     assignments_by_stem = {}
+    result_frames = []
 
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-
-    tokens = [t.strip() for t in row_col_order.split(",") if t.strip()]
-    col_map = {"agg_field": agg_field, "base_vector": "base_vector"}
-    prefix_cols = [col_map[t] for t in tokens if t in col_map]
-    base_cols = ["base_vector", agg_field, "base_fid"]
-    out_cols = prefix_cols + [c for c in base_cols if c not in prefix_cols]
-
-    header_written = False
     chunk_size = 1_000
+    logger.info("chunk_size set for tag=%s chunk_size=%d", tag, chunk_size)
 
     for base_vector_path in base_vector_path_list:
         base_vector_path = Path(base_vector_path)
         stem = base_vector_path.stem
 
         base_gdf = gpd.read_file(base_vector_path)
+        keep_cols = [c for c in base_vector_fields if c in base_gdf.columns]
+        base_gdf = base_gdf[keep_cols + ["geometry"]]
+
         base_crs = CRS.from_user_input(base_gdf.crs) if base_gdf.crs else None
 
         transformer = None
@@ -872,47 +914,159 @@ def run_vector_stats_job(
 
         transformers_by_stem[stem] = transformer
 
-        assignments = {}
-
         fids_all = base_gdf.index.to_numpy()
         geoms_all = base_gdf.geometry.values
         n = len(fids_all)
 
-        for start in tqdm(
-            range(0, n, chunk_size),
-            total=(n + chunk_size - 1) // chunk_size,
-            desc=f"finding closest geom: {stem}",
-        ):
-            end = min(start + chunk_size, n)
-            fids = fids_all[start:end]
-            geoms = geoms_all[start:end]
+        nearest_idx = np.empty(n, dtype=np.int64)
 
-            nearest_idx = tree.nearest(geoms)
-            keys = group_keys_arr[nearest_idx]
+        starts = list(range(0, n, chunk_size))
+        tasks = [(s, geoms_all[s : min(s + chunk_size, n)]) for s in starts]
 
-            df_chunk = pd.DataFrame(
-                {"base_vector": stem, agg_field: keys, "base_fid": fids}
-            )[out_cols]
-            df_chunk.to_csv(
-                output_csv,
-                mode="a" if header_written else "w",
-                header=not header_written,
-                index=False,
+        nearest_idx = np.empty(n, dtype=np.int64)
+
+        def _nearest_chunk_thread(args):
+            start, geoms = args
+            nearest = np.asarray(tree.nearest(geoms))
+            if nearest.dtype == object:
+                nearest = np.fromiter(
+                    (geom_id_to_idx[id(g)] for g in nearest),
+                    dtype=np.int64,
+                    count=len(nearest),
+                )
+            return start, nearest.astype(np.int64, copy=False)
+
+        tasks = [
+            (s, geoms_all[s : min(s + chunk_size, n)]) for s in range(0, n, chunk_size)
+        ]
+
+        with ThreadPoolExecutor() as ex:
+            for start, nearest in tqdm(
+                ex.map(_nearest_chunk_thread, tasks, chunksize=1),
+                total=len(tasks),
+                desc=f"finding closest geom: {stem}",
+            ):
+                nearest_idx[start : start + len(nearest)] = nearest
+
+        order = np.argsort(nearest_idx, kind="mergesort")
+        g_sorted = nearest_idx[order]
+        f_sorted = fids_all[order]
+        uniq_g, start_idx, counts = np.unique(
+            g_sorted, return_index=True, return_counts=True
+        )
+        assignments_by_stem[stem] = {
+            group_keys_arr[int(g)]: f_sorted[s : s + c]
+            for g, s, c in zip(uniq_g, start_idx, counts)
+        }
+
+        res = pd.DataFrame({agg_field: group_keys_arr})
+        res["base_vector"] = stem
+
+        if "total_count" in core_ops:
+            res["total_count"] = np.bincount(nearest_idx, minlength=n_groups).astype(
+                np.int64
             )
-            header_written = True
 
-            order = np.argsort(nearest_idx)
-            nearest_sorted = nearest_idx[order]
-            fids_sorted = fids[order]
+        idx_range = np.arange(n_groups, dtype=np.int64)
 
-            uniq, counts = np.unique(nearest_sorted, return_counts=True)
-            ends = np.cumsum(counts)
-            starts = ends - counts
-            for u, s, e in zip(uniq, starts, ends):
-                k = group_keys_arr[int(u)]
-                assignments.setdefault(k, []).extend(fids_sorted[s:e].tolist())
+        need_sort_per_field = (
+            ("min" in core_ops) or ("max" in core_ops) or (len(pct_list) > 0)
+        )
 
-        assignments_by_stem[stem] = assignments
+        for field in base_vector_fields:
+            vals = base_gdf[field].to_numpy()
+            m = ~pd.isna(vals)
+            g_valid = nearest_idx[m]
+            v_valid = vals[m].astype(float, copy=False)
+
+            valid_count = None
+            sum_v = None
+            sum_v2 = None
+
+            if (
+                ("valid_count" in core_ops)
+                or ("mean" in core_ops)
+                or ("stdev" in core_ops)
+                or ("sum" in core_ops)
+            ):
+                valid_count = np.bincount(g_valid, minlength=n_groups).astype(np.int64)
+
+            if ("mean" in core_ops) or ("stdev" in core_ops) or ("sum" in core_ops):
+                sum_v = np.bincount(
+                    g_valid, weights=v_valid, minlength=n_groups
+                ).astype(float, copy=False)
+
+            if "stdev" in core_ops:
+                sum_v2 = np.bincount(
+                    g_valid, weights=v_valid * v_valid, minlength=n_groups
+                ).astype(float, copy=False)
+
+            if "valid_count" in core_ops:
+                res[f"{field}_valid_count"] = valid_count
+
+            if "sum" in core_ops:
+                out = np.full(n_groups, np.nan, dtype=float)
+                ok = valid_count > 0
+                out[ok] = sum_v[ok]
+                res[f"{field}_sum"] = out
+
+            if "mean" in core_ops:
+                out = np.full(n_groups, np.nan, dtype=float)
+                ok = valid_count > 0
+                out[ok] = sum_v[ok] / valid_count[ok]
+                res[f"{field}_mean"] = out
+
+            if "stdev" in core_ops:
+                mean = np.full(n_groups, np.nan, dtype=float)
+                ok = valid_count > 0
+                mean[ok] = sum_v[ok] / valid_count[ok]
+                mean2 = np.full(n_groups, np.nan, dtype=float)
+                mean2[ok] = sum_v2[ok] / valid_count[ok]
+                var = mean2 - mean * mean
+                var[var < 0] = 0
+                res[f"{field}_stdev"] = np.sqrt(var)
+
+            if need_sort_per_field:
+                ord2 = np.argsort(g_valid, kind="mergesort")
+                g2 = g_valid[ord2]
+                v2 = v_valid[ord2]
+                uniq2, starts2, counts2 = np.unique(
+                    g2, return_index=True, return_counts=True
+                )
+
+                if "min" in core_ops:
+                    out = np.full(n_groups, np.nan, dtype=float)
+                    out[uniq2] = np.minimum.reduceat(v2, starts2)
+                    res[f"{field}_min"] = out
+
+                if "max" in core_ops:
+                    out = np.full(n_groups, np.nan, dtype=float)
+                    out[uniq2] = np.maximum.reduceat(v2, starts2)
+                    res[f"{field}_max"] = out
+
+                if pct_list:
+                    for p in pct_list:
+                        p_str = (
+                            str(int(p)) if float(p).is_integer() else str(p)
+                        ).replace(".", "_")
+                        col = f"{field}_p{p_str}"
+                        out = np.full(n_groups, np.nan, dtype=float)
+                        for g, s, c in zip(uniq2, starts2, counts2):
+                            out[int(g)] = np.percentile(v2[s : s + c], p)
+                        res[col] = out
+
+        result_frames.append(res)
+
+    df = pd.concat(result_frames, ignore_index=True)
+
+    tokens = [t.strip() for t in row_col_order.split(",") if t.strip()]
+    col_map = {"agg_field": agg_field, "base_vector": "base_vector"}
+    prefix = [col_map[t] for t in tokens if t in col_map]
+    cols = prefix + [c for c in df.columns if c not in prefix]
+    df = df[cols]
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output_csv, index=False)
 
     return transformers_by_stem, assignments_by_stem
 
@@ -1613,9 +1767,10 @@ def main():
     logger.setLevel(log_level)
     logger.info("Loaded config %s", str(cfg_path))
     logger.info(cfg)
-    task_graph = taskgraph.TaskGraph(
-        cfg["project"]["global_work_dir"], os.cpu_count() // 2 + 1, 15.0
-    )
+    # task_graph = taskgraph.TaskGraph(
+    #     cfg["project"]["global_work_dir"], os.cpu_count() // 2 + 1, 15.0
+    # )
+    task_graph = taskgraph.TaskGraph(cfg["project"]["global_work_dir"], -1)
 
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 
@@ -1640,7 +1795,6 @@ def main():
             thread = Thread(target=run_raster_zonal_stats_job, kwargs=job)
         if job["job_type"] == "vector":
             logger.info("running a vector")
-            continue
             thread = Thread(target=run_vector_stats_job, kwargs=job)
         thread.start()
         thread_list.append(thread)
