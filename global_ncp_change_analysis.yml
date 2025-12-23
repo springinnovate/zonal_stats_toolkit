@@ -7,41 +7,41 @@ log_level = INFO
 [job:country]
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = nev_name
-operations = avg,stdev,valid_count,total_count,p5,p95
+operations = mean,stdev,valid_count,total_count,p5,p95
 row_col_order=agg_field,base_raster
-base_raster_pattern=./jeronimodata/Spring/Inspring/*.tif,./jeronimodata/change_calc/*.tif
+base_raster_pattern=./jeronimodata/rasters_to_summarize/*.tif
 
 [job:continent]
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = continent
-operations = avg,stdev,valid_count,total_count,p5,p95
+operations = mean,stdev,valid_count,total_count,p5,p95
 row_col_order=agg_field,base_raster
-base_raster_pattern=./jeronimodata/Spring/Inspring/*.tif,./jeronimodata/change_calc/*.tif
+base_raster_pattern=./jeronimodata/rasters_to_summarize/*.tif
 
 [job:region_un]
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = region_un
-operations = avg,stdev,valid_count,total_count,p5,p95
+operations = mean,stdev,valid_count,total_count,p5,p95
 row_col_order=agg_field,base_raster
-base_raster_pattern=./jeronimodata/Spring/Inspring/*.tif,./jeronimodata/change_calc/*.tif
+base_raster_pattern=./jeronimodata/rasters_to_summarize/*.tif
 
 [job:subregion]
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = subregion
-operations = avg,stdev,valid_count,total_count,p5,p95
+operations = mean,stdev,valid_count,total_count,p5,p95
 row_col_order=agg_field,base_raster
-base_raster_pattern=./jeronimodata/Spring/Inspring/*.tif,./jeronimodata/change_calc/*.tif
+base_raster_pattern=./jeronimodata/rasters_to_summarize/*.tif
 
 [job:income_grp]
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = income_grp
-operations = avg,stdev,valid_count,total_count,p5,p95
+operations = mean,stdev,valid_count,total_count,p5,p95
 row_col_order=agg_field,base_raster
-base_raster_pattern=./jeronimodata/Spring/Inspring/*.tif,./jeronimodata/change_calc/*.tif
+base_raster_pattern=./jeronimodata/rasters_to_summarize/*.tif
 
 [job:biome]
 agg_vector = ./jeronimodata/vector_basedata/Biome.gpkg
 agg_field = WWF_biome
-operations = avg,stdev,valid_count,total_count,p5,p95
+operations = mean,stdev,valid_count,total_count,p5,p95
 row_col_order=agg_field,base_raster
-base_raster_pattern=./jeronimodata/Spring/Inspring/*.tif,./jeronimodata/change_calc/*.tif
+base_raster_pattern=./jeronimodata/rasters_to_summarize/*.tif
