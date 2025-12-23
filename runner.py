@@ -1391,7 +1391,7 @@ def main():
     logger = logging.getLogger(cfg["project"]["name"])
     logger.info("Loaded config %s", str(cfg_path))
     task_graph = taskgraph.TaskGraph(
-        cfg["project"]["global_work_dir"], len(cfg["job_list"]) + 1, 15.0
+        cfg["project"]["global_work_dir"], os.cpu_count() // 2 + 1, 15.0
     )
 
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
