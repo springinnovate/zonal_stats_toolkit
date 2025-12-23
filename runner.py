@@ -671,9 +671,10 @@ def fast_zonal_statistics(
         if group_sketch is not None:
             for group_value, sk in group_sketch.items():
                 for p in percentile_list:
+                    empty = sk.get_n() == 0
                     grouped_stats[group_value][
                         f"p{int(p) if float(p).is_integer() else p}"
-                    ] = sk.get_quantile(p / 100.0)
+                    ] = (None if empty else sk.get_quantile(p / 100.0))
 
         for group_value, group_stats in grouped_stats.items():
             valid_count = group_stats["total_count"] - group_stats["nodata_count"]
