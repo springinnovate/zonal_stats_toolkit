@@ -906,7 +906,7 @@ def run_vector_stats_job(
     out_cols = prefix_cols + [c for c in base_cols if c not in prefix_cols]
 
     header_written = False
-    chunk_size = 1_000_000
+    chunk_size = 1_000
 
     for base_vector_path in base_vector_path_list:
         base_vector_path = Path(base_vector_path)
