@@ -14,12 +14,15 @@ import shutil
 import tempfile
 import time
 
+from datasketches import kll_floats_sketch
 from ecoshard import taskgraph, geoprocessing
 from osgeo import gdal, ogr, osr
+from pyproj import CRS, Transformer
+from shapely.strtree import STRtree
+import pandas as pd
 import fiona
 import numpy as np
-from datasketches import kll_floats_sketch
-
+import geopandas as gpd
 
 logger = logging.getLogger(__name__)
 
@@ -82,45 +85,8 @@ def _make_logger_callback(message):
 
 
 def parse_and_validate_config(cfg_path: Path) -> dict:
-    """Parse and validate a zonal-stats runner INI configuration file.
-
-    The configuration file is expected to contain a `[project]` section and one or
-    more `[job:<tag>]` sections. This function validates required keys, enforces
-    naming constraints, checks file existence, verifies vector layer/field
-    presence, and validates the `operations` list against `VALID_OPERATIONS`.
-
-    Validation rules:
-      1) `[project].name` must equal the configuration file stem.
-      2) `[project].log_level` must be a valid `logging` level name.
-      3) Job section tags (`job:<tag>`) must be unique.
-      4) For each job, `agg_vector` must exist; `base_raster` must exist if set.
-      5) `agg_layer` must exist in `agg_vector`, and `agg_field` must exist in
-         that layer schema.
-      6) `operations` must be present and all entries must be in
-         `VALID_OPERATIONS`.
-
-    The returned dictionary contains:
-      - `project`: global configuration values.
-      - `job_list`: a list of per-job dictionaries.
-
-    Args:
-        cfg_path: Path to the INI configuration file.
-
-    Returns:
-        A dictionary with keys:
-          - `project`: Dict containing `name`, `global_work_dir`, and `log_level`.
-          - `job_list`: List of dicts describing each job. Each job dict includes
-            `tag`, `agg_vector`, `agg_layer`, `agg_field`, `base_raster`,
-            `workdir`, `output_csv`, and `operations`.
-
-    Raises:
-        ValueError: If required sections/keys are missing, if values are invalid,
-            if job tags are duplicated, if a layer/field is missing, or if any
-            operation is not recognized.
-        FileNotFoundError: If `agg_vector` does not exist, or if `base_raster` is
-            provided but does not exist.
-    """
     stem = cfg_path.stem
+    cfg_dir = cfg_path.parent
 
     config = configparser.ConfigParser(interpolation=None)
     config.read(cfg_path)
@@ -141,17 +107,31 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
         raise ValueError(f"Invalid log_level: {log_level_str}")
 
     global_work_dir = Path(config["project"]["global_work_dir"].strip())
+    if not global_work_dir.is_absolute():
+        global_work_dir = cfg_dir / global_work_dir
+
     global_output_dir = Path(config["project"]["global_output_dir"].strip())
+    if not global_output_dir.is_absolute():
+        global_output_dir = cfg_dir / global_output_dir
 
     job_tags = []
     jobs_sections = []
     for section in config.sections():
-        if section.startswith("job:"):
-            tag = section.split(":", 1)[1].strip()
+        section_clean = section.strip()
+        section_lower = section_clean.lower()
+        if section_lower.startswith("raster_job:") or section_lower.startswith(
+            "vector_job:"
+        ):
+            job_type = (
+                "raster"
+                if section_lower.startswith("raster_job:")
+                else "vector"
+            )
+            tag = section_clean.split(":", 1)[1].strip()
             if not tag:
-                raise ValueError(f"Invalid job section name: [{section}]")
+                raise ValueError(f"Invalid job section name: [{section_clean}]")
             job_tags.append(tag)
-            jobs_sections.append((tag, config[section]))
+            jobs_sections.append((job_type, tag, config[section]))
 
     if len(job_tags) != len(set(job_tags)):
         seen = set()
@@ -163,16 +143,23 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
         raise ValueError(f"Duplicate job tags found: {sorted(set(dups))}")
 
     job_list = []
-    for tag, job in jobs_sections:
-        agg_vector = Path(job.get("agg_vector", "").strip())
-        if not agg_vector:
-            raise ValueError(f"[job:{tag}] missing agg_vector")
+    for job_type, tag, job in jobs_sections:
+        agg_vector_raw = job.get("agg_vector", "").strip()
+        if not agg_vector_raw:
+            raise ValueError(f"[{job_type}_job:{tag}] missing agg_vector")
+        agg_vector = Path(agg_vector_raw)
+        if not agg_vector.is_absolute():
+            agg_vector = cfg_dir / agg_vector
         if not agg_vector.exists():
-            raise FileNotFoundError(f"[job:{tag}] agg_vector not found: {agg_vector}")
+            raise FileNotFoundError(
+                f"[job:{tag}] agg_vector not found: {agg_vector}"
+            )
 
         base_raster_pattern = job.get("base_raster_pattern", "").strip()
         if base_raster_pattern in [None, ""]:
-            raise FileNotFoundError(f"[job:{tag}] base_raster_pattern tag not found")
+            raise FileNotFoundError(
+                f"[job:{tag}] base_raster_pattern tag not found"
+            )
         base_raster_path_list = [
             path
             for pattern in base_raster_pattern.split(",")
@@ -186,34 +173,37 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
 
         agg_field = job.get("agg_field", "").strip()
         if not agg_field:
-            raise ValueError(f"[job:{tag}] missing agg_field")
+            raise ValueError(f"[{job_type}_job:{tag}] missing agg_field")
 
         ops_raw = job.get("operations", "").strip()
         if not ops_raw:
-            raise ValueError(f"[job:{tag}] missing operations")
-        operations = [o.strip().lower() for o in ops_raw.split(",") if o.strip()]
+            raise ValueError(f"[{job_type}_job:{tag}] missing operations")
+        operations = [
+            o.strip().lower() for o in ops_raw.split(",") if o.strip()
+        ]
         if not operations:
-            raise ValueError(f"[job:{tag}] operations is empty")
+            raise ValueError(f"[{job_type}_job:{tag}] operations is empty")
 
         invalid_ops = sorted(set(operations) - VALID_OPERATIONS)
-        # allow any p, but all others need to match
-        if any([op for op in invalid_ops if not op.startswith("p")]):
+        if any(op for op in invalid_ops if not op.startswith("p")):
             raise ValueError(
-                f"[job:{tag}] invalid operations: {invalid_ops}. "
+                f"[{job_type}_job:{tag}] invalid operations: {invalid_ops}. "
                 f"Valid operations: {sorted(VALID_OPERATIONS)}"
             )
 
         layers = fiona.listlayers(str(agg_vector))
 
         agg_layer = job.get("agg_layer", "").strip()
-        if agg_layer is None or not str(agg_layer).strip():
+        if not agg_layer:
             if not layers:
-                raise ValueError(f"[job:{tag}] no layers found in {agg_vector}")
+                raise ValueError(
+                    f"[{job_type}_job:{tag}] no layers found in {agg_vector}"
+                )
             agg_layer = layers[0]
 
         if agg_layer not in layers:
             raise ValueError(
-                f'[job:{tag}] agg_layer "{agg_layer}" not found in {agg_vector}. '
+                f'[{job_type}_job:{tag}] agg_layer "{agg_layer}" not found in {agg_vector}. '
                 f"Available layers: {layers}"
             )
 
@@ -221,26 +211,182 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
             props = src.schema.get("properties", {})
             if agg_field not in props:
                 raise ValueError(
-                    f'[job:{tag}] agg_field "{agg_field}" not found in layer "{agg_layer}" of {agg_vector}. '
+                    f'[{job_type}_job:{tag}] agg_field "{agg_field}" not found in layer "{agg_layer}" of {agg_vector}. '
                     f"Available fields: {sorted(props.keys())}"
                 )
+
+        row_col_order_raw = job.get("row_col_order", "").strip()
+        if not row_col_order_raw:
+            raise ValueError(f"[{job_type}_job:{tag}] missing row_col_order")
+        row_col_order_parts = [
+            p.strip() for p in row_col_order_raw.split(",") if p.strip()
+        ]
+        if len(row_col_order_parts) != 2:
+            raise ValueError(
+                f"[{job_type}_job:{tag}] row_col_order must have exactly 2 entries"
+            )
+        expected_other = (
+            "base_raster" if job_type == "raster" else "base_vector"
+        )
+        if set(row_col_order_parts) != {"agg_field", expected_other}:
+            raise ValueError(
+                f"[{job_type}_job:{tag}] row_col_order must be a permutation of "
+                f"agg_field,{expected_other}. Got: {row_col_order_raw}"
+            )
+        row_col_order = ",".join(row_col_order_parts)
+
         outdir = global_output_dir
         workdir = global_work_dir / Path(tag)
         outdir.mkdir(parents=True, exist_ok=True)
         workdir.mkdir(parents=True, exist_ok=True)
-        job_list.append(
-            {
-                "tag": tag,
-                "agg_vector": agg_vector,
-                "agg_layer": agg_layer,
-                "agg_field": agg_field,
-                "base_raster_path_list": base_raster_path_list,
-                "operations": operations,
-                "row_col_order": job["row_col_order"],
-                "workdir": workdir,
-                "output_csv": outdir / f"{tag}.csv",
-            }
-        )
+
+        job_dict = {
+            "job_type": job_type,
+            "tag": tag,
+            "agg_vector": agg_vector,
+            "agg_layer": agg_layer,
+            "agg_field": agg_field,
+            "operations": operations,
+            "row_col_order": row_col_order,
+            "workdir": workdir,
+            "output_csv": outdir / f"{tag}.csv",
+        }
+
+        if job_type == "raster":
+            import glob
+
+            base_raster_pattern = job.get("base_raster_pattern", "").strip()
+            if not base_raster_pattern:
+                raise ValueError(
+                    f"[raster_job:{tag}] missing base_raster_pattern"
+                )
+
+            base_raster_path_list = []
+            for pattern in [
+                p.strip() for p in base_raster_pattern.split(",") if p.strip()
+            ]:
+                pat = (
+                    pattern
+                    if Path(pattern).is_absolute()
+                    else str(cfg_dir / pattern)
+                )
+                base_raster_path_list.extend([Path(p) for p in glob.glob(pat)])
+
+            base_raster_path_list = sorted({p for p in base_raster_path_list})
+            if not base_raster_path_list:
+                raise FileNotFoundError(
+                    f"[raster_job:{tag}] no files found at {base_raster_pattern}"
+                )
+
+            job_dict["base_raster_path_list"] = base_raster_path_list
+
+        else:
+            import glob
+
+            base_vector_pattern = job.get("base_vector_pattern", "").strip()
+            if not base_vector_pattern:
+                raise ValueError(
+                    f"[vector_job:{tag}] missing base_vector_pattern"
+                )
+
+            parts = []
+            buf = []
+            depth = 0
+            for ch in base_vector_pattern:
+                if ch == "[":
+                    depth += 1
+                    buf.append(ch)
+                elif ch == "]":
+                    depth = max(depth - 1, 0)
+                    buf.append(ch)
+                elif ch == "," and depth == 0:
+                    part = "".join(buf).strip()
+                    if part:
+                        parts.append(part)
+                    buf = []
+                else:
+                    buf.append(ch)
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+
+            token_specs = []
+            for part in parts:
+                i = part.find("[")
+                j = part.rfind("]")
+                if i == -1 or j == -1 or j < i:
+                    raise ValueError(
+                        f"[vector_job:{tag}] base_vector_pattern entries must include fields as "
+                        f"path[field1,field2,...]. Bad entry: {part}"
+                    )
+                pattern_str = part[:i].strip()
+                fields_str = part[i + 1 : j]
+                fields = [f.strip() for f in fields_str.split(",") if f.strip()]
+                if not pattern_str:
+                    raise ValueError(
+                        f"[vector_job:{tag}] empty path in base_vector_pattern entry: {part}"
+                    )
+                if not fields:
+                    raise ValueError(
+                        f"[vector_job:{tag}] empty field list in base_vector_pattern entry: {part}"
+                    )
+                token_specs.append((pattern_str, fields))
+
+            base_vector_fields = token_specs[0][1]
+            for _, fields in token_specs[1:]:
+                if fields != base_vector_fields:
+                    raise ValueError(
+                        f"[vector_job:{tag}] base_vector_pattern uses inconsistent field lists"
+                    )
+
+            base_vector_path_list = []
+            for pattern_str, _ in token_specs:
+                pat = (
+                    pattern_str
+                    if Path(pattern_str).is_absolute()
+                    else str(cfg_dir / pattern_str)
+                )
+                base_vector_path_list.extend([Path(p) for p in glob.glob(pat)])
+
+            base_vector_path_list = sorted({p for p in base_vector_path_list})
+            if not base_vector_path_list:
+                raise FileNotFoundError(
+                    f"[vector_job:{tag}] no files found at {base_vector_pattern}"
+                )
+
+            base_vector_layer = job.get("base_vector_layer", "").strip()
+
+            for base_vector_path in base_vector_path_list:
+                layers = fiona.listlayers(str(base_vector_path))
+                if base_vector_layer:
+                    layer = base_vector_layer
+                    if layer not in layers:
+                        raise ValueError(
+                            f'[vector_job:{tag}] base_vector_layer "{layer}" not found in {base_vector_path}. '
+                            f"Available layers: {layers}"
+                        )
+                else:
+                    if not layers:
+                        raise ValueError(
+                            f"[vector_job:{tag}] no layers found in {base_vector_path}"
+                        )
+                    layer = layers[0]
+
+                with fiona.open(str(base_vector_path), layer=layer) as src:
+                    props = src.schema.get("properties", {})
+                    missing = [f for f in base_vector_fields if f not in props]
+                    if missing:
+                        raise ValueError(
+                            f'[vector_job:{tag}] missing fields {missing} in layer "{layer}" of {base_vector_path}. '
+                            f"Available fields: {sorted(props.keys())}"
+                        )
+
+            job_dict["base_vector_path_list"] = base_vector_path_list
+            job_dict["base_vector_fields"] = base_vector_fields
+            if base_vector_layer:
+                job_dict["base_vector_layer"] = base_vector_layer
+
+        job_list.append(job_dict)
 
     return {
         "project": {
@@ -312,14 +458,20 @@ def fast_zonal_statistics(
         "sumsq": 0.0,
     }
 
-    def _open_vector_layer(vector_path, layer_name, vector_label, writable=False):
+    def _open_vector_layer(
+        vector_path, layer_name, vector_label, writable=False
+    ):
         open_flags = gdal.OF_VECTOR | (gdal.OF_UPDATE if writable else 0)
         vector_dataset = gdal.OpenEx(str(vector_path), open_flags)
         if vector_dataset is None:
-            raise RuntimeError(f"Could not open {vector_label} vector at {vector_path}")
+            raise RuntimeError(
+                f"Could not open {vector_label} vector at {vector_path}"
+            )
 
         if layer_name is not None:
-            logger.info("selecting %s layer by name: %s", vector_label, layer_name)
+            logger.info(
+                "selecting %s layer by name: %s", vector_label, layer_name
+            )
             vector_layer = vector_dataset.GetLayerByName(layer_name)
         else:
             logger.info("selecting default %s layer", vector_label)
@@ -360,10 +512,14 @@ def fast_zonal_statistics(
         needs_reproject = not source_srs.IsSame(raster_srs)
         logger.info("vector SRS detected | needs_reproject=%s", needs_reproject)
     else:
-        logger.info("vector SRS missing/unknown | forcing reprojection to raster SRS")
+        logger.info(
+            "vector SRS missing/unknown | forcing reprojection to raster SRS"
+        )
 
     temp_working_dir = tempfile.mkdtemp(dir=working_dir)
-    projected_vector_path = os.path.join(temp_working_dir, "projected_vector.gpkg")
+    projected_vector_path = os.path.join(
+        temp_working_dir, "projected_vector.gpkg"
+    )
     logger.info("created temp working dir: %s", temp_working_dir)
 
     def _raster_nodata_mask(value_array):
@@ -434,7 +590,9 @@ def fast_zonal_statistics(
         )
 
         vector_min_x, vector_max_x, vector_min_y, vector_max_y = vector_extent
-        raster_min_x, raster_min_y, raster_max_x, raster_max_y = raster_bounding_box
+        raster_min_x, raster_min_y, raster_max_x, raster_max_y = (
+            raster_bounding_box
+        )
         has_no_intersection = (
             vector_max_x < raster_min_x
             or vector_min_x > raster_max_x
@@ -533,7 +691,9 @@ def fast_zonal_statistics(
         feature_id_raster_band = feature_id_raster_dataset.GetRasterBand(1)
 
         logger.info("populating disjoint layer features (transaction start)")
-        logger.info("populating disjoint layer features done (transaction commit)")
+        logger.info(
+            "populating disjoint layer features done (transaction commit)"
+        )
 
         rasterize_callback_message = "rasterizing polygons %.1f%% complete %s"
         rasterize_callback = _make_logger_callback(rasterize_callback_message)
@@ -555,7 +715,9 @@ def fast_zonal_statistics(
         group_sketch = None
         if percentile_list:
             group_sketch = defaultdict(lambda: kll_floats_sketch(k=200))
-        for block_index, feature_id_offset in enumerate(feature_id_raster_offsets):
+        for block_index, feature_id_offset in enumerate(
+            feature_id_raster_offsets
+        ):
             block_log_time = _invoke_timed_callback(
                 block_log_time,
                 lambda block_index_value=block_index: logger.info(
@@ -569,7 +731,9 @@ def fast_zonal_statistics(
                 _LOGGING_PERIOD,
             )
 
-            feature_id_block = feature_id_raster_band.ReadAsArray(**feature_id_offset)
+            feature_id_block = feature_id_raster_band.ReadAsArray(
+                **feature_id_offset
+            )
             raster_value_block = raster_band.ReadAsArray(**feature_id_offset)
 
             in_polygon_mask = feature_id_block != feature_id_raster_nodata
@@ -580,7 +744,9 @@ def fast_zonal_statistics(
             block_raster_values = raster_value_block[in_polygon_mask]
 
             for feature_id in np.unique(block_feature_ids):
-                feature_values = block_raster_values[block_feature_ids == feature_id]
+                feature_values = block_raster_values[
+                    block_feature_ids == feature_id
+                ]
                 total_count = feature_values.size
                 if total_count == 0:
                     continue
@@ -600,7 +766,9 @@ def fast_zonal_statistics(
                 if group_sketch is not None:
                     group_value = feature_id_to_group_value[feature_id]
                     sk = group_sketch[group_value]
-                    sk.update(feature_values.astype(np.float32, copy=False).ravel())
+                    sk.update(
+                        feature_values.astype(np.float32, copy=False).ravel()
+                    )
 
                 block_min_value = np.min(feature_values)
                 block_max_value = np.max(feature_values)
@@ -608,8 +776,12 @@ def fast_zonal_statistics(
                     feature_stats["min"] = block_min_value
                     feature_stats["max"] = block_max_value
                 else:
-                    feature_stats["min"] = min(feature_stats["min"], block_min_value)
-                    feature_stats["max"] = max(feature_stats["max"], block_max_value)
+                    feature_stats["min"] = min(
+                        feature_stats["min"], block_min_value
+                    )
+                    feature_stats["max"] = max(
+                        feature_stats["max"], block_max_value
+                    )
 
                 feature_stats["sum"] += np.sum(feature_values)
                 feature_stats["sumsq"] += np.sum(
@@ -621,7 +793,9 @@ def fast_zonal_statistics(
         feature_id_raster_band = None
         feature_id_raster_dataset = None
 
-        remaining_unset_feature_ids = feature_id_set.difference(feature_stats_by_id)
+        remaining_unset_feature_ids = feature_id_set.difference(
+            feature_stats_by_id
+        )
         for missing_feature_id in remaining_unset_feature_ids:
             feature_stats_by_id[missing_feature_id]
 
@@ -658,11 +832,17 @@ def fast_zonal_statistics(
                     group_stats["min"] = feature_stats["min"]
                     group_stats["max"] = feature_stats["max"]
                 else:
-                    group_stats["min"] = min(group_stats["min"], feature_stats["min"])
-                    group_stats["max"] = max(group_stats["max"], feature_stats["max"])
+                    group_stats["min"] = min(
+                        group_stats["min"], feature_stats["min"]
+                    )
+                    group_stats["max"] = max(
+                        group_stats["max"], feature_stats["max"]
+                    )
 
         for group_value, group_stats in grouped_stats.items():
-            valid_count = group_stats["total_count"] - group_stats["nodata_count"]
+            valid_count = (
+                group_stats["total_count"] - group_stats["nodata_count"]
+            )
             group_stats["valid_count"] = valid_count
             group_stats["mean"] = (
                 (group_stats["sum"] / valid_count) if valid_count > 0 else None
@@ -676,7 +856,9 @@ def fast_zonal_statistics(
                     ] = (None if sk.is_empty() else sk.get_quantile(p / 100.0))
 
         for group_value, group_stats in grouped_stats.items():
-            valid_count = group_stats["total_count"] - group_stats["nodata_count"]
+            valid_count = (
+                group_stats["total_count"] - group_stats["nodata_count"]
+            )
             group_stats["valid_count"] = valid_count
             if valid_count > 0:
                 mean_value = group_stats["sum"] / valid_count
@@ -699,6 +881,50 @@ def fast_zonal_statistics(
             shutil.rmtree(temp_working_dir)
 
 
+def run_vector_stats_job(
+    base_point_vector_path,
+    base_point_vector_path_fields,
+    agg_vector_path,
+    agg_field,
+    operations,
+    output_csv: Path,
+    workdir: Path,
+    tag: str,
+    row_col_order: str,
+    task_graph,
+):
+    agg_gdf = gpd.read_file(agg_vector_path)
+    base_gdf = gpd.read_file(base_point_vector_path)
+
+    agg_crs = CRS.from_user_input(agg_gdf.crs) if agg_gdf.crs else None
+    base_crs = CRS.from_user_input(base_gdf.crs) if base_gdf.crs else None
+
+    transformer = None
+    if agg_crs and base_crs and agg_crs != base_crs:
+        transformer = Transformer.from_crs(base_crs, agg_crs, always_xy=True)
+        base_gdf = base_gdf.to_crs(agg_crs)
+
+    agg_groups = agg_gdf.dissolve(by=agg_field)
+    group_geoms = list(agg_groups.geometry.values)
+    group_keys = list(agg_groups.index)
+
+    tree = STRtree(group_geoms)
+    geom_id_to_key = {id(g): k for g, k in zip(group_geoms, group_keys)}
+
+    assignments = {}
+    rows = []
+    for fid, pt in zip(base_gdf.index.tolist(), base_gdf.geometry.values):
+        nearest_geom = tree.nearest(pt)
+        key = geom_id_to_key[id(nearest_geom)]
+        assignments.setdefault(key, []).append(fid)
+        rows.append({"base_fid": fid, agg_field: key})
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(output_csv, index=False)
+
+    return transformer, assignments
+
+
 def run_zonal_stats_job(
     base_raster_path_list: list[Path],
     agg_vector: Path,
@@ -709,8 +935,11 @@ def run_zonal_stats_job(
     workdir: Path,
     tag: str,
     row_col_order: str,
+    job_type: str,
     task_graph,
 ):
+    if job_type != "raster":
+        raise ValueError(f"wrong jobtype for run_zonal_stats_job: {job_type}")
     raster_stems = []
     raster_stats_by_stem = {}
     all_groups = set()
@@ -751,11 +980,17 @@ def run_zonal_stats_job(
     parts = [p.strip() for p in row_col_order.split(",") if p.strip()]
     if parts == ["agg_field", "base_raster"]:
         first_col = agg_field
-        columns = [f"{field}_{stem}" for stem in raster_stems for field in operations]
+        columns = [
+            f"{field}_{stem}" for stem in raster_stems for field in operations
+        ]
 
         def row_iter():
-            for group_value in sorted(all_groups, key=lambda v: (v is None, str(v))):
-                row = {first_col: "" if group_value is None else str(group_value)}
+            for group_value in sorted(
+                all_groups, key=lambda v: (v is None, str(v))
+            ):
+                row = {
+                    first_col: "" if group_value is None else str(group_value)
+                }
                 for stem in raster_stems:
                     s = raster_stats_by_stem[stem][group_value]
                     for field in operations:
@@ -778,7 +1013,9 @@ def run_zonal_stats_job(
                 stats = raster_stats_by_stem[stem]
                 for group_value in ordered_groups:
                     s = stats[group_value]
-                    group_label = "" if group_value is None else str(group_value)
+                    group_label = (
+                        "" if group_value is None else str(group_value)
+                    )
                     for field in operations:
                         row[f"{field}_{group_label}"] = s[field]
                 yield row
@@ -892,8 +1129,12 @@ def run_fast_zonal_statistics_test_case(
             )
         return left_value == right_value
 
-    def _assert_group_stats_equal(actual_stats, expected_stats, group_value, key_name):
-        if not _close_enough(actual_stats.get(key_name), expected_stats.get(key_name)):
+    def _assert_group_stats_equal(
+        actual_stats, expected_stats, group_value, key_name
+    ):
+        if not _close_enough(
+            actual_stats.get(key_name), expected_stats.get(key_name)
+        ):
             print(
                 f"Group={group_value!r} key={key_name!r} actual={actual_stats.get(key_name)!r} expected={expected_stats.get(key_name)!r}"
             )
@@ -927,7 +1168,9 @@ def run_fast_zonal_statistics_test_case(
         count_value = int(values_1d.size)
         nodata_count_value = int(np.count_nonzero(nodata_mask))
         if ignore_nodata:
-            valid_values = values_1d[~nodata_mask].astype(np.float64, copy=False)
+            valid_values = values_1d[~nodata_mask].astype(
+                np.float64, copy=False
+            )
         else:
             valid_values = values_1d.astype(np.float64, copy=False)
 
@@ -948,7 +1191,9 @@ def run_fast_zonal_statistics_test_case(
         sum_value = float(np.sum(valid_values))
         mean_value = sum_value / valid_count_value
         sumsq_value = float(np.sum(valid_values * valid_values))
-        variance_value = sumsq_value / valid_count_value - mean_value * mean_value
+        variance_value = (
+            sumsq_value / valid_count_value - mean_value * mean_value
+        )
         if variance_value < 0:
             variance_value = 0.0
         stdev_value = float(math.sqrt(variance_value))
@@ -967,7 +1212,9 @@ def run_fast_zonal_statistics_test_case(
             pct_values = np.percentile(
                 valid_values.astype(np.float64, copy=False), percentile_list
             ).tolist()
-            for percentile_key, percentile_value in zip(percentile_values, pct_values):
+            for percentile_key, percentile_value in zip(
+                percentile_values, pct_values
+            ):
                 stats[percentile_key] = float(percentile_value)
         else:
             for percentile_key in percentile_values:
@@ -1022,9 +1269,9 @@ def run_fast_zonal_statistics_test_case(
         for polygon_spec in polygons:
             group_value = polygon_spec["group_value"]
             window = polygon_spec["window"]
-            polygon_wkt = polygon_spec.get("wkt") or _pixel_window_to_polygon_wkt(
-                window
-            )
+            polygon_wkt = polygon_spec.get(
+                "wkt"
+            ) or _pixel_window_to_polygon_wkt(window)
             polygon_geometry = ogr.CreateGeometryFromWkt(polygon_wkt)
 
             feature = ogr.Feature(layer_definition)
@@ -1054,7 +1301,9 @@ def run_fast_zonal_statistics_test_case(
 
             for polygon_spec in polygons:
                 group_value = polygon_spec["group_value"]
-                x_offset, y_offset, width_pixels, height_pixels = polygon_spec["window"]
+                x_offset, y_offset, width_pixels, height_pixels = polygon_spec[
+                    "window"
+                ]
                 window_values = raster_values[
                     y_offset : y_offset + height_pixels,
                     x_offset : x_offset + width_pixels,
@@ -1167,7 +1416,11 @@ def pretty_print_zonal_stats_result_with_polygon_values(
         if array_values.size == 0:
             return "[]"
         if np.issubdtype(array_values.dtype, np.integer):
-            return "[" + ", ".join(str(int(v)) for v in array_values.tolist()) + "]"
+            return (
+                "["
+                + ", ".join(str(int(v)) for v in array_values.tolist())
+                + "]"
+            )
         return (
             "["
             + ", ".join(
@@ -1192,7 +1445,9 @@ def pretty_print_zonal_stats_result_with_polygon_values(
         ].ravel()
 
         nodata_mask = _nodata_mask(window_values)
-        valid_values = window_values[~nodata_mask] if ignore_nodata else window_values
+        valid_values = (
+            window_values[~nodata_mask] if ignore_nodata else window_values
+        )
 
         group_to_values_all.setdefault(group_value, []).append(
             window_values.astype(np.float64, copy=False)
@@ -1324,7 +1579,9 @@ def run_test():
     def assert_actual_matches_expected(actual, expected, float_tol=1e-6):
         for gid, exp in expected.items():
             if gid not in actual:
-                raise AssertionError(f"missing group_id={gid} in actual results")
+                raise AssertionError(
+                    f"missing group_id={gid} in actual results"
+                )
             a = actual[gid]
             for k, v in exp.items():
                 if k not in a:
@@ -1411,7 +1668,8 @@ def main():
         job["output_csv"] = output_path_timestamped
         job["task_graph"] = task_graph
 
-        thread = Thread(target=run_zonal_stats_job, kwargs=job)
+        if job["job_type"] == "raster":
+            thread = Thread(target=run_zonal_stats_job, kwargs=job)
         thread.start()
         thread_list.append(thread)
     for thread in thread_list:
