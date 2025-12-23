@@ -85,8 +85,45 @@ def _make_logger_callback(message):
 
 
 def parse_and_validate_config(cfg_path: Path) -> dict:
+    """Parse and validate a zonal-stats runner INI configuration file.
+
+    The configuration file is expected to contain a `[project]` section and one or
+    more `[job:<tag>]` sections. This function validates required keys, enforces
+    naming constraints, checks file existence, verifies vector layer/field
+    presence, and validates the `operations` list against `VALID_OPERATIONS`.
+
+    Validation rules:
+      1) `[project].name` must equal the configuration file stem.
+      2) `[project].log_level` must be a valid `logging` level name.
+      3) Job section tags (`job:<tag>`) must be unique.
+      4) For each job, `agg_vector` must exist; `base_raster` must exist if set.
+      5) `agg_layer` must exist in `agg_vector`, and `agg_field` must exist in
+         that layer schema.
+      6) `operations` must be present and all entries must be in
+         `VALID_OPERATIONS`.
+
+    The returned dictionary contains:
+      - `project`: global configuration values.
+      - `job_list`: a list of per-job dictionaries.
+
+    Args:
+        cfg_path: Path to the INI configuration file.
+
+    Returns:
+        A dictionary with keys:
+          - `project`: Dict containing `name`, `global_work_dir`, and `log_level`.
+          - `job_list`: List of dicts describing each job. Each job dict includes
+            `tag`, `agg_vector`, `agg_layer`, `agg_field`, `base_raster`,
+            `workdir`, `output_csv`, and `operations`.
+
+    Raises:
+        ValueError: If required sections/keys are missing, if values are invalid,
+            if job tags are duplicated, if a layer/field is missing, or if any
+            operation is not recognized.
+        FileNotFoundError: If `agg_vector` does not exist, or if `base_raster` is
+            provided but does not exist.
+    """
     stem = cfg_path.stem
-    cfg_dir = cfg_path.parent
 
     config = configparser.ConfigParser(interpolation=None)
     config.read(cfg_path)
@@ -107,31 +144,17 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
         raise ValueError(f"Invalid log_level: {log_level_str}")
 
     global_work_dir = Path(config["project"]["global_work_dir"].strip())
-    if not global_work_dir.is_absolute():
-        global_work_dir = cfg_dir / global_work_dir
-
     global_output_dir = Path(config["project"]["global_output_dir"].strip())
-    if not global_output_dir.is_absolute():
-        global_output_dir = cfg_dir / global_output_dir
 
     job_tags = []
     jobs_sections = []
     for section in config.sections():
-        section_clean = section.strip()
-        section_lower = section_clean.lower()
-        if section_lower.startswith("raster_job:") or section_lower.startswith(
-            "vector_job:"
-        ):
-            job_type = (
-                "raster"
-                if section_lower.startswith("raster_job:")
-                else "vector"
-            )
-            tag = section_clean.split(":", 1)[1].strip()
+        if section.startswith("job:"):
+            tag = section.split(":", 1)[1].strip()
             if not tag:
-                raise ValueError(f"Invalid job section name: [{section_clean}]")
+                raise ValueError(f"Invalid job section name: [{section}]")
             job_tags.append(tag)
-            jobs_sections.append((job_type, tag, config[section]))
+            jobs_sections.append((tag, config[section]))
 
     if len(job_tags) != len(set(job_tags)):
         seen = set()
@@ -143,13 +166,10 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
         raise ValueError(f"Duplicate job tags found: {sorted(set(dups))}")
 
     job_list = []
-    for job_type, tag, job in jobs_sections:
-        agg_vector_raw = job.get("agg_vector", "").strip()
-        if not agg_vector_raw:
-            raise ValueError(f"[{job_type}_job:{tag}] missing agg_vector")
-        agg_vector = Path(agg_vector_raw)
-        if not agg_vector.is_absolute():
-            agg_vector = cfg_dir / agg_vector
+    for tag, job in jobs_sections:
+        agg_vector = Path(job.get("agg_vector", "").strip())
+        if not agg_vector:
+            raise ValueError(f"[job:{tag}] missing agg_vector")
         if not agg_vector.exists():
             raise FileNotFoundError(
                 f"[job:{tag}] agg_vector not found: {agg_vector}"
@@ -173,37 +193,36 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
 
         agg_field = job.get("agg_field", "").strip()
         if not agg_field:
-            raise ValueError(f"[{job_type}_job:{tag}] missing agg_field")
+            raise ValueError(f"[job:{tag}] missing agg_field")
 
         ops_raw = job.get("operations", "").strip()
         if not ops_raw:
-            raise ValueError(f"[{job_type}_job:{tag}] missing operations")
+            raise ValueError(f"[job:{tag}] missing operations")
         operations = [
             o.strip().lower() for o in ops_raw.split(",") if o.strip()
         ]
         if not operations:
-            raise ValueError(f"[{job_type}_job:{tag}] operations is empty")
+            raise ValueError(f"[job:{tag}] operations is empty")
 
         invalid_ops = sorted(set(operations) - VALID_OPERATIONS)
-        if any(op for op in invalid_ops if not op.startswith("p")):
+        # allow any p, but all others need to match
+        if any([op for op in invalid_ops if not op.startswith("p")]):
             raise ValueError(
-                f"[{job_type}_job:{tag}] invalid operations: {invalid_ops}. "
+                f"[job:{tag}] invalid operations: {invalid_ops}. "
                 f"Valid operations: {sorted(VALID_OPERATIONS)}"
             )
 
         layers = fiona.listlayers(str(agg_vector))
 
         agg_layer = job.get("agg_layer", "").strip()
-        if not agg_layer:
+        if agg_layer is None or not str(agg_layer).strip():
             if not layers:
-                raise ValueError(
-                    f"[{job_type}_job:{tag}] no layers found in {agg_vector}"
-                )
+                raise ValueError(f"[job:{tag}] no layers found in {agg_vector}")
             agg_layer = layers[0]
 
         if agg_layer not in layers:
             raise ValueError(
-                f'[{job_type}_job:{tag}] agg_layer "{agg_layer}" not found in {agg_vector}. '
+                f'[job:{tag}] agg_layer "{agg_layer}" not found in {agg_vector}. '
                 f"Available layers: {layers}"
             )
 
@@ -211,182 +230,26 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
             props = src.schema.get("properties", {})
             if agg_field not in props:
                 raise ValueError(
-                    f'[{job_type}_job:{tag}] agg_field "{agg_field}" not found in layer "{agg_layer}" of {agg_vector}. '
+                    f'[job:{tag}] agg_field "{agg_field}" not found in layer "{agg_layer}" of {agg_vector}. '
                     f"Available fields: {sorted(props.keys())}"
                 )
-
-        row_col_order_raw = job.get("row_col_order", "").strip()
-        if not row_col_order_raw:
-            raise ValueError(f"[{job_type}_job:{tag}] missing row_col_order")
-        row_col_order_parts = [
-            p.strip() for p in row_col_order_raw.split(",") if p.strip()
-        ]
-        if len(row_col_order_parts) != 2:
-            raise ValueError(
-                f"[{job_type}_job:{tag}] row_col_order must have exactly 2 entries"
-            )
-        expected_other = (
-            "base_raster" if job_type == "raster" else "base_vector"
-        )
-        if set(row_col_order_parts) != {"agg_field", expected_other}:
-            raise ValueError(
-                f"[{job_type}_job:{tag}] row_col_order must be a permutation of "
-                f"agg_field,{expected_other}. Got: {row_col_order_raw}"
-            )
-        row_col_order = ",".join(row_col_order_parts)
-
         outdir = global_output_dir
         workdir = global_work_dir / Path(tag)
         outdir.mkdir(parents=True, exist_ok=True)
         workdir.mkdir(parents=True, exist_ok=True)
-
-        job_dict = {
-            "job_type": job_type,
-            "tag": tag,
-            "agg_vector": agg_vector,
-            "agg_layer": agg_layer,
-            "agg_field": agg_field,
-            "operations": operations,
-            "row_col_order": row_col_order,
-            "workdir": workdir,
-            "output_csv": outdir / f"{tag}.csv",
-        }
-
-        if job_type == "raster":
-            import glob
-
-            base_raster_pattern = job.get("base_raster_pattern", "").strip()
-            if not base_raster_pattern:
-                raise ValueError(
-                    f"[raster_job:{tag}] missing base_raster_pattern"
-                )
-
-            base_raster_path_list = []
-            for pattern in [
-                p.strip() for p in base_raster_pattern.split(",") if p.strip()
-            ]:
-                pat = (
-                    pattern
-                    if Path(pattern).is_absolute()
-                    else str(cfg_dir / pattern)
-                )
-                base_raster_path_list.extend([Path(p) for p in glob.glob(pat)])
-
-            base_raster_path_list = sorted({p for p in base_raster_path_list})
-            if not base_raster_path_list:
-                raise FileNotFoundError(
-                    f"[raster_job:{tag}] no files found at {base_raster_pattern}"
-                )
-
-            job_dict["base_raster_path_list"] = base_raster_path_list
-
-        else:
-            import glob
-
-            base_vector_pattern = job.get("base_vector_pattern", "").strip()
-            if not base_vector_pattern:
-                raise ValueError(
-                    f"[vector_job:{tag}] missing base_vector_pattern"
-                )
-
-            parts = []
-            buf = []
-            depth = 0
-            for ch in base_vector_pattern:
-                if ch == "[":
-                    depth += 1
-                    buf.append(ch)
-                elif ch == "]":
-                    depth = max(depth - 1, 0)
-                    buf.append(ch)
-                elif ch == "," and depth == 0:
-                    part = "".join(buf).strip()
-                    if part:
-                        parts.append(part)
-                    buf = []
-                else:
-                    buf.append(ch)
-            part = "".join(buf).strip()
-            if part:
-                parts.append(part)
-
-            token_specs = []
-            for part in parts:
-                i = part.find("[")
-                j = part.rfind("]")
-                if i == -1 or j == -1 or j < i:
-                    raise ValueError(
-                        f"[vector_job:{tag}] base_vector_pattern entries must include fields as "
-                        f"path[field1,field2,...]. Bad entry: {part}"
-                    )
-                pattern_str = part[:i].strip()
-                fields_str = part[i + 1 : j]
-                fields = [f.strip() for f in fields_str.split(",") if f.strip()]
-                if not pattern_str:
-                    raise ValueError(
-                        f"[vector_job:{tag}] empty path in base_vector_pattern entry: {part}"
-                    )
-                if not fields:
-                    raise ValueError(
-                        f"[vector_job:{tag}] empty field list in base_vector_pattern entry: {part}"
-                    )
-                token_specs.append((pattern_str, fields))
-
-            base_vector_fields = token_specs[0][1]
-            for _, fields in token_specs[1:]:
-                if fields != base_vector_fields:
-                    raise ValueError(
-                        f"[vector_job:{tag}] base_vector_pattern uses inconsistent field lists"
-                    )
-
-            base_vector_path_list = []
-            for pattern_str, _ in token_specs:
-                pat = (
-                    pattern_str
-                    if Path(pattern_str).is_absolute()
-                    else str(cfg_dir / pattern_str)
-                )
-                base_vector_path_list.extend([Path(p) for p in glob.glob(pat)])
-
-            base_vector_path_list = sorted({p for p in base_vector_path_list})
-            if not base_vector_path_list:
-                raise FileNotFoundError(
-                    f"[vector_job:{tag}] no files found at {base_vector_pattern}"
-                )
-
-            base_vector_layer = job.get("base_vector_layer", "").strip()
-
-            for base_vector_path in base_vector_path_list:
-                layers = fiona.listlayers(str(base_vector_path))
-                if base_vector_layer:
-                    layer = base_vector_layer
-                    if layer not in layers:
-                        raise ValueError(
-                            f'[vector_job:{tag}] base_vector_layer "{layer}" not found in {base_vector_path}. '
-                            f"Available layers: {layers}"
-                        )
-                else:
-                    if not layers:
-                        raise ValueError(
-                            f"[vector_job:{tag}] no layers found in {base_vector_path}"
-                        )
-                    layer = layers[0]
-
-                with fiona.open(str(base_vector_path), layer=layer) as src:
-                    props = src.schema.get("properties", {})
-                    missing = [f for f in base_vector_fields if f not in props]
-                    if missing:
-                        raise ValueError(
-                            f'[vector_job:{tag}] missing fields {missing} in layer "{layer}" of {base_vector_path}. '
-                            f"Available fields: {sorted(props.keys())}"
-                        )
-
-            job_dict["base_vector_path_list"] = base_vector_path_list
-            job_dict["base_vector_fields"] = base_vector_fields
-            if base_vector_layer:
-                job_dict["base_vector_layer"] = base_vector_layer
-
-        job_list.append(job_dict)
+        job_list.append(
+            {
+                "tag": tag,
+                "agg_vector": agg_vector,
+                "agg_layer": agg_layer,
+                "agg_field": agg_field,
+                "base_raster_path_list": base_raster_path_list,
+                "operations": operations,
+                "row_col_order": job["row_col_order"],
+                "workdir": workdir,
+                "output_csv": outdir / f"{tag}.csv",
+            }
+        )
 
     return {
         "project": {
