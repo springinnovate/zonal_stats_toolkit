@@ -762,6 +762,7 @@ def run_zonal_stats_job(
         for op in operations
         if op.startswith("p") and op[1:].replace(".", "", 1).isdigit()
     ]
+    stats_task_list = []
     for raster_path in base_raster_path_list:
         stem = raster_path.stem
         raster_stems.append(stem)
@@ -782,6 +783,9 @@ def run_zonal_stats_job(
             store_result=True,
             task_name=f"stats for {tag}",
         )
+        stats_task_list.append((stem, stats_task))
+
+    for stem, stats_task in stats_task_list:
         stats = stats_task.get()
         raster_stats_by_stem[stem] = stats
         all_groups.update(stats.keys())
