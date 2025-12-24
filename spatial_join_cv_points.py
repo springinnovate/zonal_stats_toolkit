@@ -5,7 +5,6 @@ import os
 
 import geopandas as gpd
 import numpy as np
-from shapely.strtree import STRtree
 
 logging.basicConfig(
     level=logging.DEBUG,
