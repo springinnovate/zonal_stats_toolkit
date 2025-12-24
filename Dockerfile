@@ -17,9 +17,9 @@ RUN touch /home/mambauser/.bashrc
 RUN echo 'micromamba activate base' >> /home/mambauser/.bashrc
 
 USER root
-RUN apt-get update -y
-RUN apt install git -y
-RUN apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    htop \
     gcc \
     g++ \
     make \

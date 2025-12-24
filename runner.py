@@ -236,8 +236,6 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
         }
 
         if job_type == "raster":
-            import glob
-
             base_raster_pattern = job.get("base_raster_pattern", "").strip()
             if not base_raster_pattern:
                 raise ValueError(f"[raster_job:{tag}] missing base_raster_pattern")
@@ -967,8 +965,6 @@ def run_vector_stats_job(
                 np.int64
             )
 
-        idx_range = np.arange(n_groups, dtype=np.int64)
-
         need_sort_per_field = (
             ("min" in core_ops) or ("max" in core_ops) or (len(pct_list) > 0)
         )
@@ -1071,8 +1067,10 @@ def run_vector_stats_job(
     return transformers_by_stem, assignments_by_stem
 
 
-def run_raster_zonal_stats_job(
+def run_zonal_stats_job(
     base_raster_path_list: list[Path],
+    base_vector_path_list: list[Path],
+    base_vector_fields: list[str],
     agg_vector: Path,
     agg_layer: str,
     agg_field: str,
@@ -1081,93 +1079,118 @@ def run_raster_zonal_stats_job(
     workdir: Path,
     tag: str,
     row_col_order: str,
-    job_type: str,
     task_graph,
 ):
-    if job_type != "raster":
-        raise ValueError(f"wrong jobtype for run_zonal_stats_job: {job_type}")
-    raster_stems = []
-    raster_stats_by_stem = {}
-    all_groups = set()
+    ops = [o.strip().lower() for o in operations if str(o).strip()]
+    core_ops = []
+    pct_list = []
+    for op in ops:
+        if op.startswith("p") and len(op) > 1:
+            pct_list.append(float(op[1:]))
+        else:
+            core_ops.append(op)
+    core_ops = list(dict.fromkeys(core_ops))
+    pct_list = sorted(set(pct_list))
+    pct_keys = [f"p{int(p) if float(p).is_integer() else p}" for p in pct_list]
 
-    percentile_list = [
-        float(op[1:])
-        for op in operations
-        if op.startswith("p") and op[1:].replace(".", "", 1).isdigit()
-    ]
-    stats_task_list = []
-    for raster_path in base_raster_path_list:
-        stem = raster_path.stem
-        raster_stems.append(stem)
-        stats_task = task_graph.add_task(
-            func=fast_zonal_statistics,
-            args=(
-                (str(raster_path), 1),
-                str(agg_vector),
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    df_parts = []
+
+    if base_raster_path_list:
+        raster_rows = []
+        for base_raster_path in base_raster_path_list:
+            base_raster_path = Path(base_raster_path)
+            base = base_raster_path.stem
+
+            grouped_stats = fast_zonal_statistics(
+                (base_raster_path, 1),
+                agg_vector,
                 agg_field,
-            ),
-            kwargs={
-                "aggregate_layer_name": agg_layer,
-                "ignore_nodata": True,
-                "working_dir": str(workdir),
-                "clean_working_dir": False,
-                "percentile_list": percentile_list,
-            },
-            store_result=True,
-            task_name=f"stats for {tag} / {raster_path}",
+                aggregate_layer_name=agg_layer,
+                ignore_nodata=True,
+                working_dir=workdir,
+                clean_working_dir=True,
+                percentile_list=pct_list,
+            )
+
+            for group_value, stats in grouped_stats.items():
+                row = {
+                    agg_field: group_value,
+                    "base": base,
+                    "base_type": "raster",
+                }
+                for op in core_ops:
+                    row[op] = stats.get(op)
+                for k in pct_keys:
+                    row[k] = stats.get(k)
+                raster_rows.append(row)
+
+        df_parts.append(pd.DataFrame(raster_rows))
+
+    transformers_by_stem = {}
+    assignments_by_stem = {}
+
+    if base_vector_path_list:
+        vector_tmp_csv = workdir / f"{tag}__vector_stats.csv"
+
+        transformers_by_stem, assignments_by_stem = run_vector_stats_job(
+            base_vector_path_list=base_vector_path_list,
+            base_vector_fields=base_vector_fields,
+            agg_vector=agg_vector,
+            agg_layer=agg_layer,
+            agg_field=agg_field,
+            operations=operations,
+            output_csv=vector_tmp_csv,
+            workdir=workdir,
+            tag=tag,
+            row_col_order="agg_field,base_vector",
+            job_type="vector",
+            task_graph=task_graph,
         )
-        stats_task_list.append((stem, stats_task))
 
-    for stem, stats_task in stats_task_list:
-        stats = stats_task.get()
-        raster_stats_by_stem[stem] = stats
-        all_groups.update(stats.keys())
+        vdf = pd.read_csv(vector_tmp_csv)
+        if "base_vector" in vdf.columns:
+            vdf = vdf.rename(columns={"base_vector": "base"})
+        vdf["base_type"] = "vector"
+        df_parts.append(vdf)
 
-    parts = [p.strip() for p in row_col_order.split(",") if p.strip()]
-    if parts == ["agg_field", "base_raster"]:
-        first_col = agg_field
-        columns = [f"{field}_{stem}" for stem in raster_stems for field in operations]
-
-        def row_iter():
-            for group_value in sorted(all_groups, key=lambda v: (v is None, str(v))):
-                row = {first_col: "" if group_value is None else str(group_value)}
-                for stem in raster_stems:
-                    s = raster_stats_by_stem[stem][group_value]
-                    for field in operations:
-                        row[f"{field}_{stem}"] = s[field]
-                yield row
-
-    elif parts == ["base_raster", "agg_field"]:
-        first_col = "base_raster"
-        columns = [
-            f'{field}_{"" if gv is None else str(gv)}'
-            for gv in sorted(all_groups, key=lambda v: (v is None, str(v)))
-            for field in operations
-        ]
-
-        ordered_groups = sorted(all_groups, key=lambda v: (v is None, str(v)))
-
-        def row_iter():
-            for stem in raster_stems:
-                row = {first_col: stem}
-                stats = raster_stats_by_stem[stem]
-                for group_value in ordered_groups:
-                    s = stats[group_value]
-                    group_label = "" if group_value is None else str(group_value)
-                    for field in operations:
-                        row[f"{field}_{group_label}"] = s[field]
-                yield row
-
+    if df_parts:
+        df = pd.concat(df_parts, ignore_index=True, sort=False)
     else:
-        raise ValueError(
-            "row_col_order must be 'agg_field,base_raster' or 'base_raster,agg_field'"
-        )
+        df = pd.DataFrame(columns=[agg_field, "base", "base_type"])
 
+    tokens = [t.strip() for t in row_col_order.split(",") if t.strip()]
+    col_map = {
+        "agg_field": agg_field,
+        "base": "base",
+        "base_raster": "base",
+        "base_vector": "base",
+        "base_type": "base_type",
+    }
+
+    prefix = []
+    for t in tokens:
+        c = col_map.get(t)
+        if c and (c in df.columns) and (c not in prefix):
+            prefix.append(c)
+
+    if ("base_type" in df.columns) and ("base_type" not in prefix):
+        if "base" in prefix:
+            i = prefix.index("base") + 1
+            prefix = prefix[:i] + ["base_type"] + prefix[i:]
+        else:
+            prefix.append("base_type")
+
+    cols = prefix + [c for c in df.columns if c not in prefix]
+    df = df[cols]
+
+    output_csv = Path(output_csv)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
-    with output_csv.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=[first_col] + columns)
-        writer.writeheader()
-        writer.writerows(row_iter())
+    df.to_csv(output_csv, index=False)
+
+    return transformers_by_stem, assignments_by_stem
 
 
 def _invoke_timed_callback(reference_time, callback_lambda, callback_period):
@@ -1194,549 +1217,6 @@ def _invoke_timed_callback(reference_time, callback_lambda, callback_period):
         callback_lambda()
         return current_time
     return reference_time
-
-
-def run_fast_zonal_statistics_test_case(
-    *,
-    fast_zonal_statistics_fn,
-    raster_values,
-    polygons,
-    aggregate_vector_field="group_id",
-    aggregate_layer_name="polys",
-    ignore_nodata=True,
-    percentile_list=None,
-    raster_nodata=None,
-    pixel_size=10.0,
-    origin_x=1000.0,
-    origin_y=2000.0,
-    epsg=3857,
-    allclose_rtol=1e-6,
-    allclose_atol=1e-6,
-    expect_grouped_stats=None,
-    compare_keys=None,
-    working_dir=None,
-    clean_working_dir=True,
-):
-    raster_values = np.asarray(raster_values)
-    if raster_values.ndim != 2:
-        raise ValueError("raster_values must be 2D")
-
-    percentile_list = [] if percentile_list is None else list(percentile_list)
-    percentile_list = sorted(
-        {float(percentile_value) for percentile_value in percentile_list}
-    )
-    percentile_keys = [
-        f"p{int(percentile_value) if percentile_value.is_integer() else percentile_value}"
-        for percentile_value in percentile_list
-    ]
-
-    if compare_keys is None:
-        compare_keys = [
-            "min",
-            "max",
-            "total_count",
-            "nodata_count",
-            "valid_count",
-            "sum",
-            "stdev",
-        ] + percentile_keys
-
-    temp_dir = tempfile.mkdtemp(dir=working_dir)
-    raster_path = os.path.join(temp_dir, "test_raster.tif")
-    vector_path = os.path.join(temp_dir, "test_vector.gpkg")
-
-    def _close_enough(left_value, right_value):
-        if left_value is None and right_value is None:
-            return True
-        if left_value is None or right_value is None:
-            return False
-        if isinstance(left_value, (int, np.integer)) and isinstance(
-            right_value, (int, np.integer)
-        ):
-            return int(left_value) == int(right_value)
-        if isinstance(left_value, (float, np.floating)) or isinstance(
-            right_value, (float, np.floating)
-        ):
-            return bool(
-                np.isclose(
-                    float(left_value),
-                    float(right_value),
-                    rtol=allclose_rtol,
-                    atol=allclose_atol,
-                )
-            )
-        return left_value == right_value
-
-    def _assert_group_stats_equal(actual_stats, expected_stats, group_value, key_name):
-        if not _close_enough(actual_stats.get(key_name), expected_stats.get(key_name)):
-            print(
-                f"Group={group_value!r} key={key_name!r} actual={actual_stats.get(key_name)!r} expected={expected_stats.get(key_name)!r}"
-            )
-
-    def _pixel_window_to_polygon_wkt(window):
-        x_offset, y_offset, width_pixels, height_pixels = window
-        left = origin_x + x_offset * pixel_size
-        right = origin_x + (x_offset + width_pixels) * pixel_size
-        top = origin_y - y_offset * pixel_size
-        bottom = origin_y - (y_offset + height_pixels) * pixel_size
-        return f"POLYGON(({left} {top},{right} {top},{right} {bottom},{left} {bottom},{left} {top}))"
-
-    def _masked_stats(values_1d, percentile_values):
-        if values_1d.size == 0:
-            return {
-                "min": None,
-                "max": None,
-                "total_count": int(0),
-                "nodata_count": int(0),
-                "valid_count": int(0),
-                "sum": 0.0,
-                "stdev": None,
-                **{k: None for k in percentile_values},
-            }
-
-        if raster_nodata is None:
-            nodata_mask = np.zeros(values_1d.shape, dtype=bool)
-        else:
-            nodata_mask = np.isclose(values_1d, raster_nodata)
-
-        count_value = int(values_1d.size)
-        nodata_count_value = int(np.count_nonzero(nodata_mask))
-        if ignore_nodata:
-            valid_values = values_1d[~nodata_mask].astype(np.float64, copy=False)
-        else:
-            valid_values = values_1d.astype(np.float64, copy=False)
-
-        valid_count_value = int(valid_values.size)
-        if valid_count_value == 0:
-            stats = {
-                "min": 0.0,
-                "max": 0.0,
-                "total_count": count_value,
-                "nodata_count": nodata_count_value,
-                "valid_count": 0,
-                "sum": 0.0,
-                "stdev": None,
-                **{k: None for k in percentile_values},
-            }
-            return stats
-
-        sum_value = float(np.sum(valid_values))
-        mean_value = sum_value / valid_count_value
-        sumsq_value = float(np.sum(valid_values * valid_values))
-        variance_value = sumsq_value / valid_count_value - mean_value * mean_value
-        if variance_value < 0:
-            variance_value = 0.0
-        stdev_value = float(math.sqrt(variance_value))
-
-        stats = {
-            "min": float(np.min(valid_values)),
-            "max": float(np.max(valid_values)),
-            "total_count": count_value,
-            "nodata_count": nodata_count_value,
-            "valid_count": valid_count_value,
-            "sum": sum_value,
-            "stdev": stdev_value,
-        }
-
-        if percentile_list:
-            pct_values = np.percentile(
-                valid_values.astype(np.float64, copy=False), percentile_list
-            ).tolist()
-            for percentile_key, percentile_value in zip(percentile_values, pct_values):
-                stats[percentile_key] = float(percentile_value)
-        else:
-            for percentile_key in percentile_values:
-                stats[percentile_key] = None
-
-        return stats
-
-    try:
-        spatial_reference = osr.SpatialReference()
-        spatial_reference.ImportFromEPSG(int(epsg))
-        spatial_reference.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-
-        raster_driver = gdal.GetDriverByName("GTiff")
-        raster_dataset = raster_driver.Create(
-            raster_path,
-            int(raster_values.shape[1]),
-            int(raster_values.shape[0]),
-            1,
-            gdal.GDT_Float32,
-        )
-        raster_dataset.SetGeoTransform(
-            (origin_x, pixel_size, 0.0, origin_y, 0.0, -pixel_size)
-        )
-        raster_dataset.SetProjection(spatial_reference.ExportToWkt())
-        raster_band = raster_dataset.GetRasterBand(1)
-        if raster_nodata is not None:
-            raster_band.SetNoDataValue(float(raster_nodata))
-        raster_band.WriteArray(raster_values.astype(np.float32, copy=False))
-        raster_band.FlushCache()
-        raster_band = None
-        raster_dataset.FlushCache()
-        raster_dataset = None
-
-        vector_driver = ogr.GetDriverByName("GPKG")
-        if os.path.exists(vector_path):
-            vector_driver.DeleteDataSource(vector_path)
-        vector_dataset = vector_driver.CreateDataSource(vector_path)
-        vector_layer = vector_dataset.CreateLayer(
-            aggregate_layer_name, spatial_reference, ogr.wkbPolygon
-        )
-
-        if polygons and isinstance(polygons[0].get("group_value"), str):
-            group_field_type = ogr.OFTString
-        else:
-            group_field_type = ogr.OFTInteger
-
-        vector_layer.CreateField(
-            ogr.FieldDefn(aggregate_vector_field, group_field_type)
-        )
-        layer_definition = vector_layer.GetLayerDefn()
-
-        for polygon_spec in polygons:
-            group_value = polygon_spec["group_value"]
-            window = polygon_spec["window"]
-            polygon_wkt = polygon_spec.get("wkt") or _pixel_window_to_polygon_wkt(
-                window
-            )
-            polygon_geometry = ogr.CreateGeometryFromWkt(polygon_wkt)
-
-            feature = ogr.Feature(layer_definition)
-            feature.SetGeometry(polygon_geometry)
-            feature.SetField(aggregate_vector_field, group_value)
-            vector_layer.CreateFeature(feature)
-
-        vector_layer = None
-        vector_dataset = None
-
-        actual_grouped_stats = fast_zonal_statistics_fn(
-            (raster_path, 1),
-            vector_path,
-            aggregate_vector_field,
-            aggregate_layer_name=aggregate_layer_name,
-            ignore_nodata=ignore_nodata,
-            working_dir=temp_dir,
-            clean_working_dir=False,
-            percentile_list=percentile_list,
-        )
-
-        if expect_grouped_stats is None:
-            expected_values_by_group = collections.defaultdict(list)
-            expected_counts_by_group = collections.defaultdict(
-                lambda: {"total_count": 0, "nodata_count": 0}
-            )
-
-            for polygon_spec in polygons:
-                group_value = polygon_spec["group_value"]
-                x_offset, y_offset, width_pixels, height_pixels = polygon_spec["window"]
-                window_values = raster_values[
-                    y_offset : y_offset + height_pixels,
-                    x_offset : x_offset + width_pixels,
-                ].ravel()
-
-                expected_values_by_group[group_value].append(window_values)
-
-                if raster_nodata is None:
-                    nodata_mask = np.zeros(window_values.shape, dtype=bool)
-                else:
-                    nodata_mask = np.isclose(window_values, raster_nodata)
-
-                expected_counts_by_group[group_value]["total_count"] += int(
-                    window_values.size
-                )
-                expected_counts_by_group[group_value]["nodata_count"] += int(
-                    np.count_nonzero(nodata_mask)
-                )
-
-            expect_grouped_stats = {}
-            for group_value, chunk_list in expected_values_by_group.items():
-                combined_values = (
-                    np.concatenate(chunk_list)
-                    if chunk_list
-                    else np.array([], dtype=np.float64)
-                )
-                group_stats = _masked_stats(combined_values, percentile_keys)
-                group_stats["total_count"] = int(
-                    expected_counts_by_group[group_value]["total_count"]
-                )
-                group_stats["nodata_count"] = int(
-                    expected_counts_by_group[group_value]["nodata_count"]
-                )
-                group_stats["valid_count"] = int(
-                    group_stats["total_count"] - group_stats["nodata_count"]
-                )
-                expect_grouped_stats[group_value] = group_stats
-
-        actual_group_keys = set(actual_grouped_stats.keys())
-        expected_group_keys = set(expect_grouped_stats.keys())
-        if actual_group_keys != expected_group_keys:
-            raise AssertionError(
-                f"Group keys mismatch actual={sorted(actual_group_keys)!r} expected={sorted(expected_group_keys)!r}"
-            )
-
-        for group_value, expected_stats in expect_grouped_stats.items():
-            actual_stats = actual_grouped_stats[group_value]
-            for key_name in compare_keys:
-                _assert_group_stats_equal(
-                    actual_stats, expected_stats, group_value, key_name
-                )
-
-        return {
-            "temp_dir": temp_dir,
-            "raster_path": raster_path,
-            "vector_path": vector_path,
-            "actual": actual_grouped_stats,
-            "expected": expect_grouped_stats,
-        }
-    finally:
-        if clean_working_dir and os.path.isdir(temp_dir):
-            shutil.rmtree(temp_dir)
-
-
-def pretty_print_zonal_stats_result_with_polygon_values(
-    polygons,
-    result,
-    *,
-    raster_values,
-    raster_nodata=None,
-    ignore_nodata=True,
-    title_key="group_id",
-    stats_root_key="actual",
-    sort_groups=True,
-    sort_stats=True,
-    preferred_stat_order=None,
-    float_digits=6,
-):
-    import numpy as np
-
-    raster_values = np.asarray(raster_values)
-    if raster_values.ndim != 2:
-        raise ValueError("raster_values must be a 2D array")
-
-    if preferred_stat_order is None:
-        preferred_stat_order = [
-            "min",
-            "max",
-            "total_count",
-            "nodata_count",
-            "valid_count",
-            "sum",
-            "stdev",
-        ]
-
-    stats_by_group = result[stats_root_key]
-
-    group_to_values_all = {}
-    group_to_values_valid = {}
-
-    def _format_value(value):
-        if value is None:
-            return "None"
-        if isinstance(value, float):
-            return f"{value:.{float_digits}f}"
-        return str(value)
-
-    def _format_array(array_values):
-        array_values = np.asarray(array_values)
-        if array_values.size == 0:
-            return "[]"
-        if np.issubdtype(array_values.dtype, np.integer):
-            return "[" + ", ".join(str(int(v)) for v in array_values.tolist()) + "]"
-        return (
-            "["
-            + ", ".join(
-                f"{float(v):.{float_digits}f}".rstrip("0").rstrip(".")
-                for v in array_values.tolist()
-            )
-            + "]"
-        )
-
-    def _nodata_mask(values_1d):
-        if raster_nodata is None:
-            return np.zeros(values_1d.shape, dtype=bool)
-        return np.isclose(values_1d, raster_nodata)
-
-    for polygon_id, polygon_spec in enumerate(polygons):
-        group_value = polygon_spec["group_value"]
-        x_offset, y_offset, width_pixels, height_pixels = polygon_spec["window"]
-
-        window_values = raster_values[
-            y_offset : y_offset + height_pixels,
-            x_offset : x_offset + width_pixels,
-        ].ravel()
-
-        nodata_mask = _nodata_mask(window_values)
-        valid_values = window_values[~nodata_mask] if ignore_nodata else window_values
-
-        group_to_values_all.setdefault(group_value, []).append(
-            window_values.astype(np.float64, copy=False)
-        )
-        group_to_values_valid.setdefault(group_value, []).append(
-            valid_values.astype(np.float64, copy=False)
-        )
-
-        print(
-            f'polygon_id={polygon_id} ({title_key}={group_value}, window={polygon_spec["window"]})'
-        )
-        print(
-            f"  - selected_values_all: {_format_array(window_values.astype(np.float64, copy=False))}"
-        )
-        print(
-            f"  - selected_values_valid: {_format_array(valid_values.astype(np.float64, copy=False))}"
-        )
-        print("")
-
-    group_items = list(stats_by_group.items())
-    if sort_groups:
-        group_items.sort(key=lambda item: str(item[0]))
-
-    for group_value, stats in group_items:
-        all_group_values = (
-            np.concatenate(group_to_values_all.get(group_value, []))
-            if group_to_values_all.get(group_value)
-            else np.array([], dtype=np.float64)
-        )
-        valid_group_values = (
-            np.concatenate(group_to_values_valid.get(group_value, []))
-            if group_to_values_valid.get(group_value)
-            else np.array([], dtype=np.float64)
-        )
-
-        print(f"{title_key}={group_value}")
-        print(f"  - selected_values_all: {_format_array(all_group_values)}")
-        print(f"  - selected_values_valid: {_format_array(valid_group_values)}")
-
-        stat_items = list(stats.items())
-        if sort_stats:
-            stat_items.sort(
-                key=lambda item: (
-                    (
-                        preferred_stat_order.index(item[0])
-                        if item[0] in preferred_stat_order
-                        else 10_000
-                    ),
-                    item[0],
-                )
-            )
-
-        for stat_key, stat_value in stat_items:
-            print(f"  - {stat_key}: {_format_value(stat_value)}")
-        print("")
-
-
-def example_fast_zonal_statistics_test_case(*, fast_zonal_statistics_fn):
-    import numpy as np
-
-    raster_values = np.array(
-        [
-            [1, 2, 3, 4, 5],
-            [6, 7, 8, 9, 10],
-            [11, 12, -9999, 14, 15],
-            [16, 17, 18, 19, 20],
-            [21, 22, 23, 24, 25],
-        ],
-        dtype=np.float32,
-    )
-
-    polygons = [
-        {"group_value": 10, "window": (0, 0, 2, 2)},
-        {"group_value": 10, "window": (2, 0, 3, 1)},
-        {"group_value": 20, "window": (1, 2, 3, 2)},
-    ]
-
-    result = run_fast_zonal_statistics_test_case(
-        fast_zonal_statistics_fn=fast_zonal_statistics_fn,
-        raster_values=raster_values,
-        polygons=polygons,
-        aggregate_vector_field="group_id",
-        aggregate_layer_name="polys",
-        ignore_nodata=True,
-        percentile_list=[50, 90],
-        raster_nodata=-9999,
-        pixel_size=10.0,
-        origin_x=1000.0,
-        origin_y=2000.0,
-        epsg=3857,
-        allclose_rtol=1e-6,
-        allclose_atol=1e-6,
-        clean_working_dir=True,
-    )
-
-    return polygons, raster_values, result
-
-
-def run_test():
-    polygons, raster_values, result = example_fast_zonal_statistics_test_case(
-        fast_zonal_statistics_fn=fast_zonal_statistics
-    )
-    print(result["actual"][10])
-    expected = {
-        10: {
-            "min": 1.0,
-            "max": 7.0,
-            "total_count": 7,
-            "nodata_count": 0,
-            "valid_count": 7,
-            "sum": 28.0,
-            "stdev": 2.000000,
-            "p50": 4.000000,
-            "p90": 7,
-        },
-        20: {
-            "min": 12.0,
-            "max": 19.0,
-            "total_count": 6,
-            "nodata_count": 1,
-            "valid_count": 5,
-            "sum": 80.0,
-            "stdev": 2.607681,
-            "p50": 17.000000,
-            "p90": 19,
-        },
-    }
-
-    def assert_actual_matches_expected(actual, expected, float_tol=1e-6):
-        for gid, exp in expected.items():
-            if gid not in actual:
-                raise AssertionError(f"missing group_id={gid} in actual results")
-            a = actual[gid]
-            for k, v in exp.items():
-                if k not in a:
-                    raise AssertionError(
-                        f"missing key={k} for group_id={gid} in actual results"
-                    )
-                av = a[k]
-                if isinstance(v, float):
-                    if av is None or not math.isclose(
-                        float(av), float(v), rel_tol=0.0, abs_tol=float_tol
-                    ):
-                        raise AssertionError(
-                            f"group_id={gid} key={k} expected={v} actual={av}"
-                        )
-                else:
-                    if av != v:
-                        raise AssertionError(
-                            f"group_id={gid} key={k} expected={v} actual={av}"
-                        )
-
-    polygons, raster_values, result = example_fast_zonal_statistics_test_case(
-        fast_zonal_statistics_fn=fast_zonal_statistics
-    )
-
-    assert_actual_matches_expected(result["actual"], expected)
-
-    pretty_print_zonal_stats_result_with_polygon_values(
-        polygons,
-        result,
-        raster_values=raster_values,
-        raster_nodata=-9999,
-        ignore_nodata=True,
-        title_key="group_id",
-        stats_root_key="actual",
-        float_digits=6,
-    )
-    return
 
 
 def main():
@@ -1789,13 +1269,7 @@ def main():
         job["output_csv"] = output_path_timestamped
         job["task_graph"] = task_graph
 
-        if job["job_type"] == "raster":
-            logger.info("running a raster")
-            continue
-            thread = Thread(target=run_raster_zonal_stats_job, kwargs=job)
-        if job["job_type"] == "vector":
-            logger.info("running a vector")
-            thread = Thread(target=run_vector_stats_job, kwargs=job)
+        thread = Thread(target=run_zonal_stats_job, kwargs=job)
         thread.start()
         thread_list.append(thread)
     for thread in thread_list:
