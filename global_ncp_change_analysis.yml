@@ -4,42 +4,42 @@ global_work_dir = ./workdir
 global_output_dir = ./output
 log_level = INFO
 
-[job:country]
+[raster_job:country]
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = nev_name
 operations = mean,stdev,valid_count,total_count,p5,p95
 row_col_order=agg_field,base_raster
 base_raster_pattern=./jeronimodata/rasters_to_summarize/*.tif
 
-[job:continent]
+[raster_job:continent]
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = continent
 operations = mean,stdev,valid_count,total_count,p5,p95
 row_col_order=agg_field,base_raster
 base_raster_pattern=./jeronimodata/rasters_to_summarize/*.tif
 
-[job:region_un]
+[raster_job:region_un]
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = region_un
 operations = mean,stdev,valid_count,total_count,p5,p95
 row_col_order=agg_field,base_raster
 base_raster_pattern=./jeronimodata/rasters_to_summarize/*.tif
 
-[job:subregion]
+[raster_job:subregion]
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = subregion
 operations = mean,stdev,valid_count,total_count,p5,p95
 row_col_order=agg_field,base_raster
 base_raster_pattern=./jeronimodata/rasters_to_summarize/*.tif
 
-[job:income_grp]
+[raster_job:income_grp]
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = income_grp
 operations = mean,stdev,valid_count,total_count,p5,p95
 row_col_order=agg_field,base_raster
 base_raster_pattern=./jeronimodata/rasters_to_summarize/*.tif
 
-[job:biome]
+[raster_job:biome]
 agg_vector = ./jeronimodata/vector_basedata/Biome.gpkg
 agg_field = WWF_biome
 operations = mean,stdev,valid_count,total_count,p5,p95
