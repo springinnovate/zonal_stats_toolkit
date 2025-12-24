@@ -7,10 +7,8 @@ from pathlib import Path
 import collections
 import argparse
 import configparser
-import csv
 import glob
 import logging
-import math
 import os
 import shutil
 import tempfile
@@ -27,7 +25,10 @@ import fiona
 import numpy as np
 import geopandas as gpd
 
+logging.getLogger("ecoshard").setLevel(logging.WARNING)
+logging.getLogger("fiona").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
 
 _LOGGING_PERIOD = 10.0
 VALID_OPERATIONS = {
@@ -807,14 +808,6 @@ def fast_zonal_statistics(
             shutil.rmtree(temp_working_dir)
 
 
-import numpy as np
-import pandas as pd
-import geopandas as gpd
-from pyproj import CRS, Transformer
-from shapely.strtree import STRtree
-from tqdm import tqdm
-
-
 def run_vector_stats_job(
     base_vector_path_list,
     base_vector_fields,
@@ -827,7 +820,6 @@ def run_vector_stats_job(
     tag: str,
     row_col_order: str,
     job_type: str,
-    task_graph,
 ):
     if job_type != "vector":
         raise ValueError(f"unexpected job type for run_vector_stats_job: {job_type}")
@@ -949,7 +941,6 @@ def run_vector_stats_job(
         }
 
         res = pd.DataFrame({agg_field: group_keys_arr})
-        res["base_vector"] = stem
 
         if "total_count" in core_ops:
             res["total_count"] = np.bincount(nearest_idx, minlength=n_groups).astype(
@@ -995,13 +986,13 @@ def run_vector_stats_job(
                 out = np.full(n_groups, np.nan, dtype=float)
                 ok = valid_count > 0
                 out[ok] = sum_v[ok]
-                res[f"{field}_sum"] = out
+                res[f"sum_{stem}_{field}"] = out
 
             if "mean" in core_ops:
                 out = np.full(n_groups, np.nan, dtype=float)
                 ok = valid_count > 0
                 out[ok] = sum_v[ok] / valid_count[ok]
-                res[f"{field}_mean"] = out
+                res[f"mean_{stem}_{field}"] = out
 
             if "stdev" in core_ops:
                 mean = np.full(n_groups, np.nan, dtype=float)
@@ -1011,7 +1002,7 @@ def run_vector_stats_job(
                 mean2[ok] = sum_v2[ok] / valid_count[ok]
                 var = mean2 - mean * mean
                 var[var < 0] = 0
-                res[f"{field}_stdev"] = np.sqrt(var)
+                res[f"stdev_{stem}_{field}"] = np.sqrt(var)
 
             if need_sort_per_field:
                 ord2 = np.argsort(g_valid, kind="mergesort")
@@ -1024,19 +1015,19 @@ def run_vector_stats_job(
                 if "min" in core_ops:
                     out = np.full(n_groups, np.nan, dtype=float)
                     out[uniq2] = np.minimum.reduceat(v2, starts2)
-                    res[f"{field}_min"] = out
+                    res[f"min_{stem}_{field}"] = out
 
                 if "max" in core_ops:
                     out = np.full(n_groups, np.nan, dtype=float)
                     out[uniq2] = np.maximum.reduceat(v2, starts2)
-                    res[f"{field}_max"] = out
+                    res[f"max_{stem}_{field}"] = out
 
                 if pct_list:
                     for p in pct_list:
                         p_str = (
                             str(int(p)) if float(p).is_integer() else str(p)
                         ).replace(".", "_")
-                        col = f"{field}_p{p_str}"
+                        col = f"p{p_str}_{stem}_{field}"
                         out = np.full(n_groups, np.nan, dtype=float)
                         for g, s, c in zip(uniq2, starts2, counts2):
                             out[int(g)] = np.percentile(v2[s : s + c], p)
@@ -1091,66 +1082,72 @@ def run_zonal_stats_job(
 
     if base_raster_path_list:
         raster_rows = []
+        grouped_stats_list = []
         for base_raster_path in base_raster_path_list:
             base_raster_path = Path(base_raster_path)
-            base = base_raster_path.stem
 
-            grouped_stats = fast_zonal_statistics(
-                (base_raster_path, 1),
-                agg_vector,
-                agg_field,
-                aggregate_layer_name=agg_layer,
-                ignore_nodata=True,
-                working_dir=workdir,
-                clean_working_dir=True,
-                percentile_list=pct_list,
+            grouped_stats_task = task_graph.add_task(
+                func=fast_zonal_statistics,
+                args=((base_raster_path, 1), agg_vector, agg_field),
+                kwargs={
+                    "aggregate_layer_name": agg_layer,
+                    "ignore_nodata": True,
+                    "working_dir": workdir,
+                    "clean_working_dir": True,
+                    "percentile_list": pct_list,
+                },
+                store_result=True,
             )
-
-            for group_value, stats in grouped_stats.items():
-                row = {
-                    agg_field: group_value,
-                    "base": base,
-                    "base_type": "raster",
-                }
-                for op in core_ops:
-                    row[op] = stats.get(op)
-                for k in pct_keys:
-                    row[k] = stats.get(k)
-                raster_rows.append(row)
-
-        df_parts.append(pd.DataFrame(raster_rows))
-
-    transformers_by_stem = {}
-    assignments_by_stem = {}
+            grouped_stats_list.append(
+                (base_raster_path.stem, agg_field, grouped_stats_task)
+            )
 
     if base_vector_path_list:
         vector_tmp_csv = workdir / f"{tag}__vector_stats.csv"
 
-        transformers_by_stem, assignments_by_stem = run_vector_stats_job(
-            base_vector_path_list=base_vector_path_list,
-            base_vector_fields=base_vector_fields,
-            agg_vector=agg_vector,
-            agg_layer=agg_layer,
-            agg_field=agg_field,
-            operations=operations,
-            output_csv=vector_tmp_csv,
-            workdir=workdir,
-            tag=tag,
-            row_col_order="agg_field,base_vector",
-            job_type="vector",
-            task_graph=task_graph,
+        vector_task = task_graph.add_task(
+            func=run_vector_stats_job,
+            kwargs={
+                "base_vector_path_list": base_vector_path_list,
+                "base_vector_fields": base_vector_fields,
+                "agg_vector": agg_vector,
+                "agg_layer": agg_layer,
+                "agg_field": agg_field,
+                "operations": operations,
+                "output_csv": vector_tmp_csv,
+                "workdir": workdir,
+                "tag": tag,
+                "row_col_order": "agg_field,base_vector",
+                "job_type": "vector",
+            },
+            task_name=f"vector stats for {tag}",
+            target_path_list=[vector_tmp_csv],
         )
+        vector_task.join()
 
         vdf = pd.read_csv(vector_tmp_csv)
         if "base_vector" in vdf.columns:
             vdf = vdf.rename(columns={"base_vector": "base"})
-        vdf["base_type"] = "vector"
         df_parts.append(vdf)
+
+    for raster_stem, agg_field, group_task in grouped_stats_list:
+        grouped_stats = group_task.get()
+        for group_value, stats in grouped_stats.items():
+            row = {
+                agg_field: group_value,
+            }
+            for op in core_ops:
+                row[f"{op}_{raster_stem}"] = stats.get(op)
+            for k in pct_keys:
+                row[f"{k}_{raster_stem}"] = stats.get(k)
+            raster_rows.append(row)
+
+        df_parts.append(pd.DataFrame(raster_rows))
 
     if df_parts:
         df = pd.concat(df_parts, ignore_index=True, sort=False)
     else:
-        df = pd.DataFrame(columns=[agg_field, "base", "base_type"])
+        df = pd.DataFrame(columns=[agg_field])
 
     tokens = [t.strip() for t in row_col_order.split(",") if t.strip()]
     col_map = {
@@ -1180,8 +1177,6 @@ def run_zonal_stats_job(
     output_csv = Path(output_csv)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_csv, index=False)
-
-    return transformers_by_stem, assignments_by_stem
 
 
 def _invoke_timed_callback(reference_time, callback_lambda, callback_period):
@@ -1232,13 +1227,12 @@ def main():
     logger = logging.getLogger(cfg["project"]["name"])
     logger.setLevel(log_level)
     logger.info("Loaded config %s", str(cfg_path))
-    logger.info(cfg)
     # task_graph = taskgraph.TaskGraph(
     #     cfg["project"]["global_work_dir"], os.cpu_count() // 2 + 1, 15.0
     # )
     task_graph = taskgraph.TaskGraph(cfg["project"]["global_work_dir"], -1)
 
-    timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     thread_list = []
 
