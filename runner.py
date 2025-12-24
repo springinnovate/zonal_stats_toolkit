@@ -825,14 +825,14 @@ def run_vector_stats_job(
         raise ValueError(f"unexpected job type for run_vector_stats_job: {job_type}")
 
     logger.info("parsing operations for tag=%s", tag)
-    ops = [o.strip().lower() for o in operations if str(o).strip()]
+    normalized_operations = [o.strip().lower() for o in operations if str(o).strip()]
     core_ops = []
     pct_list = []
-    for op in ops:
-        if op.startswith("p") and len(op) > 1:
-            pct_list.append(float(op[1:]))
+    for operation in normalized_operations:
+        if operation.startswith("p") and len(operation) > 1:
+            pct_list.append(float(operation[1:]))
         else:
-            core_ops.append(op)
+            core_ops.append(operation)
     core_ops = list(dict.fromkeys(core_ops))
     pct_list = sorted(set(pct_list))
     logger.info(
@@ -858,25 +858,34 @@ def run_vector_stats_job(
     agg_groups = agg_gdf.dissolve(by=agg_field)
     logger.info("dissolve complete for tag=%s groups=%d", tag, len(agg_groups))
 
-    group_geoms = list(agg_groups.geometry.values)
+    group_geometries = list(agg_groups.geometry.values)
     group_keys = list(agg_groups.index)
     group_keys_arr = np.asarray(group_keys, dtype=object)
-    n_groups = len(group_keys_arr)
+    group_count = len(group_keys_arr)
 
-    logger.info("building STRtree for tag=%s groups=%d", tag, n_groups)
-    tree = STRtree(group_geoms)
+    logger.info("building STRtree for tag=%s groups=%d", tag, group_count)
+    tree = STRtree(group_geometries)
     logger.info("STRtree built for tag=%s", tag)
 
-    logger.info("building geometry-id index map for tag=%s groups=%d", tag, n_groups)
-    geom_id_to_idx = {id(g): i for i, g in enumerate(group_geoms)}
+    logger.info("building geometry-id index map for tag=%s groups=%d", tag, group_count)
+    geom_id_to_idx = {
+        id(geometry): index for index, geometry in enumerate(group_geometries)
+    }
     logger.info("geometry-id index map built for tag=%s", tag)
 
     transformers_by_stem = {}
     assignments_by_stem = {}
-    result_frames = []
+    per_stem_frames = []
 
     chunk_size = 1_000
     logger.info("chunk_size set for tag=%s chunk_size=%d", tag, chunk_size)
+
+    def _pct_to_suffix(percentile_value: float) -> str:
+        return (
+            str(int(percentile_value))
+            if float(percentile_value).is_integer()
+            else str(percentile_value)
+        ).replace(".", "_")
 
     for base_vector_path in base_vector_path_list:
         base_vector_path = Path(base_vector_path)
@@ -895,71 +904,75 @@ def run_vector_stats_job(
 
         transformers_by_stem[stem] = transformer
 
-        fids_all = base_gdf.index.to_numpy()
-        geoms_all = base_gdf.geometry.values
-        n = len(fids_all)
+        feature_ids_all = base_gdf.index.to_numpy()
+        geometries_all = base_gdf.geometry.values
+        feature_count = len(feature_ids_all)
 
-        nearest_idx = np.empty(n, dtype=np.int64)
-
-        starts = list(range(0, n, chunk_size))
-        tasks = [(s, geoms_all[s : min(s + chunk_size, n)]) for s in starts]
-
-        nearest_idx = np.empty(n, dtype=np.int64)
+        nearest_group_index = np.empty(feature_count, dtype=np.int64)
 
         def _nearest_chunk_thread(args):
-            start, geoms = args
-            nearest = np.asarray(tree.nearest(geoms))
-            if nearest.dtype == object:
-                nearest = np.fromiter(
-                    (geom_id_to_idx[id(g)] for g in nearest),
+            start_index, geometries_chunk = args
+            nearest_geometries = np.asarray(tree.nearest(geometries_chunk))
+            if nearest_geometries.dtype == object:
+                nearest_geometries = np.fromiter(
+                    (geom_id_to_idx[id(geometry)] for geometry in nearest_geometries),
                     dtype=np.int64,
-                    count=len(nearest),
+                    count=len(nearest_geometries),
                 )
-            return start, nearest.astype(np.int64, copy=False)
+            return start_index, nearest_geometries.astype(np.int64, copy=False)
 
-        tasks = [
-            (s, geoms_all[s : min(s + chunk_size, n)]) for s in range(0, n, chunk_size)
+        nearest_tasks = [
+            (
+                start_index,
+                geometries_all[
+                    start_index : min(start_index + chunk_size, feature_count)
+                ],
+            )
+            for start_index in range(0, feature_count, chunk_size)
         ]
 
-        with ThreadPoolExecutor() as ex:
-            for start, nearest in tqdm(
-                ex.map(_nearest_chunk_thread, tasks, chunksize=1),
-                total=len(tasks),
+        with ThreadPoolExecutor() as executor:
+            for start_index, nearest_chunk in tqdm(
+                executor.map(_nearest_chunk_thread, nearest_tasks, chunksize=1),
+                total=len(nearest_tasks),
                 desc=f"finding closest geom: {stem}",
             ):
-                nearest_idx[start : start + len(nearest)] = nearest
+                nearest_group_index[
+                    start_index : start_index + len(nearest_chunk)
+                ] = nearest_chunk
 
-        order = np.argsort(nearest_idx, kind="mergesort")
-        g_sorted = nearest_idx[order]
-        f_sorted = fids_all[order]
-        uniq_g, start_idx, counts = np.unique(
-            g_sorted, return_index=True, return_counts=True
+        order = np.argsort(nearest_group_index, kind="mergesort")
+        groups_sorted = nearest_group_index[order]
+        features_sorted = feature_ids_all[order]
+        unique_groups, start_indices, counts = np.unique(
+            groups_sorted, return_index=True, return_counts=True
         )
         assignments_by_stem[stem] = {
-            group_keys_arr[int(g)]: f_sorted[s : s + c]
-            for g, s, c in zip(uniq_g, start_idx, counts)
+            group_keys_arr[int(group_index)]: features_sorted[start : start + count]
+            for group_index, start, count in zip(unique_groups, start_indices, counts)
         }
 
-        res = pd.DataFrame({agg_field: group_keys_arr})
+        stem_frame = pd.DataFrame({agg_field: group_keys_arr})
 
         if "total_count" in core_ops:
-            res["total_count"] = np.bincount(nearest_idx, minlength=n_groups).astype(
-                np.int64
-            )
+            stem_frame[f"total_count_{stem}"] = np.bincount(
+                nearest_group_index, minlength=group_count
+            ).astype(np.int64)
 
         need_sort_per_field = (
             ("min" in core_ops) or ("max" in core_ops) or (len(pct_list) > 0)
         )
 
         for field in base_vector_fields:
-            vals = base_gdf[field].to_numpy()
-            m = ~pd.isna(vals)
-            g_valid = nearest_idx[m]
-            v_valid = vals[m].astype(float, copy=False)
+            values_all = base_gdf[field].to_numpy()
+            has_value_mask = ~pd.isna(values_all)
+
+            groups_valid = nearest_group_index[has_value_mask]
+            values_valid = values_all[has_value_mask].astype(float, copy=False)
 
             valid_count = None
-            sum_v = None
-            sum_v2 = None
+            sum_values = None
+            sum_values_sq = None
 
             if (
                 ("valid_count" in core_ops)
@@ -967,86 +980,121 @@ def run_vector_stats_job(
                 or ("stdev" in core_ops)
                 or ("sum" in core_ops)
             ):
-                valid_count = np.bincount(g_valid, minlength=n_groups).astype(np.int64)
+                valid_count = np.bincount(groups_valid, minlength=group_count).astype(
+                    np.int64
+                )
 
             if ("mean" in core_ops) or ("stdev" in core_ops) or ("sum" in core_ops):
-                sum_v = np.bincount(
-                    g_valid, weights=v_valid, minlength=n_groups
+                sum_values = np.bincount(
+                    groups_valid, weights=values_valid, minlength=group_count
                 ).astype(float, copy=False)
 
             if "stdev" in core_ops:
-                sum_v2 = np.bincount(
-                    g_valid, weights=v_valid * v_valid, minlength=n_groups
+                sum_values_sq = np.bincount(
+                    groups_valid,
+                    weights=values_valid * values_valid,
+                    minlength=group_count,
                 ).astype(float, copy=False)
 
             if "valid_count" in core_ops:
-                res[f"{field}_valid_count"] = valid_count
+                stem_frame[f"valid_count_{field}_{stem}"] = valid_count
 
             if "sum" in core_ops:
-                out = np.full(n_groups, np.nan, dtype=float)
+                out = np.full(group_count, np.nan, dtype=float)
                 ok = valid_count > 0
-                out[ok] = sum_v[ok]
-                res[f"sum_{stem}_{field}"] = out
+                out[ok] = sum_values[ok]
+                stem_frame[f"sum_{field}_{stem}"] = out
 
             if "mean" in core_ops:
-                out = np.full(n_groups, np.nan, dtype=float)
+                out = np.full(group_count, np.nan, dtype=float)
                 ok = valid_count > 0
-                out[ok] = sum_v[ok] / valid_count[ok]
-                res[f"mean_{stem}_{field}"] = out
+                out[ok] = sum_values[ok] / valid_count[ok]
+                stem_frame[f"mean_{field}_{stem}"] = out
 
             if "stdev" in core_ops:
-                mean = np.full(n_groups, np.nan, dtype=float)
+                mean = np.full(group_count, np.nan, dtype=float)
                 ok = valid_count > 0
-                mean[ok] = sum_v[ok] / valid_count[ok]
-                mean2 = np.full(n_groups, np.nan, dtype=float)
-                mean2[ok] = sum_v2[ok] / valid_count[ok]
-                var = mean2 - mean * mean
-                var[var < 0] = 0
-                res[f"stdev_{stem}_{field}"] = np.sqrt(var)
+                mean[ok] = sum_values[ok] / valid_count[ok]
+                mean_sq = np.full(group_count, np.nan, dtype=float)
+                mean_sq[ok] = sum_values_sq[ok] / valid_count[ok]
+                variance = mean_sq - mean * mean
+                variance[variance < 0] = 0
+                stem_frame[f"stdev_{field}_{stem}"] = np.sqrt(variance)
 
             if need_sort_per_field:
-                ord2 = np.argsort(g_valid, kind="mergesort")
-                g2 = g_valid[ord2]
-                v2 = v_valid[ord2]
-                uniq2, starts2, counts2 = np.unique(
-                    g2, return_index=True, return_counts=True
+                sort_order = np.argsort(groups_valid, kind="mergesort")
+                groups_sorted = groups_valid[sort_order]
+                values_sorted = values_valid[sort_order]
+                unique_groups, start_indices, counts = np.unique(
+                    groups_sorted, return_index=True, return_counts=True
                 )
 
                 if "min" in core_ops:
-                    out = np.full(n_groups, np.nan, dtype=float)
-                    out[uniq2] = np.minimum.reduceat(v2, starts2)
-                    res[f"min_{stem}_{field}"] = out
+                    out = np.full(group_count, np.nan, dtype=float)
+                    out[unique_groups] = np.minimum.reduceat(
+                        values_sorted, start_indices
+                    )
+                    stem_frame[f"min_{field}_{stem}"] = out
 
                 if "max" in core_ops:
-                    out = np.full(n_groups, np.nan, dtype=float)
-                    out[uniq2] = np.maximum.reduceat(v2, starts2)
-                    res[f"max_{stem}_{field}"] = out
+                    out = np.full(group_count, np.nan, dtype=float)
+                    out[unique_groups] = np.maximum.reduceat(
+                        values_sorted, start_indices
+                    )
+                    stem_frame[f"max_{field}_{stem}"] = out
 
                 if pct_list:
-                    for p in pct_list:
-                        p_str = (
-                            str(int(p)) if float(p).is_integer() else str(p)
-                        ).replace(".", "_")
-                        col = f"p{p_str}_{stem}_{field}"
-                        out = np.full(n_groups, np.nan, dtype=float)
-                        for g, s, c in zip(uniq2, starts2, counts2):
-                            out[int(g)] = np.percentile(v2[s : s + c], p)
-                        res[col] = out
+                    for percentile_value in pct_list:
+                        percentile_suffix = _pct_to_suffix(percentile_value)
+                        column_name = f"p{percentile_suffix}_{field}_{stem}"
+                        out = np.full(group_count, np.nan, dtype=float)
+                        for group_index, start_index, count in zip(
+                            unique_groups, start_indices, counts
+                        ):
+                            out[int(group_index)] = np.percentile(
+                                values_sorted[start_index : start_index + count],
+                                percentile_value,
+                            )
+                        stem_frame[column_name] = out
 
-        result_frames.append(res)
+        per_stem_frames.append(stem_frame)
 
-    df = pd.concat(result_frames, ignore_index=True)
+    if per_stem_frames:
+        result_table = per_stem_frames[0]
+        for stem_frame in per_stem_frames[1:]:
+            result_table = result_table.merge(
+                stem_frame, on=agg_field, how="outer", sort=False
+            )
+    else:
+        result_table = pd.DataFrame(columns=[agg_field])
 
-    tokens = [t.strip() for t in row_col_order.split(",") if t.strip()]
-    col_map = {"agg_field": agg_field, "base_vector": "base_vector"}
-    prefix = [col_map[t] for t in tokens if t in col_map]
-    cols = prefix + [c for c in df.columns if c not in prefix]
-    df = df[cols]
+    desired_columns = [agg_field]
+    per_field_ops = [operation for operation in core_ops if operation != "total_count"]
+
+    for base_vector_path in base_vector_path_list:
+        stem = Path(base_vector_path).stem
+
+        if "total_count" in core_ops:
+            column_name = f"total_count_{stem}"
+            if column_name in result_table.columns:
+                desired_columns.append(column_name)
+
+        for field in base_vector_fields:
+            for operation in per_field_ops:
+                column_name = f"{operation}_{field}_{stem}"
+                if column_name in result_table.columns:
+                    desired_columns.append(column_name)
+            for percentile_value in pct_list:
+                percentile_suffix = _pct_to_suffix(percentile_value)
+                column_name = f"p{percentile_suffix}_{field}_{stem}"
+                if column_name in result_table.columns:
+                    desired_columns.append(column_name)
+
+    remaining_columns = [c for c in result_table.columns if c not in desired_columns]
+    result_table = result_table[desired_columns + remaining_columns]
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(output_csv, index=False)
-
-    return transformers_by_stem, assignments_by_stem
+    result_table.to_csv(output_csv, index=False)
 
 
 def run_zonal_stats_job(
@@ -1078,11 +1126,9 @@ def run_zonal_stats_job(
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
-    df_parts = []
-
+    grouped_stats_list = []
     if base_raster_path_list:
         raster_rows = []
-        grouped_stats_list = []
         for base_raster_path in base_raster_path_list:
             base_raster_path = Path(base_raster_path)
 
@@ -1220,10 +1266,10 @@ def main():
     logger = logging.getLogger(cfg["project"]["name"])
     logger.setLevel(log_level)
     logger.info("Loaded config %s", str(cfg_path))
-    # task_graph = taskgraph.TaskGraph(
-    #     cfg["project"]["global_work_dir"], os.cpu_count() // 2 + 1, 15.0
-    # )
-    task_graph = taskgraph.TaskGraph(cfg["project"]["global_work_dir"], -1)
+    task_graph = taskgraph.TaskGraph(
+        cfg["project"]["global_work_dir"], os.cpu_count() // 2 + 1, 15.0
+    )
+    # task_graph = taskgraph.TaskGraph(cfg["project"]["global_work_dir"], -1)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1247,7 +1293,7 @@ def main():
         thread_list.append(thread)
     for thread in thread_list:
         thread.join()
-    logger.info("All jobs validated (%d)", len(cfg["job_list"]))
+    logger.info(f"All {len(cfg['job_list'])} jobs done")
     task_graph.join()
     task_graph.close()
 
