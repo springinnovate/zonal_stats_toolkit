@@ -1102,6 +1102,8 @@ def run_zonal_stats_job(
                 (base_raster_path.stem, agg_field, grouped_stats_task)
             )
 
+    combined_dataframe = None
+
     if base_vector_path_list:
         vector_tmp_csv = workdir / f"{tag}__vector_stats.csv"
 
@@ -1125,58 +1127,49 @@ def run_zonal_stats_job(
         )
         vector_task.join()
 
-        vdf = pd.read_csv(vector_tmp_csv)
-        if "base_vector" in vdf.columns:
-            vdf = vdf.rename(columns={"base_vector": "base"})
-        df_parts.append(vdf)
+        vector_dataframe = pd.read_csv(vector_tmp_csv)
+        if "base_vector" in vector_dataframe.columns:
+            vector_dataframe = vector_dataframe.rename(columns={"base_vector": "base"})
 
-    for raster_stem, agg_field, group_task in grouped_stats_list:
+        combined_dataframe = vector_dataframe
+
+    raster_dataframes = []
+
+    for raster_stem, aggregation_field_name, group_task in grouped_stats_list:
         grouped_stats = group_task.get()
-        for group_value, stats in grouped_stats.items():
-            row = {
-                agg_field: group_value,
-            }
-            for op in core_ops:
-                row[f"{op}_{raster_stem}"] = stats.get(op)
-            for k in pct_keys:
-                row[f"{k}_{raster_stem}"] = stats.get(k)
+
+        raster_rows = []
+        for group_value, statistics in grouped_stats.items():
+            row = {aggregation_field_name: group_value}
+            for operation in core_ops:
+                row[f"{operation}_{raster_stem}"] = statistics.get(operation)
+            for percentile_key in pct_keys:
+                row[f"{percentile_key}_{raster_stem}"] = statistics.get(percentile_key)
             raster_rows.append(row)
 
-        df_parts.append(pd.DataFrame(raster_rows))
+        raster_dataframes.append(pd.DataFrame(raster_rows))
 
-    if df_parts:
-        df = pd.concat(df_parts, ignore_index=True, sort=False)
-    else:
-        df = pd.DataFrame(columns=[agg_field])
+    raster_dataframe = None
+    for raster_frame in raster_dataframes:
+        raster_dataframe = (
+            raster_frame
+            if raster_dataframe is None
+            else raster_dataframe.merge(raster_frame, on=agg_field, how="outer")
+        )
 
-    tokens = [t.strip() for t in row_col_order.split(",") if t.strip()]
-    col_map = {
-        "agg_field": agg_field,
-        "base": "base",
-        "base_raster": "base",
-        "base_vector": "base",
-        "base_type": "base_type",
-    }
+    if combined_dataframe is None:
+        combined_dataframe = raster_dataframe
+    elif raster_dataframe is not None:
+        combined_dataframe = combined_dataframe.merge(
+            raster_dataframe, on=agg_field, how="outer"
+        )
 
-    prefix = []
-    for t in tokens:
-        c = col_map.get(t)
-        if c and (c in df.columns) and (c not in prefix):
-            prefix.append(c)
-
-    if ("base_type" in df.columns) and ("base_type" not in prefix):
-        if "base" in prefix:
-            i = prefix.index("base") + 1
-            prefix = prefix[:i] + ["base_type"] + prefix[i:]
-        else:
-            prefix.append("base_type")
-
-    cols = prefix + [c for c in df.columns if c not in prefix]
-    df = df[cols]
+    if combined_dataframe is None:
+        combined_dataframe = pd.DataFrame(columns=[agg_field])
 
     output_csv = Path(output_csv)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(output_csv, index=False)
+    combined_dataframe.to_csv(output_csv, index=False)
 
 
 def _invoke_timed_callback(reference_time, callback_lambda, callback_period):
