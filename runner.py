@@ -1457,7 +1457,7 @@ def main():
                 job["tag"],
                 ",".join(job["operations"]),
             )
-            output_path = job["output_csv"]
+            output_path = Path(job["output_csv"])
             output_path_timestamped = output_path.with_name(
                 f"{output_path.stem}_{timestamp}{output_path.suffix}"
             )
