@@ -108,7 +108,7 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
     Returns:
         A dictionary with two top-level keys:
             - `project`: A dict containing validated project-level settings
-              (`name`, `global_work_dir`, `global_output_dir`, `log_level`).
+              (`name`, `global_work_dir`, `log_level`).
             - `job_list`: A list of dicts, one per job, containing validated and
               resolved job configuration, including paths, fields, operations, and
               output locations.
@@ -142,10 +142,6 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
     global_work_dir = Path(config["project"]["global_work_dir"].strip())
     if not global_work_dir.is_absolute():
         global_work_dir = cfg_dir / global_work_dir
-
-    global_output_dir = Path(config["project"]["global_output_dir"].strip())
-    if not global_output_dir.is_absolute():
-        global_output_dir = cfg_dir / global_output_dir
 
     job_tags = []
     jobs_sections = []
@@ -289,9 +285,7 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                     f"Available fields: {sorted(props.keys())}"
                 )
 
-        outdir = global_output_dir
         workdir = global_work_dir / Path(tag)
-        outdir.mkdir(parents=True, exist_ok=True)
         workdir.mkdir(parents=True, exist_ok=True)
 
         base_raster_path_list = []
@@ -376,7 +370,6 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
         "project": {
             "name": project_name,
             "global_work_dir": global_work_dir,
-            "global_output_dir": global_output_dir,
             "log_level": log_level_str,
         },
         "job_list": job_list,

@@ -1,7 +1,6 @@
 [project]
 name = global_ncp_change_analysis_accountforfinite
 global_work_dir = ./workdir
-global_output_dir = ./output
 log_level = INFO
 
 [job:country]
