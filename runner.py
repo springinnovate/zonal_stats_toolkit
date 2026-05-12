@@ -294,25 +294,6 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                     f"Available fields: {sorted(props.keys())}"
                 )
 
-        row_col_order_raw = job.get("row_col_order", "").strip()
-        if not row_col_order_raw:
-            raise ValueError(f"[job:{tag}] missing row_col_order")
-        row_col_order_parts = [
-            p.strip() for p in row_col_order_raw.split(",") if p.strip()
-        ]
-        if len(row_col_order_parts) != 2:
-            raise ValueError(f"[job:{tag}] row_col_order must have exactly 2 entries")
-        other_tokens = {"base", "base_raster", "base_vector"}
-        if "agg_field" not in row_col_order_parts:
-            raise ValueError(f"[job:{tag}] row_col_order must include agg_field")
-        other = [t for t in row_col_order_parts if t != "agg_field"]
-        if len(other) != 1 or other[0] not in other_tokens:
-            raise ValueError(
-                f"[job:{tag}] row_col_order must be a permutation of agg_field and one of "
-                f"{sorted(other_tokens)}. Got: {row_col_order_raw}"
-            )
-        row_col_order = ",".join(row_col_order_parts)
-
         outdir = global_output_dir
         workdir = global_work_dir / Path(tag)
         outdir.mkdir(parents=True, exist_ok=True)
@@ -387,7 +368,6 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                 "agg_layer": agg_layer,
                 "agg_field": agg_fields,
                 "operations": operations,
-                "row_col_order": row_col_order,
                 "workdir": workdir,
                 "output_csv": job["output_csv"],
                 "base_raster_path_list": base_raster_path_list,
@@ -951,7 +931,6 @@ def run_vector_stats_job(
     output_csv: Path,
     workdir: Path,
     tag: str,
-    row_col_order: str,
     job_type: str,
 ):
     """Run a vector-based statistics job and write aggregated results to CSV.
@@ -980,7 +959,6 @@ def run_vector_stats_job(
         output_csv: Path to the output CSV file to write.
         workdir: Working directory for intermediate job artifacts.
         tag: Job identifier used for logging and column name suffixes.
-        row_col_order: Output row/column ordering specifier (validated upstream).
         job_type: Job type string; must be `"vector"`.
 
     Raises:
@@ -1280,7 +1258,6 @@ def run_zonal_stats_job(
     output_csv: Path,
     workdir: Path,
     tag: str,
-    row_col_order: str,
     task_graph,
 ):
     """Run a zonal statistics job over raster and/or vector base datasets.
@@ -1308,7 +1285,6 @@ def run_zonal_stats_job(
         output_csv: Path to the output CSV file to write.
         workdir: Working directory for intermediate files and task graph outputs.
         tag: Job identifier used for temporary filenames and task labeling.
-        row_col_order: Output row/column ordering specifier (validated upstream).
         task_graph: Task graph instance used to schedule raster and vector jobs.
 
     Raises:
@@ -1374,7 +1350,6 @@ def run_zonal_stats_job(
                 "output_csv": vector_tmp_csv,
                 "workdir": workdir,
                 "tag": tag,
-                "row_col_order": "agg_field,base_vector",
                 "job_type": "vector",
             },
             task_name=f"vector stats for {tag}",
