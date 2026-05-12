@@ -1091,12 +1091,7 @@ def run_vector_stats_job(
             for group_index, start, count in zip(unique_groups, start_indices, counts)
         }
 
-        if len(agg_fields) == 1:
-            stem_frame = pd.DataFrame({agg_fields[0]: group_keys})
-        else:
-            stem_frame = pd.DataFrame(
-                [dict(zip(agg_fields, group_key)) for group_key in group_keys]
-            )
+        stem_frame = pd.DataFrame(group_keys, columns=agg_fields)
 
         if "total_count" in core_ops:
             stem_frame[f"total_count_{stem}"] = np.bincount(
