@@ -1584,7 +1584,15 @@ def main():
     task_graph = taskgraph.TaskGraph(Path.cwd(), os.cpu_count() // 2 + 1, 15.0)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     thread_list = []
+    thread_error_list = []
     total_job_count = 0
+
+    def _run_zonal_stats_job_thread(output_csv, job_kwargs):
+        try:
+            run_zonal_stats_job(**job_kwargs)
+        except Exception as error:
+            logger.exception("job failed for output %s", output_csv)
+            thread_error_list.append((output_csv, error))
 
     for config_path in args.configs:
         cfg_path = Path(config_path)
@@ -1603,7 +1611,10 @@ def main():
             job["output_csv"] = output_path_timestamped
             job["task_graph"] = task_graph
 
-            thread = Thread(target=run_zonal_stats_job, kwargs=job)
+            thread = Thread(
+                target=_run_zonal_stats_job_thread,
+                args=(output_path_timestamped, job),
+            )
             thread.start()
             thread_list.append((output_path_timestamped, thread))
             total_job_count += 1
@@ -1611,7 +1622,15 @@ def main():
 
     for output_csv, thread in thread_list:
         thread.join()
-        logger.info(f"********* {output_csv} is complete!")
+        if not any(error_path == output_csv for error_path, _ in thread_error_list):
+            logger.info(f"********* {output_csv} is complete!")
+
+    if thread_error_list:
+        task_graph.close()
+        failed_outputs = ", ".join(str(path) for path, _ in thread_error_list)
+        raise RuntimeError(f"zonal statistics jobs failed: {failed_outputs}") from (
+            thread_error_list[0][1]
+        )
 
     task_graph.join()
     task_graph.close()
