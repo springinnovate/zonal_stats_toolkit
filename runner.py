@@ -42,6 +42,148 @@ VALID_OPERATIONS = {
 }
 
 
+def _safe_path_stem(path, max_length=60):
+    """Return a filesystem-safe abbreviated stem for cache directory names."""
+    safe_stem = "".join(
+        char if char.isalnum() or char in ("-", "_") else "_"
+        for char in Path(path).stem
+    )
+    return (safe_stem or "unnamed")[:max_length]
+
+
+def _prepare_aggregate_vector_for_rasterization(
+    aggregate_vector_path,
+    aggregate_layer_name,
+    target_vector_path,
+    raster_projection_wkt,
+    simplify_tolerance,
+    needs_reproject,
+):
+    """Project/simplify aggregation vector and add a FID burn field."""
+    target_vector_path = Path(target_vector_path)
+    target_vector_path.parent.mkdir(parents=True, exist_ok=True)
+    target_vector_path.unlink(missing_ok=True)
+
+    vector_translate_kwargs = {"format": "GPKG"}
+    src_path = str(aggregate_vector_path)
+    tmp_reprojected_path = None
+    if needs_reproject:
+        tmp_reprojected_path = target_vector_path.with_suffix(".reprojected.gpkg")
+        tmp_reprojected_path.unlink(missing_ok=True)
+        logger.info(
+            "vector translate (reproject) start | output=%s | reproject=%s",
+            tmp_reprojected_path,
+            needs_reproject,
+        )
+        gdal.VectorTranslate(
+            str(tmp_reprojected_path),
+            src_path,
+            dstSRS=raster_projection_wkt,
+            **vector_translate_kwargs,
+        )
+        src_path = str(tmp_reprojected_path)
+
+    logger.info(
+        "vector translate (simplify) start | output=%s | simplifyTolerance=%s | reproject=%s",
+        target_vector_path,
+        simplify_tolerance,
+        needs_reproject,
+    )
+    gdal.VectorTranslate(
+        str(target_vector_path),
+        src_path,
+        simplifyTolerance=simplify_tolerance,
+        **vector_translate_kwargs,
+    )
+    if tmp_reprojected_path:
+        tmp_reprojected_path.unlink(missing_ok=True)
+
+    aggregate_vector = gdal.OpenEx(
+        str(target_vector_path), gdal.OF_VECTOR | gdal.OF_UPDATE
+    )
+    aggregate_layer = (
+        aggregate_vector.GetLayerByName(aggregate_layer_name)
+        if aggregate_layer_name is not None
+        else aggregate_vector.GetLayer()
+    )
+
+    local_aggregate_field_name = "original_fid"
+    # RasterizeLayer burns attribute values, so persist the OGR FID as a field.
+    if aggregate_layer.FindFieldIndex(local_aggregate_field_name, 1) == -1:
+        aggregate_layer.CreateField(
+            ogr.FieldDefn(local_aggregate_field_name, ogr.OFTInteger)
+        )
+
+    aggregate_layer.ResetReading()
+    aggregate_layer.StartTransaction()
+    for feature in aggregate_layer:
+        feature.SetField(local_aggregate_field_name, feature.GetFID())
+        aggregate_layer.SetFeature(feature)
+    aggregate_layer.CommitTransaction()
+    aggregate_layer = None
+    aggregate_vector = None
+
+    logger.info("vector translate done | output=%s", target_vector_path)
+
+
+def _rasterize_aggregate_fids(
+    base_raster_path,
+    aggregate_vector_path,
+    aggregate_layer_name,
+    target_raster_path,
+    target_nodata,
+):
+    """Rasterize prepared aggregation feature IDs onto the base raster grid."""
+    target_raster_path = Path(target_raster_path)
+    target_raster_path.parent.mkdir(parents=True, exist_ok=True)
+    target_raster_path.unlink(missing_ok=True)
+
+    logger.info("creating agg fid raster: %s", target_raster_path)
+    geoprocessing.new_raster_from_base(
+        str(base_raster_path),
+        str(target_raster_path),
+        gdal.GDT_Int32,
+        [target_nodata],
+    )
+
+    aggregate_vector = gdal.OpenEx(str(aggregate_vector_path), gdal.OF_VECTOR)
+    aggregate_layer = (
+        aggregate_vector.GetLayerByName(aggregate_layer_name)
+        if aggregate_layer_name is not None
+        else aggregate_vector.GetLayer()
+    )
+    feature_id_raster_dataset = gdal.OpenEx(
+        str(target_raster_path), gdal.GA_Update | gdal.OF_RASTER
+    )
+    if feature_id_raster_dataset is None:
+        raise RuntimeError(f"Could not open target raster at {target_raster_path}")
+
+    rasterize_callback = _make_logger_callback(
+        "rasterizing polygons %.1f%% complete %s"
+    )
+    aggregate_layer.ResetReading()
+    logger.info("rasterize start")
+    error_code = gdal.RasterizeLayer(
+        feature_id_raster_dataset,
+        [1],
+        aggregate_layer,
+        callback=rasterize_callback,
+        options=[
+            "ALL_TOUCHED=FALSE",
+            "ATTRIBUTE=original_fid",
+        ],
+    )
+    feature_id_raster_dataset.FlushCache()
+    feature_id_raster_dataset = None
+    aggregate_layer = None
+    aggregate_vector = None
+    if error_code != 0:
+        raise RuntimeError(
+            f"RasterizeLayer failed with error code {error_code} for {target_raster_path}"
+        )
+    logger.info("rasterize done")
+
+
 def _make_logger_callback(message):
     """Build a timed logger callback that prints ``message`` replaced.
 
@@ -383,7 +525,7 @@ def fast_zonal_statistics(
     aggregate_layer_name=None,
     ignore_nodata=True,
     working_dir=None,
-    clean_working_dir=True,
+    clean_working_dir=False,
     percentile_list=None,
 ):
     raster_path, raster_band_index = base_raster_path_band
@@ -438,26 +580,6 @@ def fast_zonal_statistics(
         "sumsq": 0.0,
     }
 
-    def _open_vector_layer(vector_path, layer_name, vector_label, writable=False):
-        open_flags = gdal.OF_VECTOR | (gdal.OF_UPDATE if writable else 0)
-        vector_dataset = gdal.OpenEx(str(vector_path), open_flags)
-        if vector_dataset is None:
-            raise RuntimeError(f"Could not open {vector_label} vector at {vector_path}")
-
-        if layer_name is not None:
-            logger.info("selecting %s layer by name: %s", vector_label, layer_name)
-            vector_layer = vector_dataset.GetLayerByName(layer_name)
-        else:
-            logger.info("selecting default %s layer", vector_label)
-            vector_layer = vector_dataset.GetLayer()
-
-        if vector_layer is None:
-            raise RuntimeError(
-                f"Could not open layer {layer_name} on {vector_label} vector {vector_path}"
-            )
-
-        return vector_dataset, vector_layer
-
     raster_info = geoprocessing.get_raster_info(raster_path)
     raster_nodata = raster_info["nodata"][raster_band_index - 1]
     raster_pixel_width = abs(raster_info["pixel_size"][0])
@@ -474,8 +596,11 @@ def fast_zonal_statistics(
     raster_srs.ImportFromWkt(raster_info["projection_wkt"])
     raster_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
 
-    source_vector, source_layer = _open_vector_layer(
-        aggregate_vector_path, aggregate_layer_name, "source"
+    source_vector = gdal.OpenEx(str(aggregate_vector_path), gdal.OF_VECTOR)
+    source_layer = (
+        source_vector.GetLayerByName(aggregate_layer_name)
+        if aggregate_layer_name is not None
+        else source_vector.GetLayer()
     )
 
     source_srs = source_layer.GetSpatialRef()
@@ -488,9 +613,22 @@ def fast_zonal_statistics(
     else:
         logger.info("vector SRS missing/unknown | forcing reprojection to raster SRS")
 
-    temp_working_dir = tempfile.mkdtemp(dir=working_dir)
-    projected_vector_path = os.path.join(temp_working_dir, "projected_vector.gpkg")
-    logger.info("created temp working dir: %s", temp_working_dir)
+    source_layer = None
+    source_vector = None
+
+    working_dir = Path(working_dir) if working_dir else Path(tempfile.gettempdir())
+    cache_working_dir = (
+        working_dir
+        / "fast_zonal_statistics_cache"
+        / f"{_safe_path_stem(raster_path)}_band{raster_band_index}"
+    )
+    cache_working_dir.mkdir(parents=True, exist_ok=True)
+    projected_vector_path = cache_working_dir / "projected_vector.gpkg"
+    feature_id_raster_path = cache_working_dir / "agg_fid.tif"
+    local_task_graph = taskgraph.TaskGraph(
+        cache_working_dir / "taskgraph", 1, 15.0
+    )
+    logger.info("using zonal statistics cache dir: %s", cache_working_dir)
 
     def _raster_nodata_mask(value_array):
         finite_mask = np.isfinite(value_array)
@@ -499,51 +637,26 @@ def fast_zonal_statistics(
         return np.isclose(value_array, raster_nodata) | ~finite_mask
 
     try:
-        vector_translate_kwargs = {"format": "GPKG"}
-        src_path = str(aggregate_vector_path)
-        tmp_reprojected_path = None
-        if needs_reproject:
-            tmp_reprojected_path = Path(projected_vector_path).with_suffix(
-                ".reprojected.gpkg"
-            )
-
-            logger.info(
-                "vector translate (reproject) start | output=%s | reproject=%s",
-                tmp_reprojected_path,
+        prepare_vector_task = local_task_graph.add_task(
+            func=_prepare_aggregate_vector_for_rasterization,
+            args=(
+                aggregate_vector_path,
+                aggregate_layer_name,
+                projected_vector_path,
+                raster_info["projection_wkt"],
+                simplify_tolerance,
                 needs_reproject,
-            )
-            gdal.VectorTranslate(
-                str(tmp_reprojected_path),
-                src_path,
-                dstSRS=raster_info["projection_wkt"],
-                **vector_translate_kwargs,
-            )
-            src_path = str(tmp_reprojected_path)
-
-        logger.info(
-            "vector translate (simplify) start | output=%s | simplifyTolerance=%s | reproject=%s",
-            projected_vector_path,
-            simplify_tolerance,
-            needs_reproject,
+            ),
+            target_path_list=[projected_vector_path],
+            task_name=f"prepare aggregate vector for {Path(aggregate_vector_path).stem}",
         )
-        gdal.VectorTranslate(
-            str(projected_vector_path),
-            src_path,
-            simplifyTolerance=simplify_tolerance,
-            **vector_translate_kwargs,
-        )
-        if tmp_reprojected_path:
-            tmp_reprojected_path.unlink()
+        prepare_vector_task.join()
 
-        logger.info("vector translate done | output=%s", projected_vector_path)
-
-        source_layer = None
-
-        aggregate_vector, aggregate_layer = _open_vector_layer(
-            projected_vector_path,
-            aggregate_layer_name,
-            "projected",
-            writable=True,
+        aggregate_vector = gdal.OpenEx(str(projected_vector_path), gdal.OF_VECTOR)
+        aggregate_layer = (
+            aggregate_vector.GetLayerByName(aggregate_layer_name)
+            if aggregate_layer_name is not None
+            else aggregate_vector.GetLayer()
         )
 
         logger.info(
@@ -622,30 +735,6 @@ def fast_zonal_statistics(
             raster_band_index,
         )
 
-        # we need to put an 'fid' code into the vector because otherwise we are
-        # not guarnateed to have one
-        local_aggregate_field_name = "original_fid"
-        if aggregate_layer.FindFieldIndex(local_aggregate_field_name, 1) == -1:
-            aggregate_layer.CreateField(
-                ogr.FieldDefn(local_aggregate_field_name, ogr.OFTInteger)
-            )
-
-        aggregate_layer.ResetReading()
-        aggregate_layer.StartTransaction()
-        for feat in aggregate_layer:
-            feat.SetField(local_aggregate_field_name, feat.GetFID())
-            aggregate_layer.SetFeature(feat)
-        aggregate_layer.CommitTransaction()
-        aggregate_layer.ResetReading()
-
-        local_aggregate_field_name = "original_fid"
-        rasterize_layer_args = {
-            "options": [
-                "ALL_TOUCHED=FALSE",
-                f"ATTRIBUTE={local_aggregate_field_name}",
-            ]
-        }
-
         logger.info(
             "disjoint sets ready total_features=%d",
             len(feature_id_set),
@@ -655,19 +744,28 @@ def fast_zonal_statistics(
             lambda: dict(feature_stats_template)
         )
 
-        feature_id_raster_path = os.path.join(temp_working_dir, "agg_fid.tif")
         feature_id_raster_nodata = -1
-        logger.info("creating agg fid raster: %s", feature_id_raster_path)
-        geoprocessing.new_raster_from_base(
-            raster_path_for_stats,
-            feature_id_raster_path,
-            gdal.GDT_Int32,
-            [feature_id_raster_nodata],
+        aggregate_layer = None
+        aggregate_vector = None
+
+        rasterize_task = local_task_graph.add_task(
+            func=_rasterize_aggregate_fids,
+            args=(
+                raster_path_for_stats,
+                projected_vector_path,
+                aggregate_layer_name,
+                feature_id_raster_path,
+                feature_id_raster_nodata,
+            ),
+            dependent_task_list=[prepare_vector_task],
+            target_path_list=[feature_id_raster_path],
+            task_name=f"rasterize aggregate fids for {Path(raster_path).stem}",
         )
+        rasterize_task.join()
 
         feature_id_raster_offsets = list(
             geoprocessing.iterblocks(
-                (feature_id_raster_path, 1),
+                (str(feature_id_raster_path), 1),
                 offset_only=True,
                 largest_block=2**28,
             )
@@ -678,27 +776,9 @@ def fast_zonal_statistics(
         )
 
         feature_id_raster_dataset = gdal.OpenEx(
-            feature_id_raster_path, gdal.GA_Update | gdal.OF_RASTER
+            str(feature_id_raster_path), gdal.OF_RASTER
         )
         feature_id_raster_band = feature_id_raster_dataset.GetRasterBand(1)
-
-        logger.info("populating disjoint layer features (transaction start)")
-        logger.info("populating disjoint layer features done (transaction commit)")
-
-        rasterize_callback_message = "rasterizing polygons %.1f%% complete %s"
-        rasterize_callback = _make_logger_callback(rasterize_callback_message)
-
-        logger.info("rasterize start")
-        aggregate_layer.ResetReading()
-        gdal.RasterizeLayer(
-            feature_id_raster_dataset,
-            [1],
-            aggregate_layer,
-            callback=rasterize_callback,
-            **rasterize_layer_args,
-        )
-        feature_id_raster_dataset.FlushCache()
-        logger.info("rasterize done")
 
         logger.info("gathering stats from raster blocks")
         block_log_time = time.time()
@@ -904,9 +984,10 @@ def fast_zonal_statistics(
         logger.info("fast_zonal_statistics done")
         return dict(grouped_stats)
     finally:
+        local_task_graph.close()
         if clean_working_dir:
-            logger.info("cleaning temp working dir: %s", temp_working_dir)
-            shutil.rmtree(temp_working_dir)
+            logger.info("cleaning zonal statistics cache dir: %s", cache_working_dir)
+            shutil.rmtree(cache_working_dir)
 
 
 def run_vector_stats_job(
@@ -1302,7 +1383,7 @@ def run_zonal_stats_job(
                     "aggregate_layer_name": agg_layer,
                     "ignore_nodata": True,
                     "working_dir": workdir,
-                    "clean_working_dir": True,
+                    "clean_working_dir": False,
                     "percentile_list": pct_list,
                 },
                 store_result=True,
@@ -1435,7 +1516,15 @@ def main():
     task_graph = taskgraph.TaskGraph(Path.cwd(), os.cpu_count() // 2 + 1, 15.0)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     thread_list = []
+    thread_error_list = []
     total_job_count = 0
+
+    def _run_zonal_stats_job_thread(output_csv, job_kwargs):
+        try:
+            run_zonal_stats_job(**job_kwargs)
+        except Exception as error:
+            logger.exception("job failed for output %s", output_csv)
+            thread_error_list.append((output_csv, error))
 
     for config_path in args.configs:
         cfg_path = Path(config_path)
@@ -1454,7 +1543,10 @@ def main():
             job["output_csv"] = output_path_timestamped
             job["task_graph"] = task_graph
 
-            thread = Thread(target=run_zonal_stats_job, kwargs=job)
+            thread = Thread(
+                target=_run_zonal_stats_job_thread,
+                args=(output_path_timestamped, job),
+            )
             thread.start()
             thread_list.append((output_path_timestamped, thread))
             total_job_count += 1
@@ -1462,7 +1554,15 @@ def main():
 
     for output_csv, thread in thread_list:
         thread.join()
-        logger.info(f"********* {output_csv} is complete!")
+        if not any(error_path == output_csv for error_path, _ in thread_error_list):
+            logger.info(f"********* {output_csv} is complete!")
+
+    if thread_error_list:
+        task_graph.close()
+        failed_outputs = ", ".join(str(path) for path, _ in thread_error_list)
+        raise RuntimeError(f"zonal statistics jobs failed: {failed_outputs}") from (
+            thread_error_list[0][1]
+        )
 
     task_graph.join()
     task_graph.close()
