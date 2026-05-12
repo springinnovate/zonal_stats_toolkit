@@ -963,7 +963,6 @@ def run_vector_stats_job(
     if job_type != "vector":
         raise ValueError(f"unexpected job type for run_vector_stats_job: {job_type}")
     agg_fields = agg_field
-    dissolve_by = agg_fields[0] if len(agg_fields) == 1 else agg_fields
 
     logger.info("parsing operations for tag=%s", tag)
     normalized_operations = [o.strip().lower() for o in operations if str(o).strip()]
@@ -995,8 +994,8 @@ def run_vector_stats_job(
     agg_crs = CRS.from_user_input(agg_gdf.crs) if agg_gdf.crs else None
     logger.info("agg CRS for tag=%s crs=%s", tag, str(agg_crs) if agg_crs else None)
 
-    logger.info("dissolving agg features for tag=%s by=%s", tag, dissolve_by)
-    agg_groups = agg_gdf.dissolve(by=dissolve_by)
+    logger.info("dissolving agg features for tag=%s by=%s", tag, agg_fields)
+    agg_groups = agg_gdf.dissolve(by=agg_fields)
     logger.info("dissolve complete for tag=%s groups=%d", tag, len(agg_groups))
 
     group_geometries = list(agg_groups.geometry.values)
