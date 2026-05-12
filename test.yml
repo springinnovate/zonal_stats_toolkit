@@ -1,7 +1,6 @@
 [project]
 name = test
 global_work_dir = ./workdir
-global_output_dir = ./output
 log_level = INFO
 
 [job:country]
