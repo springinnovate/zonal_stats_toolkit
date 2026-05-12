@@ -49,13 +49,6 @@ def _normalize_agg_fields(agg_field_value) -> list[str]:
     return [field.strip() for field in agg_field_value.split(",") if field.strip()]
 
 
-def _agg_group_key_to_row(agg_fields: list[str], group_key) -> dict:
-    """Convert an aggregation group key to output columns."""
-    if len(agg_fields) == 1:
-        return {agg_fields[0]: group_key}
-    return dict(zip(agg_fields, group_key))
-
-
 def _make_logger_callback(message):
     """Build a timed logger callback that prints ``message`` replaced.
 
@@ -1126,9 +1119,12 @@ def run_vector_stats_job(
             for group_index, start, count in zip(unique_groups, start_indices, counts)
         }
 
-        stem_frame = pd.DataFrame(
-            [_agg_group_key_to_row(agg_fields, group_key) for group_key in group_keys]
-        )
+        if len(agg_fields) == 1:
+            stem_frame = pd.DataFrame({agg_fields[0]: group_keys})
+        else:
+            stem_frame = pd.DataFrame(
+                [dict(zip(agg_fields, group_key)) for group_key in group_keys]
+            )
 
         if "total_count" in core_ops:
             stem_frame[f"total_count_{stem}"] = np.bincount(
@@ -1399,7 +1395,10 @@ def run_zonal_stats_job(
 
         raster_rows = []
         for group_value, statistics in grouped_stats.items():
-            row = _agg_group_key_to_row(aggregation_field_names, group_value)
+            if len(aggregation_field_names) == 1:
+                row = {aggregation_field_names[0]: group_value}
+            else:
+                row = dict(zip(aggregation_field_names, group_value))
             for operation in core_ops:
                 row[f"{operation}_{raster_stem}"] = statistics.get(operation)
             for percentile_key in pct_keys:
