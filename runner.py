@@ -8,7 +8,6 @@ import collections
 import argparse
 import configparser
 import glob
-import hashlib
 import logging
 import os
 import shutil
@@ -52,70 +51,6 @@ def _safe_path_stem(path, max_length=60):
     return (safe_stem or "unnamed")[:max_length]
 
 
-def _unlink_path_family(path):
-    """Remove a path and common sidecar files if they exist."""
-    path = Path(path)
-    path.unlink(missing_ok=True)
-    for suffix in (".aux.xml", "-wal", "-shm"):
-        Path(f"{path}{suffix}").unlink(missing_ok=True)
-
-
-def _make_zonal_cache_dir(
-    working_dir,
-    raster_path,
-    raster_band_index,
-    aggregate_vector_path,
-    aggregate_layer_name,
-    aggregate_vector_fields,
-    raster_info,
-    simplify_tolerance,
-):
-    """Build a deterministic per-raster/vector cache directory."""
-    working_dir = Path(working_dir) if working_dir else Path(tempfile.gettempdir())
-    raster_path = Path(raster_path)
-    aggregate_vector_path = Path(aggregate_vector_path)
-    key_parts = [
-        str(raster_path.resolve()),
-        str(raster_path.stat().st_mtime_ns),
-        str(raster_band_index),
-        str(aggregate_vector_path.resolve()),
-        str(aggregate_vector_path.stat().st_mtime_ns),
-        str(aggregate_layer_name),
-        ",".join(aggregate_vector_fields),
-        repr(raster_info["pixel_size"]),
-        repr(raster_info["bounding_box"]),
-        str(raster_info["projection_wkt"]),
-        repr(simplify_tolerance),
-    ]
-    cache_hash = hashlib.sha1("|".join(key_parts).encode("utf-8")).hexdigest()[:16]
-    cache_name = (
-        f"{_safe_path_stem(raster_path)}__"
-        f"{_safe_path_stem(aggregate_vector_path)}__{cache_hash}"
-    )
-    return working_dir / "fast_zonal_statistics_cache" / cache_name
-
-
-def _open_vector_layer(vector_path, layer_name, vector_label, writable=False):
-    open_flags = gdal.OF_VECTOR | (gdal.OF_UPDATE if writable else 0)
-    vector_dataset = gdal.OpenEx(str(vector_path), open_flags)
-    if vector_dataset is None:
-        raise RuntimeError(f"Could not open {vector_label} vector at {vector_path}")
-
-    if layer_name is not None:
-        logger.info("selecting %s layer by name: %s", vector_label, layer_name)
-        vector_layer = vector_dataset.GetLayerByName(layer_name)
-    else:
-        logger.info("selecting default %s layer", vector_label)
-        vector_layer = vector_dataset.GetLayer()
-
-    if vector_layer is None:
-        raise RuntimeError(
-            f"Could not open layer {layer_name} on {vector_label} vector {vector_path}"
-        )
-
-    return vector_dataset, vector_layer
-
-
 def _prepare_aggregate_vector_for_rasterization(
     aggregate_vector_path,
     aggregate_layer_name,
@@ -124,17 +59,17 @@ def _prepare_aggregate_vector_for_rasterization(
     simplify_tolerance,
     needs_reproject,
 ):
-    """Project/simplify aggregation vector and add stable feature IDs."""
+    """Project/simplify aggregation vector and add a FID burn field."""
     target_vector_path = Path(target_vector_path)
     target_vector_path.parent.mkdir(parents=True, exist_ok=True)
-    _unlink_path_family(target_vector_path)
+    target_vector_path.unlink(missing_ok=True)
 
     vector_translate_kwargs = {"format": "GPKG"}
     src_path = str(aggregate_vector_path)
     tmp_reprojected_path = None
     if needs_reproject:
         tmp_reprojected_path = target_vector_path.with_suffix(".reprojected.gpkg")
-        _unlink_path_family(tmp_reprojected_path)
+        tmp_reprojected_path.unlink(missing_ok=True)
         logger.info(
             "vector translate (reproject) start | output=%s | reproject=%s",
             tmp_reprojected_path,
@@ -161,16 +96,19 @@ def _prepare_aggregate_vector_for_rasterization(
         **vector_translate_kwargs,
     )
     if tmp_reprojected_path:
-        _unlink_path_family(tmp_reprojected_path)
+        tmp_reprojected_path.unlink(missing_ok=True)
 
-    aggregate_vector, aggregate_layer = _open_vector_layer(
-        target_vector_path,
-        aggregate_layer_name,
-        "prepared",
-        writable=True,
+    aggregate_vector = gdal.OpenEx(
+        str(target_vector_path), gdal.OF_VECTOR | gdal.OF_UPDATE
+    )
+    aggregate_layer = (
+        aggregate_vector.GetLayerByName(aggregate_layer_name)
+        if aggregate_layer_name is not None
+        else aggregate_vector.GetLayer()
     )
 
     local_aggregate_field_name = "original_fid"
+    # RasterizeLayer burns attribute values, so persist the OGR FID as a field.
     if aggregate_layer.FindFieldIndex(local_aggregate_field_name, 1) == -1:
         aggregate_layer.CreateField(
             ogr.FieldDefn(local_aggregate_field_name, ogr.OFTInteger)
@@ -198,7 +136,7 @@ def _rasterize_aggregate_fids(
     """Rasterize prepared aggregation feature IDs onto the base raster grid."""
     target_raster_path = Path(target_raster_path)
     target_raster_path.parent.mkdir(parents=True, exist_ok=True)
-    _unlink_path_family(target_raster_path)
+    target_raster_path.unlink(missing_ok=True)
 
     logger.info("creating agg fid raster: %s", target_raster_path)
     geoprocessing.new_raster_from_base(
@@ -208,10 +146,11 @@ def _rasterize_aggregate_fids(
         [target_nodata],
     )
 
-    aggregate_vector, aggregate_layer = _open_vector_layer(
-        aggregate_vector_path,
-        aggregate_layer_name,
-        "prepared",
+    aggregate_vector = gdal.OpenEx(str(aggregate_vector_path), gdal.OF_VECTOR)
+    aggregate_layer = (
+        aggregate_vector.GetLayerByName(aggregate_layer_name)
+        if aggregate_layer_name is not None
+        else aggregate_vector.GetLayer()
     )
     feature_id_raster_dataset = gdal.OpenEx(
         str(target_raster_path), gdal.GA_Update | gdal.OF_RASTER
@@ -664,8 +603,11 @@ def fast_zonal_statistics(
     raster_srs.ImportFromWkt(raster_info["projection_wkt"])
     raster_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
 
-    source_vector, source_layer = _open_vector_layer(
-        aggregate_vector_path, aggregate_layer_name, "source"
+    source_vector = gdal.OpenEx(str(aggregate_vector_path), gdal.OF_VECTOR)
+    source_layer = (
+        source_vector.GetLayerByName(aggregate_layer_name)
+        if aggregate_layer_name is not None
+        else source_vector.GetLayer()
     )
 
     source_srs = source_layer.GetSpatialRef()
@@ -681,15 +623,11 @@ def fast_zonal_statistics(
     source_layer = None
     source_vector = None
 
-    cache_working_dir = _make_zonal_cache_dir(
-        working_dir,
-        raster_path,
-        raster_band_index,
-        aggregate_vector_path,
-        aggregate_layer_name,
-        aggregate_vector_fields,
-        raster_info,
-        simplify_tolerance,
+    working_dir = Path(working_dir) if working_dir else Path(tempfile.gettempdir())
+    cache_working_dir = (
+        working_dir
+        / "fast_zonal_statistics_cache"
+        / f"{_safe_path_stem(raster_path)}_band{raster_band_index}"
     )
     cache_working_dir.mkdir(parents=True, exist_ok=True)
     projected_vector_path = cache_working_dir / "projected_vector.gpkg"
@@ -721,10 +659,11 @@ def fast_zonal_statistics(
         )
         prepare_vector_task.join()
 
-        aggregate_vector, aggregate_layer = _open_vector_layer(
-            projected_vector_path,
-            aggregate_layer_name,
-            "projected",
+        aggregate_vector = gdal.OpenEx(str(projected_vector_path), gdal.OF_VECTOR)
+        aggregate_layer = (
+            aggregate_vector.GetLayerByName(aggregate_layer_name)
+            if aggregate_layer_name is not None
+            else aggregate_vector.GetLayer()
         )
 
         logger.info(
