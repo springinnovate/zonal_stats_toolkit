@@ -44,15 +44,9 @@ VALID_OPERATIONS = {
 
 def _normalize_agg_fields(agg_field_value) -> list[str]:
     """Normalize a config or function aggregation field value to field names."""
-    if isinstance(agg_field_value, str):
-        agg_fields = [
-            field.strip() for field in agg_field_value.split(",") if field.strip()
-        ]
-    else:
-        agg_fields = [
-            str(field).strip() for field in agg_field_value if str(field).strip()
-        ]
-    return agg_fields
+    if not isinstance(agg_field_value, str):
+        agg_field_value = ",".join(str(field) for field in agg_field_value)
+    return [field.strip() for field in agg_field_value.split(",") if field.strip()]
 
 
 def _agg_group_key_from_values(values):
