@@ -25,7 +25,7 @@ import fiona
 import numpy as np
 import geopandas as gpd
 
-logging.getLogger("ecoshard").setLevel(logging.WARNING)
+logging.getLogger("ecoshard").setLevel(logging.INFO)
 logging.getLogger("fiona").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -1316,6 +1316,7 @@ def run_zonal_stats_job(
                     "percentile_list": pct_list,
                 },
                 store_result=True,
+                task_name=f"fast_zonal_statistics for {Path(base_raster_path).stem}, {Path(agg_vector).stem} {agg_field}",
             )
             grouped_stats_list.append(
                 (base_raster_path.stem, agg_field, grouped_stats_task)
@@ -1436,7 +1437,6 @@ def main():
         level=logging.DEBUG,
         format="%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d: %(message)s",
     )
-
     task_graph = taskgraph.TaskGraph(Path.cwd(), os.cpu_count() // 2 + 1, 15.0)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     thread_list = []
@@ -1445,11 +1445,6 @@ def main():
     for config_path in args.configs:
         cfg_path = Path(config_path)
         cfg = parse_and_validate_config(cfg_path)
-
-        log_level = getattr(logging, cfg["project"]["log_level"])
-        logger = logging.getLogger(cfg["project"]["name"])
-        logger.setLevel(log_level)
-        logger.info("Loaded config %s", str(cfg_path))
 
         for job in cfg["job_list"]:
             logger.info(
@@ -1466,11 +1461,13 @@ def main():
 
             thread = Thread(target=run_zonal_stats_job, kwargs=job)
             thread.start()
-            thread_list.append(thread)
+            thread_list.append((output_path_timestamped, thread))
             total_job_count += 1
+    logger.info(f"******** running {total_job_count} jobs")
 
-    for thread in thread_list:
+    for output_csv, thread in thread_list:
         thread.join()
+        logger.info(f"********* {output_csv} is complete!")
 
     task_graph.join()
     task_graph.close()
