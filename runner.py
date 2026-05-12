@@ -42,13 +42,6 @@ VALID_OPERATIONS = {
 }
 
 
-def _normalize_agg_fields(agg_field_value) -> list[str]:
-    """Normalize a config or function aggregation field value to field names."""
-    if not isinstance(agg_field_value, str):
-        agg_field_value = ",".join(str(field) for field in agg_field_value)
-    return [field.strip() for field in agg_field_value.split(",") if field.strip()]
-
-
 def _make_logger_callback(message):
     """Build a timed logger callback that prints ``message`` replaced.
 
@@ -246,7 +239,9 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
         agg_field_raw = job.get("agg_field", "").strip()
         if not agg_field_raw:
             raise ValueError(f"[job:{tag}] missing agg_field")
-        agg_fields = _normalize_agg_fields(agg_field_raw)
+        agg_fields = [
+            field.strip() for field in agg_field_raw.split(",") if field.strip()
+        ]
         if not agg_fields:
             raise ValueError(f"[job:{tag}] agg_field is empty")
         if len(agg_fields) != len(set(agg_fields)):
@@ -399,7 +394,7 @@ def fast_zonal_statistics(
     percentile_list=None,
 ):
     raster_path, raster_band_index = base_raster_path_band
-    aggregate_vector_fields = _normalize_agg_fields(aggregate_vector_field)
+    aggregate_vector_fields = aggregate_vector_field
     aggregate_vector_field_label = ",".join(aggregate_vector_fields)
 
     logger.info(
@@ -967,7 +962,7 @@ def run_vector_stats_job(
     """
     if job_type != "vector":
         raise ValueError(f"unexpected job type for run_vector_stats_job: {job_type}")
-    agg_fields = _normalize_agg_fields(agg_field)
+    agg_fields = agg_field
     dissolve_by = agg_fields[0] if len(agg_fields) == 1 else agg_fields
 
     logger.info("parsing operations for tag=%s", tag)
@@ -1291,7 +1286,7 @@ def run_zonal_stats_job(
         ValueError: If operation parsing fails or required inputs are inconsistent.
         IOError: If intermediate or output files cannot be read or written.
     """
-    agg_fields = _normalize_agg_fields(agg_field)
+    agg_fields = agg_field
     ops = [o.strip().lower() for o in operations if str(o).strip()]
     core_ops = []
     pct_list = []
