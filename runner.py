@@ -49,12 +49,6 @@ def _normalize_agg_fields(agg_field_value) -> list[str]:
     return [field.strip() for field in agg_field_value.split(",") if field.strip()]
 
 
-def _agg_group_key_from_values(values):
-    """Return a scalar key for one field or a tuple key for composite fields."""
-    values = tuple(values)
-    return values[0] if len(values) == 1 else values
-
-
 def _agg_group_key_to_row(agg_fields: list[str], group_key) -> dict:
     """Convert an aggregation group key to output columns."""
     if len(agg_fields) == 1:
@@ -602,10 +596,12 @@ def fast_zonal_statistics(
         aggregate_layer.ResetReading()
         for feature in aggregate_layer:
             feature_id = feature.GetFID()
-            group_value = _agg_group_key_from_values(
+            group_value = tuple(
                 feature.GetField(field_name)
                 for field_name in aggregate_vector_fields
             )
+            if len(group_value) == 1:
+                group_value = group_value[0]
             feature_id_set.add(feature_id)
             feature_id_to_group_value[feature_id] = group_value
             unique_group_values.add(group_value)
