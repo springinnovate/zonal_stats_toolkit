@@ -31,6 +31,5 @@ operations = avg,stdev,total_count,valid_count
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = nev_name
 operations = p50
-row_col_order=agg_field,base
 base_raster_pattern=./*.tif
 base_vector_pattern=./coastal_risk_tnc_esa1992_2020_20251224_013825_Columbia.gpkg[Rt_1992,Rt_2020,Service_1992,Service_2020,Rt_change,Service_change]

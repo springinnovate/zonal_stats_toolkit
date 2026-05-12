@@ -8,7 +8,6 @@ log_level = INFO
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = nev_name
 operations = mean,stdev,valid_count,total_count,p5,p95
-row_col_order=agg_field,base
 base_raster_pattern=./jeronimodata/data_to_summarize/*.tif
 base_vector_pattern=./jeronimodata/data_to_summarize/coastal_risk_tnc_esa1992_2020_20251224_013825.gpkg[Rt_1992,Rt_2020,Service_1992,Service_2020,Rt_change,Service_change]
 
@@ -16,7 +15,6 @@ base_vector_pattern=./jeronimodata/data_to_summarize/coastal_risk_tnc_esa1992_20
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = continent
 operations = mean,stdev,valid_count,total_count,p5,p95
-row_col_order=agg_field,base
 base_raster_pattern=./jeronimodata/data_to_summarize/*.tif
 base_vector_pattern=./jeronimodata/data_to_summarize/coastal_risk_tnc_esa1992_2020_20251224_013825.gpkg[Rt_1992,Rt_2020,Service_1992,Service_2020,Rt_change,Service_change]
 
@@ -24,7 +22,6 @@ base_vector_pattern=./jeronimodata/data_to_summarize/coastal_risk_tnc_esa1992_20
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = region_un
 operations = mean,stdev,valid_count,total_count,p5,p95
-row_col_order=agg_field,base
 base_raster_pattern=./jeronimodata/data_to_summarize/*.tif
 base_vector_pattern=./jeronimodata/data_to_summarize/coastal_risk_tnc_esa1992_2020_20251224_013825.gpkg[Rt_1992,Rt_2020,Service_1992,Service_2020,Rt_change,Service_change]
 
@@ -32,7 +29,6 @@ base_vector_pattern=./jeronimodata/data_to_summarize/coastal_risk_tnc_esa1992_20
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = subregion
 operations = mean,stdev,valid_count,total_count,p5,p95
-row_col_order=agg_field,base
 base_raster_pattern=./jeronimodata/data_to_summarize/*.tif
 base_vector_pattern=./jeronimodata/data_to_summarize/coastal_risk_tnc_esa1992_2020_20251224_013825.gpkg[Rt_1992,Rt_2020,Service_1992,Service_2020,Rt_change,Service_change]
 
@@ -40,7 +36,6 @@ base_vector_pattern=./jeronimodata/data_to_summarize/coastal_risk_tnc_esa1992_20
 agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
 agg_field = income_grp
 operations = mean,stdev,valid_count,total_count,p5,p95
-row_col_order=agg_field,base
 base_raster_pattern=./jeronimodata/data_to_summarize/*.tif
 base_vector_pattern=./jeronimodata/data_to_summarize/coastal_risk_tnc_esa1992_2020_20251224_013825.gpkg[Rt_1992,Rt_2020,Service_1992,Service_2020,Rt_change,Service_change]
 
@@ -48,6 +43,5 @@ base_vector_pattern=./jeronimodata/data_to_summarize/coastal_risk_tnc_esa1992_20
 agg_vector = ./jeronimodata/vector_basedata/Biome.gpkg
 agg_field = WWF_biome
 operations = mean,stdev,valid_count,total_count,p5,p95
-row_col_order=agg_field,base
 base_raster_pattern=./jeronimodata/data_to_summarize/*.tif
 base_vector_pattern=./jeronimodata/data_to_summarize/coastal_risk_tnc_esa1992_2020_20251224_013825.gpkg[Rt_1992,Rt_2020,Service_1992,Service_2020,Rt_change,Service_change]
