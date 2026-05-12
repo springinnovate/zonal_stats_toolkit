@@ -42,6 +42,32 @@ VALID_OPERATIONS = {
 }
 
 
+def _normalize_agg_fields(agg_field_value) -> list[str]:
+    """Normalize a config or function aggregation field value to field names."""
+    if isinstance(agg_field_value, str):
+        agg_fields = [
+            field.strip() for field in agg_field_value.split(",") if field.strip()
+        ]
+    else:
+        agg_fields = [
+            str(field).strip() for field in agg_field_value if str(field).strip()
+        ]
+    return agg_fields
+
+
+def _agg_group_key_from_values(values):
+    """Return a scalar key for one field or a tuple key for composite fields."""
+    values = tuple(values)
+    return values[0] if len(values) == 1 else values
+
+
+def _agg_group_key_to_row(agg_fields: list[str], group_key) -> dict:
+    """Convert an aggregation group key to output columns."""
+    if len(agg_fields) == 1:
+        return {agg_fields[0]: group_key}
+    return dict(zip(agg_fields, group_key))
+
+
 def _make_logger_callback(message):
     """Build a timed logger callback that prints ``message`` replaced.
 
@@ -236,9 +262,16 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
         if not agg_vector.exists():
             raise FileNotFoundError(f"[job:{tag}] agg_vector not found: {agg_vector}")
 
-        agg_field = job.get("agg_field", "").strip()
-        if not agg_field:
+        agg_field_raw = job.get("agg_field", "").strip()
+        if not agg_field_raw:
             raise ValueError(f"[job:{tag}] missing agg_field")
+        agg_fields = _normalize_agg_fields(agg_field_raw)
+        if not agg_fields:
+            raise ValueError(f"[job:{tag}] agg_field is empty")
+        if len(agg_fields) != len(set(agg_fields)):
+            raise ValueError(
+                f"[job:{tag}] agg_field contains duplicate fields: {agg_field_raw}"
+            )
 
         ops_raw = job.get("operations", "").strip()
         if not ops_raw:
@@ -270,9 +303,13 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
 
         with fiona.open(str(agg_vector), layer=agg_layer) as src:
             props = src.schema.get("properties", {})
-            if agg_field not in props:
+            missing_agg_fields = [
+                agg_field for agg_field in agg_fields if agg_field not in props
+            ]
+            if missing_agg_fields:
                 raise ValueError(
-                    f'[job:{tag}] agg_field "{agg_field}" not found in layer "{agg_layer}" of {agg_vector}. '
+                    f"[job:{tag}] agg_field entries {missing_agg_fields} not found in layer "
+                    f'"{agg_layer}" of {agg_vector}. '
                     f"Available fields: {sorted(props.keys())}"
                 )
 
@@ -367,7 +404,7 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                 "tag": tag,
                 "agg_vector": agg_vector,
                 "agg_layer": agg_layer,
-                "agg_field": agg_field,
+                "agg_field": agg_fields,
                 "operations": operations,
                 "row_col_order": row_col_order,
                 "workdir": workdir,
@@ -401,14 +438,16 @@ def fast_zonal_statistics(
     percentile_list=None,
 ):
     raster_path, raster_band_index = base_raster_path_band
+    aggregate_vector_fields = _normalize_agg_fields(aggregate_vector_field)
+    aggregate_vector_field_label = ",".join(aggregate_vector_fields)
 
     logger.info(
-        "fast_zonal_statistics start | raster=%s band=%s | vector=%s layer=%s field=%s | ignore_nodata=%s | working_dir=%s clean=%s | percentiles=%s",
+        "fast_zonal_statistics start | raster=%s band=%s | vector=%s layer=%s fields=%s | ignore_nodata=%s | working_dir=%s clean=%s | percentiles=%s",
         raster_path,
         raster_band_index,
         str(aggregate_vector_path),
         aggregate_layer_name,
-        aggregate_vector_field,
+        aggregate_vector_field_label,
         ignore_nodata,
         working_dir,
         clean_working_dir,
@@ -560,7 +599,7 @@ def fast_zonal_statistics(
 
         logger.info(
             "scanning vector for grouping field values: %s",
-            aggregate_vector_field,
+            aggregate_vector_field_label,
         )
         feature_id_set = set()
         feature_id_to_group_value = {}
@@ -569,7 +608,10 @@ def fast_zonal_statistics(
         aggregate_layer.ResetReading()
         for feature in aggregate_layer:
             feature_id = feature.GetFID()
-            group_value = feature.GetField(aggregate_vector_field)
+            group_value = _agg_group_key_from_values(
+                feature.GetField(field_name)
+                for field_name in aggregate_vector_fields
+            )
             feature_id_set.add(feature_id)
             feature_id_to_group_value[feature_id] = group_value
             unique_group_values.add(group_value)
@@ -578,7 +620,7 @@ def fast_zonal_statistics(
         logger.info(
             "vector scan done | features=%d | unique %s=%d",
             len(feature_id_set),
-            aggregate_vector_field,
+            aggregate_vector_field_label,
             len(unique_group_values),
         )
 
@@ -792,7 +834,7 @@ def fast_zonal_statistics(
         raster_dataset = None
         aggregate_layer = None
 
-        logger.info("grouping fid stats -> %s values", aggregate_vector_field)
+        logger.info("grouping fid stats -> %s values", aggregate_vector_field_label)
         grouped_stats = collections.defaultdict(
             lambda: dict(grouped_stats_working_template)
         )
@@ -948,7 +990,7 @@ def run_vector_stats_job(
             base vector dataset.
         agg_vector: Path to the aggregation vector dataset.
         agg_layer: Name of the layer within `agg_vector` to use.
-        agg_field: Attribute field in the aggregation layer used to dissolve
+        agg_field: Attribute field or fields in the aggregation layer used to dissolve
             geometries and define aggregation groups.
         operations: List of operation specifiers (e.g. `"sum"`, `"mean"`,
             `"min"`, `"max"`, `"stdev"`, `"total_count"`, `"p50"`).
@@ -964,6 +1006,8 @@ def run_vector_stats_job(
     """
     if job_type != "vector":
         raise ValueError(f"unexpected job type for run_vector_stats_job: {job_type}")
+    agg_fields = _normalize_agg_fields(agg_field)
+    dissolve_by = agg_fields[0] if len(agg_fields) == 1 else agg_fields
 
     logger.info("parsing operations for tag=%s", tag)
     normalized_operations = [o.strip().lower() for o in operations if str(o).strip()]
@@ -995,14 +1039,13 @@ def run_vector_stats_job(
     agg_crs = CRS.from_user_input(agg_gdf.crs) if agg_gdf.crs else None
     logger.info("agg CRS for tag=%s crs=%s", tag, str(agg_crs) if agg_crs else None)
 
-    logger.info("dissolving agg features for tag=%s by=%s", tag, agg_field)
-    agg_groups = agg_gdf.dissolve(by=agg_field)
+    logger.info("dissolving agg features for tag=%s by=%s", tag, dissolve_by)
+    agg_groups = agg_gdf.dissolve(by=dissolve_by)
     logger.info("dissolve complete for tag=%s groups=%d", tag, len(agg_groups))
 
     group_geometries = list(agg_groups.geometry.values)
     group_keys = list(agg_groups.index)
-    group_keys_arr = np.asarray(group_keys, dtype=object)
-    group_count = len(group_keys_arr)
+    group_count = len(group_keys)
 
     logger.info("building STRtree for tag=%s groups=%d", tag, group_count)
     tree = STRtree(group_geometries)
@@ -1089,11 +1132,13 @@ def run_vector_stats_job(
             groups_sorted, return_index=True, return_counts=True
         )
         assignments_by_stem[stem] = {
-            group_keys_arr[int(group_index)]: features_sorted[start : start + count]
+            group_keys[int(group_index)]: features_sorted[start : start + count]
             for group_index, start, count in zip(unique_groups, start_indices, counts)
         }
 
-        stem_frame = pd.DataFrame({agg_field: group_keys_arr})
+        stem_frame = pd.DataFrame(
+            [_agg_group_key_to_row(agg_fields, group_key) for group_key in group_keys]
+        )
 
         if "total_count" in core_ops:
             stem_frame[f"total_count_{stem}"] = np.bincount(
@@ -1204,12 +1249,12 @@ def run_vector_stats_job(
         result_table = per_stem_frames[0]
         for stem_frame in per_stem_frames[1:]:
             result_table = result_table.merge(
-                stem_frame, on=agg_field, how="outer", sort=False
+                stem_frame, on=agg_fields, how="outer", sort=False
             )
     else:
-        result_table = pd.DataFrame(columns=[agg_field])
+        result_table = pd.DataFrame(columns=agg_fields)
 
-    desired_columns = [agg_field]
+    desired_columns = list(agg_fields)
     per_field_ops = [operation for operation in core_ops if operation != "total_count"]
 
     for base_vector_path in base_vector_path_list:
@@ -1244,7 +1289,7 @@ def run_zonal_stats_job(
     base_vector_fields: list[str],
     agg_vector: Path,
     agg_layer: str,
-    agg_field: str,
+    agg_field,
     operations: list[str],
     output_csv: Path,
     workdir: Path,
@@ -1272,7 +1317,7 @@ def run_zonal_stats_job(
         base_vector_fields: Attribute field names to aggregate from base vectors.
         agg_vector: Path to the aggregation vector dataset.
         agg_layer: Name of the layer within `agg_vector` to use for aggregation.
-        agg_field: Attribute field defining aggregation zones/groups.
+        agg_field: Attribute field or fields defining aggregation zones/groups.
         operations: List of operation specifiers (e.g. `"mean"`, `"sum"`, `"p90"`).
         output_csv: Path to the output CSV file to write.
         workdir: Working directory for intermediate files and task graph outputs.
@@ -1284,6 +1329,7 @@ def run_zonal_stats_job(
         ValueError: If operation parsing fails or required inputs are inconsistent.
         IOError: If intermediate or output files cannot be read or written.
     """
+    agg_fields = _normalize_agg_fields(agg_field)
     ops = [o.strip().lower() for o in operations if str(o).strip()]
     core_ops = []
     pct_list = []
@@ -1307,7 +1353,7 @@ def run_zonal_stats_job(
 
             grouped_stats_task = task_graph.add_task(
                 func=fast_zonal_statistics,
-                args=((base_raster_path, 1), agg_vector, agg_field),
+                args=((base_raster_path, 1), agg_vector, agg_fields),
                 kwargs={
                     "aggregate_layer_name": agg_layer,
                     "ignore_nodata": True,
@@ -1316,10 +1362,13 @@ def run_zonal_stats_job(
                     "percentile_list": pct_list,
                 },
                 store_result=True,
-                task_name=f"fast_zonal_statistics for {Path(base_raster_path).stem}, {Path(agg_vector).stem} {agg_field}",
+                task_name=(
+                    f"fast_zonal_statistics for {Path(base_raster_path).stem}, "
+                    f"{Path(agg_vector).stem} {','.join(agg_fields)}"
+                ),
             )
             grouped_stats_list.append(
-                (base_raster_path.stem, agg_field, grouped_stats_task)
+                (base_raster_path.stem, agg_fields, grouped_stats_task)
             )
 
     combined_dataframe = None
@@ -1334,7 +1383,7 @@ def run_zonal_stats_job(
                 "base_vector_fields": base_vector_fields,
                 "agg_vector": agg_vector,
                 "agg_layer": agg_layer,
-                "agg_field": agg_field,
+                "agg_field": agg_fields,
                 "operations": operations,
                 "output_csv": vector_tmp_csv,
                 "workdir": workdir,
@@ -1355,12 +1404,12 @@ def run_zonal_stats_job(
 
     raster_dataframes = []
 
-    for raster_stem, aggregation_field_name, group_task in grouped_stats_list:
+    for raster_stem, aggregation_field_names, group_task in grouped_stats_list:
         grouped_stats = group_task.get()
 
         raster_rows = []
         for group_value, statistics in grouped_stats.items():
-            row = {aggregation_field_name: group_value}
+            row = _agg_group_key_to_row(aggregation_field_names, group_value)
             for operation in core_ops:
                 row[f"{operation}_{raster_stem}"] = statistics.get(operation)
             for percentile_key in pct_keys:
@@ -1374,18 +1423,18 @@ def run_zonal_stats_job(
         raster_dataframe = (
             raster_frame
             if raster_dataframe is None
-            else raster_dataframe.merge(raster_frame, on=agg_field, how="outer")
+            else raster_dataframe.merge(raster_frame, on=agg_fields, how="outer")
         )
 
     if combined_dataframe is None:
         combined_dataframe = raster_dataframe
     elif raster_dataframe is not None:
         combined_dataframe = combined_dataframe.merge(
-            raster_dataframe, on=agg_field, how="outer"
+            raster_dataframe, on=agg_fields, how="outer"
         )
 
     if combined_dataframe is None:
-        combined_dataframe = pd.DataFrame(columns=[agg_field])
+        combined_dataframe = pd.DataFrame(columns=agg_fields)
 
     output_csv = Path(output_csv)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
