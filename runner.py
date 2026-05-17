@@ -1,5 +1,5 @@
 from __future__ import annotations
-from threading import Thread
+from threading import Lock, Thread
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -31,7 +31,16 @@ logger = logging.getLogger(__name__)
 
 
 _LOGGING_PERIOD = 10.0
+AREA_HECTARE_OPERATIONS = {
+    "area_ha_total",
+    "area_ha_valid",
+}
+AREA_PROJECTION_EPSG = 6933
+AREA_PROJECTION_DESCRIPTION = "EPSG:6933 WGS 84 / NSIDC EASE-Grid 2.0 Global"
+_AREA_PROJECTION_ASSUMPTIONS = set()
+_AREA_PROJECTION_ASSUMPTIONS_LOCK = Lock()
 VALID_OPERATIONS = {
+    *AREA_HECTARE_OPERATIONS,
     "mean",
     "stdev",
     "min",
@@ -40,6 +49,81 @@ VALID_OPERATIONS = {
     "total_count",
     "valid_count",
 }
+
+
+def _record_area_projection_assumption(message):
+    with _AREA_PROJECTION_ASSUMPTIONS_LOCK:
+        _AREA_PROJECTION_ASSUMPTIONS.add(message)
+
+
+def _log_area_projection_assumptions():
+    with _AREA_PROJECTION_ASSUMPTIONS_LOCK:
+        assumption_list = sorted(_AREA_PROJECTION_ASSUMPTIONS)
+    for message in assumption_list:
+        logger.warning("Area hectare projection assumption: %s", message)
+
+
+def _shoelace_area(x_values, y_values):
+    area = 0.0
+    point_count = len(x_values)
+    for index in range(point_count):
+        next_index = (index + 1) % point_count
+        area += (
+            x_values[index] * y_values[next_index]
+            - x_values[next_index] * y_values[index]
+        )
+    return abs(area) * 0.5
+
+
+def _raster_pixel_area_ha(raster_path, raster_info, raster_srs):
+    """Estimate a raster pixel area in hectares."""
+    pixel_width, pixel_height = raster_info["pixel_size"]
+    if raster_srs is not None and raster_srs.IsProjected():
+        linear_units_to_meters = raster_srs.GetLinearUnits() or 1.0
+        return (
+            abs(pixel_width * pixel_height)
+            * linear_units_to_meters
+            * linear_units_to_meters
+            / 10000.0
+        )
+
+    bounding_box = raster_info["bounding_box"]
+    center_x = (bounding_box[0] + bounding_box[2]) * 0.5
+    center_y = (bounding_box[1] + bounding_box[3]) * 0.5
+    half_width = abs(pixel_width) * 0.5
+    half_height = abs(pixel_height) * 0.5
+
+    source_projection_wkt = raster_info.get("projection_wkt")
+    if source_projection_wkt:
+        source_crs = CRS.from_wkt(source_projection_wkt)
+        source_description = source_crs.to_string()
+    else:
+        source_crs = CRS.from_epsg(4326)
+        source_description = "missing CRS, assumed EPSG:4326"
+
+    transformer = Transformer.from_crs(
+        source_crs, CRS.from_epsg(AREA_PROJECTION_EPSG), always_xy=True
+    )
+    x_values, y_values = transformer.transform(
+        [
+            center_x - half_width,
+            center_x + half_width,
+            center_x + half_width,
+            center_x - half_width,
+        ],
+        [
+            center_y - half_height,
+            center_y - half_height,
+            center_y + half_height,
+            center_y + half_height,
+        ],
+    )
+    _record_area_projection_assumption(
+        f"{raster_path}: raster CRS is not projected ({source_description}); "
+        f"pixel area was estimated by projecting a representative center pixel "
+        f"to {AREA_PROJECTION_DESCRIPTION}."
+    )
+    return _shoelace_area(x_values, y_values) / 10000.0
 
 
 def _safe_path_stem(path, max_length=60):
@@ -498,6 +582,13 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
             raise ValueError(
                 f"[job:{tag}] must define at least one of base_raster_pattern or base_vector_pattern"
             )
+        if (
+            AREA_HECTARE_OPERATIONS.intersection(operations)
+            and not base_raster_path_list
+        ):
+            raise ValueError(
+                f"[job:{tag}] area_ha operations require base_raster_pattern"
+            )
 
         job_list.append(
             {
@@ -535,13 +626,16 @@ def fast_zonal_statistics(
     working_dir=None,
     clean_working_dir=False,
     percentile_list=None,
+    calculate_area_ha=False,
 ):
     raster_path, raster_band_index = base_raster_path_band
     aggregate_vector_fields = aggregate_vector_field
     aggregate_vector_field_label = ",".join(aggregate_vector_fields)
 
     logger.info(
-        "fast_zonal_statistics start | raster=%s band=%s | vector=%s layer=%s fields=%s | ignore_nodata=%s | working_dir=%s clean=%s | percentiles=%s",
+        "fast_zonal_statistics start | raster=%s band=%s | vector=%s layer=%s "
+        "fields=%s | ignore_nodata=%s | working_dir=%s clean=%s | "
+        "percentiles=%s | calculate_area_ha=%s",
         raster_path,
         raster_band_index,
         str(aggregate_vector_path),
@@ -551,6 +645,7 @@ def fast_zonal_statistics(
         working_dir,
         clean_working_dir,
         percentile_list,
+        calculate_area_ha,
     )
 
     percentile_list = [] if percentile_list is None else list(percentile_list)
@@ -571,6 +666,8 @@ def fast_zonal_statistics(
         "total_count": 0,
         "nodata_count": 0,
         "valid_count": 0,
+        "area_ha_total": 0.0,
+        "area_ha_valid": 0.0,
         "sum": 0.0,
         "stdev": None,
         **percentile_default_values,
@@ -603,6 +700,12 @@ def fast_zonal_statistics(
     raster_srs = osr.SpatialReference()
     raster_srs.ImportFromWkt(raster_info["projection_wkt"])
     raster_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    raster_pixel_area_ha = None
+    if calculate_area_ha:
+        raster_pixel_area_ha = _raster_pixel_area_ha(
+            raster_path, raster_info, raster_srs
+        )
+        logger.info("raster pixel area: %.12f ha", raster_pixel_area_ha)
 
     source_vector = gdal.OpenEx(str(aggregate_vector_path), gdal.OF_VECTOR)
     source_layer = (
@@ -902,6 +1005,11 @@ def fast_zonal_statistics(
         for group_value, group_stats in grouped_stats.items():
             valid_count = group_stats["total_count"] - group_stats["nodata_count"]
             group_stats["valid_count"] = valid_count
+            if raster_pixel_area_ha is not None:
+                group_stats["area_ha_total"] = (
+                    group_stats["total_count"] * raster_pixel_area_ha
+                )
+                group_stats["area_ha_valid"] = valid_count * raster_pixel_area_ha
             group_stats["mean"] = (
                 (group_stats["sum"] / valid_count) if valid_count > 0 else None
             )
@@ -926,6 +1034,11 @@ def fast_zonal_statistics(
 
             valid_count = group_stats["total_count"] - group_stats["nodata_count"]
             group_stats["valid_count"] = valid_count
+            if raster_pixel_area_ha is not None:
+                group_stats["area_ha_total"] = (
+                    group_stats["total_count"] * raster_pixel_area_ha
+                )
+                group_stats["area_ha_valid"] = valid_count * raster_pixel_area_ha
             logger.debug("group=%r computed valid_count=%r", group_value, valid_count)
 
             if valid_count > 0:
@@ -1434,6 +1547,9 @@ def run_zonal_stats_job(
                     "working_dir": workdir,
                     "clean_working_dir": False,
                     "percentile_list": pct_list,
+                    "calculate_area_ha": bool(
+                        AREA_HECTARE_OPERATIONS.intersection(core_ops)
+                    ),
                 },
                 store_result=True,
                 task_name=(
@@ -1630,6 +1746,7 @@ def main():
     task_graph.close()
 
     logging.getLogger(__name__).info("All %d jobs done", total_job_count)
+    _log_area_projection_assumptions()
 
 
 if __name__ == "__main__":
