@@ -427,6 +427,13 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                     f"Available fields: {sorted(props.keys())}"
                 )
 
+        output_csv = job.get("output_csv", "").strip()
+        output_gpkg = job.get("output_gpkg", "").strip()
+        if not output_csv and not output_gpkg:
+            raise ValueError(
+                f"[job:{tag}] must define at least one of output_csv or output_gpkg"
+            )
+
         workdir = global_work_dir / Path(tag)
         workdir.mkdir(parents=True, exist_ok=True)
 
@@ -500,7 +507,8 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                 "agg_field": agg_fields,
                 "operations": operations,
                 "workdir": workdir,
-                "output_csv": job["output_csv"],
+                "output_csv": output_csv or None,
+                "output_gpkg": output_gpkg or None,
                 "base_raster_path_list": base_raster_path_list,
                 "base_vector_path_list": base_vector_path_list,
                 "base_vector_fields": base_vector_fields,
@@ -1310,6 +1318,45 @@ def run_vector_stats_job(
     result_table.to_csv(output_csv, index=False)
 
 
+def _write_zonal_outputs(
+    result_table: pd.DataFrame,
+    agg_vector: Path,
+    agg_layer: str,
+    agg_fields: list[str],
+    output_csv: Path | None,
+    output_gpkg: Path | None,
+):
+    """Write zonal statistics to configured table and vector outputs."""
+    if output_csv is not None:
+        output_csv = Path(output_csv)
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        result_table.to_csv(output_csv, index=False)
+
+    if output_gpkg is None:
+        return
+
+    output_gpkg = Path(output_gpkg)
+    output_gpkg.parent.mkdir(parents=True, exist_ok=True)
+
+    output_gdf = gpd.read_file(agg_vector, layer=agg_layer)
+    result_columns = [
+        column_name
+        for column_name in result_table.columns
+        if column_name not in agg_fields
+    ]
+    conflicting_columns = [
+        column_name
+        for column_name in result_columns
+        if column_name in output_gdf.columns
+    ]
+    if conflicting_columns:
+        output_gdf = output_gdf.drop(columns=conflicting_columns)
+
+    output_gdf = output_gdf.merge(result_table, on=agg_fields, how="left", sort=False)
+    output_gpkg.unlink(missing_ok=True)
+    output_gdf.to_file(output_gpkg, layer=agg_layer, driver="GPKG")
+
+
 def run_zonal_stats_job(
     base_raster_path_list: list[Path],
     base_vector_path_list: list[Path],
@@ -1318,7 +1365,8 @@ def run_zonal_stats_job(
     agg_layer: str,
     agg_field,
     operations: list[str],
-    output_csv: Path,
+    output_csv: Path | None,
+    output_gpkg: Path | None,
     workdir: Path,
     tag: str,
     task_graph,
@@ -1329,7 +1377,7 @@ def run_zonal_stats_job(
     using geometries from an aggregation vector layer. Raster zonal statistics are
     executed via a task graph using `fast_zonal_statistics`, while vector-based
     statistics are delegated to `run_vector_stats_job`. Results from all inputs
-    are merged on the aggregation field and written to a single CSV output.
+    are merged on the aggregation field and written to the configured outputs.
 
     Both raster- and vector-derived statistics support core operations
     (e.g. count, sum, mean) and percentile operations (e.g. `p50`). All paths,
@@ -1345,7 +1393,8 @@ def run_zonal_stats_job(
         agg_layer: Name of the layer within `agg_vector` to use for aggregation.
         agg_field: Attribute field or fields defining aggregation zones/groups.
         operations: List of operation specifiers (e.g. `"mean"`, `"sum"`, `"p90"`).
-        output_csv: Path to the output CSV file to write.
+        output_csv: Optional path to the output CSV file to write.
+        output_gpkg: Optional path to the output GeoPackage file to write.
         workdir: Working directory for intermediate files and task graph outputs.
         tag: Job identifier used for temporary filenames and task labeling.
         task_graph: Task graph instance used to schedule raster and vector jobs.
@@ -1463,9 +1512,14 @@ def run_zonal_stats_job(
     if combined_dataframe is None:
         combined_dataframe = pd.DataFrame(columns=agg_fields)
 
-    output_csv = Path(output_csv)
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    combined_dataframe.to_csv(output_csv, index=False)
+    _write_zonal_outputs(
+        combined_dataframe,
+        agg_vector,
+        agg_layer,
+        agg_fields,
+        output_csv,
+        output_gpkg,
+    )
 
 
 def _invoke_timed_callback(reference_time, callback_lambda, callback_period):
@@ -1519,12 +1573,12 @@ def main():
     thread_error_list = []
     total_job_count = 0
 
-    def _run_zonal_stats_job_thread(output_csv, job_kwargs):
+    def _run_zonal_stats_job_thread(output_label, job_kwargs):
         try:
             run_zonal_stats_job(**job_kwargs)
         except Exception as error:
-            logger.exception("job failed for output %s", output_csv)
-            thread_error_list.append((output_csv, error))
+            logger.exception("job failed for output %s", output_label)
+            thread_error_list.append((output_label, error))
 
     for config_path in args.configs:
         cfg_path = Path(config_path)
@@ -1536,26 +1590,34 @@ def main():
                 job["tag"],
                 ",".join(job["operations"]),
             )
-            output_path = Path(job["output_csv"])
-            output_path_timestamped = output_path.with_name(
-                f"{output_path.stem}_{timestamp}{output_path.suffix}"
-            )
-            job["output_csv"] = output_path_timestamped
+            output_path_list = []
+            for output_key in ("output_csv", "output_gpkg"):
+                if job[output_key] is None:
+                    continue
+                output_path = Path(job[output_key])
+                output_path_timestamped = output_path.with_name(
+                    f"{output_path.stem}_{timestamp}{output_path.suffix}"
+                )
+                job[output_key] = output_path_timestamped
+                output_path_list.append(output_path_timestamped)
             job["task_graph"] = task_graph
+            output_label = ", ".join(
+                str(output_path) for output_path in output_path_list
+            )
 
             thread = Thread(
                 target=_run_zonal_stats_job_thread,
-                args=(output_path_timestamped, job),
+                args=(output_label, job),
             )
             thread.start()
-            thread_list.append((output_path_timestamped, thread))
+            thread_list.append((output_label, thread))
             total_job_count += 1
     logger.info(f"******** running {total_job_count} jobs")
 
-    for output_csv, thread in thread_list:
+    for output_label, thread in thread_list:
         thread.join()
-        if not any(error_path == output_csv for error_path, _ in thread_error_list):
-            logger.info(f"********* {output_csv} is complete!")
+        if not any(error_path == output_label for error_path, _ in thread_error_list):
+            logger.info(f"********* {output_label} is complete!")
 
     if thread_error_list:
         task_graph.close()
