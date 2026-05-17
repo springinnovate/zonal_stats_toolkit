@@ -1,5 +1,5 @@
 from __future__ import annotations
-from threading import Lock, Thread
+from threading import Thread
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -18,7 +18,7 @@ from tqdm import tqdm
 from datasketches import kll_floats_sketch
 from ecoshard import taskgraph, geoprocessing
 from osgeo import gdal, ogr, osr
-from pyproj import CRS, Transformer
+from pyproj import CRS, Geod, Transformer
 from shapely.strtree import STRtree
 import pandas as pd
 import fiona
@@ -35,10 +35,7 @@ AREA_HECTARE_OPERATIONS = {
     "area_ha_total",
     "area_ha_valid",
 }
-AREA_PROJECTION_EPSG = 6933
-AREA_PROJECTION_DESCRIPTION = "EPSG:6933 WGS 84 / NSIDC EASE-Grid 2.0 Global"
-_AREA_PROJECTION_ASSUMPTIONS = set()
-_AREA_PROJECTION_ASSUMPTIONS_LOCK = Lock()
+_AREA_HECTARE_ASSUMPTIONS = set()
 VALID_OPERATIONS = {
     *AREA_HECTARE_OPERATIONS,
     "mean",
@@ -51,32 +48,37 @@ VALID_OPERATIONS = {
 }
 
 
-def _record_area_projection_assumption(message):
-    with _AREA_PROJECTION_ASSUMPTIONS_LOCK:
-        _AREA_PROJECTION_ASSUMPTIONS.add(message)
+def _record_area_hectare_assumption(message):
+    """Track a geographic-raster area approximation for end-of-run logging.
+
+    Args:
+        message: Human-readable description of the raster and approximation used.
+    """
+    _AREA_HECTARE_ASSUMPTIONS.add(message)
 
 
-def _log_area_projection_assumptions():
-    with _AREA_PROJECTION_ASSUMPTIONS_LOCK:
-        assumption_list = sorted(_AREA_PROJECTION_ASSUMPTIONS)
-    for message in assumption_list:
-        logger.warning("Area hectare projection assumption: %s", message)
-
-
-def _shoelace_area(x_values, y_values):
-    area = 0.0
-    point_count = len(x_values)
-    for index in range(point_count):
-        next_index = (index + 1) % point_count
-        area += (
-            x_values[index] * y_values[next_index]
-            - x_values[next_index] * y_values[index]
-        )
-    return abs(area) * 0.5
+def _log_area_hectare_assumptions():
+    """Log any geographic-raster area approximations after all jobs complete."""
+    for message in sorted(_AREA_HECTARE_ASSUMPTIONS):
+        logger.warning("Area hectare assumption: %s", message)
 
 
 def _raster_pixel_area_ha(raster_path, raster_info, raster_srs):
-    """Estimate a raster pixel area in hectares."""
+    """Estimate one raster pixel's area in hectares.
+
+    Projected rasters use the raster pixel size and CRS linear units directly.
+    Geographic rasters use a representative pixel at the center of the raster
+    extent and compute its ellipsoidal area with `pyproj.Geod`. That keeps area
+    outputs count-based while making the geographic-CRS approximation explicit.
+
+    Args:
+        raster_path: Path to the raster, used only for logging assumptions.
+        raster_info: Raster metadata from `geoprocessing.get_raster_info`.
+        raster_srs: GDAL spatial reference for the raster.
+
+    Returns:
+        Estimated area of one raster pixel in hectares.
+    """
     pixel_width, pixel_height = raster_info["pixel_size"]
     if raster_srs is not None and raster_srs.IsProjected():
         linear_units_to_meters = raster_srs.GetLinearUnits() or 1.0
@@ -101,29 +103,30 @@ def _raster_pixel_area_ha(raster_path, raster_info, raster_srs):
         source_crs = CRS.from_epsg(4326)
         source_description = "missing CRS, assumed EPSG:4326"
 
-    transformer = Transformer.from_crs(
-        source_crs, CRS.from_epsg(AREA_PROJECTION_EPSG), always_xy=True
-    )
-    x_values, y_values = transformer.transform(
-        [
-            center_x - half_width,
-            center_x + half_width,
-            center_x + half_width,
-            center_x - half_width,
-        ],
-        [
-            center_y - half_height,
-            center_y - half_height,
-            center_y + half_height,
-            center_y + half_height,
-        ],
-    )
-    _record_area_projection_assumption(
+    geod = source_crs.get_geod() if hasattr(source_crs, "get_geod") else None
+    if geod is None:
+        geod = Geod(ellps="WGS84")
+        source_description = f"{source_description}; WGS84 ellipsoid assumed"
+
+    x_values = [
+        center_x - half_width,
+        center_x + half_width,
+        center_x + half_width,
+        center_x - half_width,
+    ]
+    y_values = [
+        center_y - half_height,
+        center_y - half_height,
+        center_y + half_height,
+        center_y + half_height,
+    ]
+    area_m2, _ = geod.polygon_area_perimeter(x_values, y_values)
+    _record_area_hectare_assumption(
         f"{raster_path}: raster CRS is not projected ({source_description}); "
-        f"pixel area was estimated by projecting a representative center pixel "
-        f"to {AREA_PROJECTION_DESCRIPTION}."
+        f"pixel area was estimated from a representative center pixel using "
+        f"pyproj.Geod."
     )
-    return _shoelace_area(x_values, y_values) / 10000.0
+    return abs(area_m2) / 10000.0
 
 
 def _safe_path_stem(path, max_length=60):
@@ -1746,7 +1749,7 @@ def main():
     task_graph.close()
 
     logging.getLogger(__name__).info("All %d jobs done", total_job_count)
-    _log_area_projection_assumptions()
+    _log_area_hectare_assumptions()
 
 
 if __name__ == "__main__":
