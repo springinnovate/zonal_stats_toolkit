@@ -18,7 +18,7 @@ from tqdm import tqdm
 from datasketches import kll_floats_sketch
 from ecoshard import taskgraph, geoprocessing
 from osgeo import gdal, ogr, osr
-from pyproj import CRS, Transformer
+from pyproj import CRS, Geod, Transformer
 from shapely.strtree import STRtree
 import pandas as pd
 import fiona
@@ -31,7 +31,13 @@ logger = logging.getLogger(__name__)
 
 
 _LOGGING_PERIOD = 10.0
+AREA_HECTARE_OPERATIONS = {
+    "area_ha_total",
+    "area_ha_valid",
+}
+_AREA_HECTARE_ASSUMPTIONS = set()
 VALID_OPERATIONS = {
+    *AREA_HECTARE_OPERATIONS,
     "mean",
     "stdev",
     "min",
@@ -40,6 +46,87 @@ VALID_OPERATIONS = {
     "total_count",
     "valid_count",
 }
+
+
+def _record_area_hectare_assumption(message):
+    """Track a geographic-raster area approximation for end-of-run logging.
+
+    Args:
+        message: Human-readable description of the raster and approximation used.
+    """
+    _AREA_HECTARE_ASSUMPTIONS.add(message)
+
+
+def _log_area_hectare_assumptions():
+    """Log any geographic-raster area approximations after all jobs complete."""
+    for message in sorted(_AREA_HECTARE_ASSUMPTIONS):
+        logger.warning("Area hectare assumption: %s", message)
+
+
+def _raster_pixel_area_ha(raster_path, raster_info, raster_srs):
+    """Estimate one raster pixel's area in hectares.
+
+    Projected rasters use the raster pixel size and CRS linear units directly.
+    Geographic rasters use a representative pixel at the center of the raster
+    extent and compute its ellipsoidal area with `pyproj.Geod`. That keeps area
+    outputs count-based while making the geographic-CRS approximation explicit.
+
+    Args:
+        raster_path: Path to the raster, used only for logging assumptions.
+        raster_info: Raster metadata from `geoprocessing.get_raster_info`.
+        raster_srs: GDAL spatial reference for the raster.
+
+    Returns:
+        Estimated area of one raster pixel in hectares.
+    """
+    pixel_width, pixel_height = raster_info["pixel_size"]
+    if raster_srs is not None and raster_srs.IsProjected():
+        linear_units_to_meters = raster_srs.GetLinearUnits() or 1.0
+        return (
+            abs(pixel_width * pixel_height)
+            * linear_units_to_meters
+            * linear_units_to_meters
+            / 10000.0
+        )
+
+    bounding_box = raster_info["bounding_box"]
+    center_x = (bounding_box[0] + bounding_box[2]) * 0.5
+    center_y = (bounding_box[1] + bounding_box[3]) * 0.5
+    half_width = abs(pixel_width) * 0.5
+    half_height = abs(pixel_height) * 0.5
+
+    source_projection_wkt = raster_info.get("projection_wkt")
+    if source_projection_wkt:
+        source_crs = CRS.from_wkt(source_projection_wkt)
+        source_description = source_crs.to_string()
+    else:
+        source_crs = CRS.from_epsg(4326)
+        source_description = "missing CRS, assumed EPSG:4326"
+
+    geod = source_crs.get_geod() if hasattr(source_crs, "get_geod") else None
+    if geod is None:
+        geod = Geod(ellps="WGS84")
+        source_description = f"{source_description}; WGS84 ellipsoid assumed"
+
+    x_values = [
+        center_x - half_width,
+        center_x + half_width,
+        center_x + half_width,
+        center_x - half_width,
+    ]
+    y_values = [
+        center_y - half_height,
+        center_y - half_height,
+        center_y + half_height,
+        center_y + half_height,
+    ]
+    area_m2, _ = geod.polygon_area_perimeter(x_values, y_values)
+    _record_area_hectare_assumption(
+        f"{raster_path}: raster CRS is not projected ({source_description}); "
+        f"pixel area was estimated from a representative center pixel using "
+        f"pyproj.Geod."
+    )
+    return abs(area_m2) / 10000.0
 
 
 def _safe_path_stem(path, max_length=60):
@@ -498,6 +585,13 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
             raise ValueError(
                 f"[job:{tag}] must define at least one of base_raster_pattern or base_vector_pattern"
             )
+        if (
+            AREA_HECTARE_OPERATIONS.intersection(operations)
+            and not base_raster_path_list
+        ):
+            raise ValueError(
+                f"[job:{tag}] area_ha operations require base_raster_pattern"
+            )
 
         job_list.append(
             {
@@ -535,13 +629,16 @@ def fast_zonal_statistics(
     working_dir=None,
     clean_working_dir=False,
     percentile_list=None,
+    calculate_area_ha=False,
 ):
     raster_path, raster_band_index = base_raster_path_band
     aggregate_vector_fields = aggregate_vector_field
     aggregate_vector_field_label = ",".join(aggregate_vector_fields)
 
     logger.info(
-        "fast_zonal_statistics start | raster=%s band=%s | vector=%s layer=%s fields=%s | ignore_nodata=%s | working_dir=%s clean=%s | percentiles=%s",
+        "fast_zonal_statistics start | raster=%s band=%s | vector=%s layer=%s "
+        "fields=%s | ignore_nodata=%s | working_dir=%s clean=%s | "
+        "percentiles=%s | calculate_area_ha=%s",
         raster_path,
         raster_band_index,
         str(aggregate_vector_path),
@@ -551,6 +648,7 @@ def fast_zonal_statistics(
         working_dir,
         clean_working_dir,
         percentile_list,
+        calculate_area_ha,
     )
 
     percentile_list = [] if percentile_list is None else list(percentile_list)
@@ -571,6 +669,8 @@ def fast_zonal_statistics(
         "total_count": 0,
         "nodata_count": 0,
         "valid_count": 0,
+        "area_ha_total": 0.0,
+        "area_ha_valid": 0.0,
         "sum": 0.0,
         "stdev": None,
         **percentile_default_values,
@@ -603,6 +703,12 @@ def fast_zonal_statistics(
     raster_srs = osr.SpatialReference()
     raster_srs.ImportFromWkt(raster_info["projection_wkt"])
     raster_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    raster_pixel_area_ha = None
+    if calculate_area_ha:
+        raster_pixel_area_ha = _raster_pixel_area_ha(
+            raster_path, raster_info, raster_srs
+        )
+        logger.info("raster pixel area: %.12f ha", raster_pixel_area_ha)
 
     source_vector = gdal.OpenEx(str(aggregate_vector_path), gdal.OF_VECTOR)
     source_layer = (
@@ -902,6 +1008,11 @@ def fast_zonal_statistics(
         for group_value, group_stats in grouped_stats.items():
             valid_count = group_stats["total_count"] - group_stats["nodata_count"]
             group_stats["valid_count"] = valid_count
+            if raster_pixel_area_ha is not None:
+                group_stats["area_ha_total"] = (
+                    group_stats["total_count"] * raster_pixel_area_ha
+                )
+                group_stats["area_ha_valid"] = valid_count * raster_pixel_area_ha
             group_stats["mean"] = (
                 (group_stats["sum"] / valid_count) if valid_count > 0 else None
             )
@@ -926,6 +1037,11 @@ def fast_zonal_statistics(
 
             valid_count = group_stats["total_count"] - group_stats["nodata_count"]
             group_stats["valid_count"] = valid_count
+            if raster_pixel_area_ha is not None:
+                group_stats["area_ha_total"] = (
+                    group_stats["total_count"] * raster_pixel_area_ha
+                )
+                group_stats["area_ha_valid"] = valid_count * raster_pixel_area_ha
             logger.debug("group=%r computed valid_count=%r", group_value, valid_count)
 
             if valid_count > 0:
@@ -1434,6 +1550,9 @@ def run_zonal_stats_job(
                     "working_dir": workdir,
                     "clean_working_dir": False,
                     "percentile_list": pct_list,
+                    "calculate_area_ha": bool(
+                        AREA_HECTARE_OPERATIONS.intersection(core_ops)
+                    ),
                 },
                 store_result=True,
                 task_name=(
@@ -1630,6 +1749,7 @@ def main():
     task_graph.close()
 
     logging.getLogger(__name__).info("All %d jobs done", total_job_count)
+    _log_area_hectare_assumptions()
 
 
 if __name__ == "__main__":
