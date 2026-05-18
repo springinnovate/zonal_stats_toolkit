@@ -1492,6 +1492,7 @@ def run_vector_stats_job(
 
 
 def _bounds_to_wgs84(bounds, source_crs):
+    """Transform vector bounds into WGS84 longitude/latitude bounds."""
     transformer = Transformer.from_crs(source_crs, CRS.from_epsg(4326), always_xy=True)
     min_x, min_y, max_x, max_y = bounds
     lon_values, lat_values = transformer.transform(
