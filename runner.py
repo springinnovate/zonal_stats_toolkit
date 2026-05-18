@@ -2198,6 +2198,8 @@ def _write_zonal_outputs(
     output_gdf = output_gdf.merge(result_table, on=agg_fields, how="left", sort=False)
     geometry_types = set(output_gdf.geometry.geom_type.dropna())
     if {"Polygon", "MultiPolygon"}.issubset(geometry_types):
+        # GeoPackage layers have one declared geometry type; normalizing mixed
+        # polygonal output avoids repeated GDAL warnings during writes.
         output_gdf = output_gdf.copy()
         output_gdf.geometry = output_gdf.geometry.apply(_promote_polygon_to_multipolygon)
     output_gpkg.unlink(missing_ok=True)
