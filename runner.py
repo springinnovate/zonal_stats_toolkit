@@ -421,6 +421,7 @@ def _prepare_aggregate_vector_for_rasterization(
             str(tmp_reprojected_path),
             src_path,
             dstSRS=raster_projection_wkt,
+            options=["-ct_opt", "WARN_ABOUT_DIFFERENT_COORD_OP=NO"],
             **vector_translate_kwargs,
         )
         src_path = str(tmp_reprojected_path)
