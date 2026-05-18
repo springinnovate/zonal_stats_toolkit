@@ -1508,6 +1508,7 @@ def _bounds_to_wgs84(bounds, source_crs):
 
 
 def _linear_units_to_meters(crs):
+    """Return the conversion factor from CRS linear units to meters."""
     if crs.axis_info:
         return crs.axis_info[0].unit_conversion_factor or 1.0
     return 1.0
