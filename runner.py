@@ -35,9 +35,16 @@ AREA_HECTARE_OPERATIONS = {
     "area_ha_total",
     "area_ha_valid",
 }
+MEASURE_OPERATIONS = {
+    "intersect_area_ha",
+    "intersect_length_km",
+    "intersect_count",
+}
 _AREA_HECTARE_ASSUMPTIONS = set()
+_MEASURE_CRS_ASSUMPTIONS = set()
 VALID_OPERATIONS = {
     *AREA_HECTARE_OPERATIONS,
+    *MEASURE_OPERATIONS,
     "mean",
     "stdev",
     "min",
@@ -452,6 +459,43 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
             out.extend([Path(p) for p in glob.glob(pat)])
         return sorted({p for p in out})
 
+    def _resolve_layer(
+        vector_path: Path, layer_name: str, layer_config_key: str, tag: str
+    ) -> str:
+        """Return a validated vector layer name.
+
+        Args:
+            vector_path: Vector datasource path to inspect.
+            layer_name: User-provided layer name, or an empty string when no
+                layer was configured.
+            layer_config_key: Config key name to include in validation errors.
+            tag: Job tag to include in validation errors.
+
+        Returns:
+            The resolved layer name.
+
+        Raises:
+            ValueError: If the datasource has no layers, the requested layer is
+                missing, or the datasource has multiple layers and no layer was
+                configured.
+        """
+        layers = fiona.listlayers(str(vector_path))
+        if not layers:
+            raise ValueError(f"[job:{tag}] no layers found in {vector_path}")
+        if layer_name:
+            if layer_name not in layers:
+                raise ValueError(
+                    f'[job:{tag}] {layer_config_key} "{layer_name}" not found in '
+                    f"{vector_path}. Available layers: {layers}"
+                )
+            return layer_name
+        if len(layers) > 1:
+            raise ValueError(
+                f"[job:{tag}] {layer_config_key} is required for {vector_path} "
+                f"because it has multiple layers: {layers}"
+            )
+        return layers[0]
+
     job_list = []
     for tag, job in jobs_sections:
         agg_vector_raw = job.get("agg_vector", "").strip()
@@ -488,19 +532,8 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                 f"Valid operations: {sorted(VALID_OPERATIONS)}"
             )
 
-        layers = fiona.listlayers(str(agg_vector))
-
         agg_layer = job.get("agg_layer", "").strip()
-        if not agg_layer:
-            if not layers:
-                raise ValueError(f"[job:{tag}] no layers found in {agg_vector}")
-            agg_layer = layers[0]
-
-        if agg_layer not in layers:
-            raise ValueError(
-                f'[job:{tag}] agg_layer "{agg_layer}" not found in {agg_vector}. '
-                f"Available layers: {layers}"
-            )
+        agg_layer = _resolve_layer(agg_vector, agg_layer, "agg_layer", tag)
 
         with fiona.open(str(agg_vector), layer=agg_layer) as src:
             props = src.schema.get("properties", {})
@@ -527,6 +560,9 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
         base_raster_path_list = []
         base_vector_path_list = []
         base_vector_fields = []
+        base_measure_vector = None
+        base_measure_layer = None
+        measure_crs = job.get("measure_crs", "auto").strip() or "auto"
 
         base_raster_pattern = job.get("base_raster_pattern", "").strip()
         if base_raster_pattern:
@@ -566,12 +602,9 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                 )
 
             for base_vector_path in base_vector_path_list:
-                layers = fiona.listlayers(str(base_vector_path))
-                if not layers:
-                    raise ValueError(
-                        f"[job:{tag}] no layers found in {base_vector_path}"
-                    )
-                layer = layers[0]
+                layer = _resolve_layer(
+                    base_vector_path, "", "base_vector_pattern layer", tag
+                )
                 with fiona.open(str(base_vector_path), layer=layer) as src:
                     props = src.schema.get("properties", {})
                     missing = [f for f in base_vector_fields if f not in props]
@@ -581,9 +614,46 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                             f"Available fields: {sorted(props.keys())}"
                         )
 
-        if (not base_raster_path_list) and (not base_vector_path_list):
+        base_measure_vector_raw = job.get("base_measure_vector", "").strip()
+        if base_measure_vector_raw:
+            base_measure_vector = _abs_from_cfg_dir(base_measure_vector_raw)
+            if not base_measure_vector.exists():
+                raise FileNotFoundError(
+                    f"[job:{tag}] base_measure_vector not found: {base_measure_vector}"
+                )
+            base_measure_layer = _resolve_layer(
+                base_measure_vector,
+                job.get("base_measure_layer", "").strip(),
+                "base_measure_layer",
+                tag,
+            )
+
+        is_measure_job = base_measure_vector is not None
+        measure_operation_set = MEASURE_OPERATIONS.intersection(operations)
+        if is_measure_job:
+            if base_raster_path_list or base_vector_path_list:
+                raise ValueError(
+                    f"[job:{tag}] base_measure_vector jobs cannot also define "
+                    "base_raster_pattern or base_vector_pattern"
+                )
+            if len(operations) != 1 or len(measure_operation_set) != 1:
+                raise ValueError(
+                    f"[job:{tag}] base_measure_vector jobs must define exactly "
+                    f"one operation from {sorted(MEASURE_OPERATIONS)}"
+                )
+        elif measure_operation_set:
             raise ValueError(
-                f"[job:{tag}] must define at least one of base_raster_pattern or base_vector_pattern"
+                f"[job:{tag}] measure operations require base_measure_vector"
+            )
+
+        if (
+            (not base_raster_path_list)
+            and (not base_vector_path_list)
+            and (not is_measure_job)
+        ):
+            raise ValueError(
+                f"[job:{tag}] must define at least one of base_raster_pattern, "
+                "base_vector_pattern, or base_measure_vector"
             )
         if (
             AREA_HECTARE_OPERATIONS.intersection(operations)
@@ -606,6 +676,9 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                 "base_raster_path_list": base_raster_path_list,
                 "base_vector_path_list": base_vector_path_list,
                 "base_vector_fields": base_vector_fields,
+                "base_measure_vector": base_measure_vector,
+                "base_measure_layer": base_measure_layer,
+                "measure_crs": measure_crs,
                 "task_graph": None,
             }
         )
@@ -1434,6 +1507,265 @@ def run_vector_stats_job(
     result_table.to_csv(output_csv, index=False)
 
 
+def _bounds_to_wgs84(bounds, source_crs):
+    """Transform vector bounds into WGS84 longitude/latitude bounds.
+
+    Args:
+        bounds: Source bounds as `(min_x, min_y, max_x, max_y)`.
+        source_crs: CRS describing the source bounds.
+
+    Returns:
+        Bounds as `(min_lon, min_lat, max_lon, max_lat)`.
+    """
+    transformer = Transformer.from_crs(source_crs, CRS.from_epsg(4326), always_xy=True)
+    min_x, min_y, max_x, max_y = bounds
+    lon_values, lat_values = transformer.transform(
+        [min_x, min_x, max_x, max_x],
+        [min_y, max_y, min_y, max_y],
+    )
+    return (
+        min(lon_values),
+        min(lat_values),
+        max(lon_values),
+        max(lat_values),
+    )
+
+
+def _linear_units_to_meters(crs):
+    """Return the conversion factor from CRS linear units to meters.
+
+    Args:
+        crs: Projected CRS whose axis units are used for measurement.
+
+    Returns:
+        Multiplier for converting one CRS linear unit to meters.
+    """
+    if crs.axis_info:
+        return crs.axis_info[0].unit_conversion_factor or 1.0
+    return 1.0
+
+
+def _select_measure_crs(agg_gdf, measure_gdf, measure_crs, operation, tag):
+    """Choose the projected CRS used for vector intersection measurements.
+
+    Args:
+        agg_gdf: Aggregation GeoDataFrame.
+        measure_gdf: GeoDataFrame containing geometries to measure.
+        measure_crs: User-configured CRS string, or `"auto"`.
+        operation: Measure operation being run.
+        tag: Job tag to include in validation errors and log messages.
+
+    Returns:
+        The CRS to use for planar intersection measurements.
+
+    Raises:
+        ValueError: If either input is missing a CRS, or if an explicit
+            non-projected CRS is configured for area or length measurement.
+    """
+    agg_crs = CRS.from_user_input(agg_gdf.crs) if agg_gdf.crs else None
+    base_crs = CRS.from_user_input(measure_gdf.crs) if measure_gdf.crs else None
+    if agg_crs is None or base_crs is None:
+        raise ValueError(
+            f"[job:{tag}] agg_vector and base_measure_vector must both define a CRS"
+        )
+
+    if measure_crs.lower() != "auto":
+        target_crs = CRS.from_user_input(measure_crs)
+        if operation != "intersect_count" and not target_crs.is_projected:
+            raise ValueError(
+                f"[job:{tag}] measure_crs must be projected for {operation}: "
+                f"{measure_crs}"
+            )
+        return target_crs
+
+    if agg_crs == base_crs and agg_crs.is_projected:
+        authority = agg_crs.to_authority()
+        crs_label = (
+            f"{authority[0]}:{authority[1]}" if authority else agg_crs.to_string()
+        )
+        _MEASURE_CRS_ASSUMPTIONS.add(
+            f"[job:{tag}] measure_crs=auto used shared projected CRS "
+            f"{crs_label}."
+        )
+        return agg_crs
+
+    agg_bounds = _bounds_to_wgs84(agg_gdf.total_bounds, agg_crs)
+    base_bounds = _bounds_to_wgs84(measure_gdf.total_bounds, base_crs)
+    min_lon = min(agg_bounds[0], base_bounds[0])
+    min_lat = min(agg_bounds[1], base_bounds[1])
+    max_lon = max(agg_bounds[2], base_bounds[2])
+    max_lat = max(agg_bounds[3], base_bounds[3])
+    center_lon = (min_lon + max_lon) * 0.5
+    center_lat = (min_lat + max_lat) * 0.5
+    lon_span = max_lon - min_lon
+    lat_span = max_lat - min_lat
+
+    if -80.0 <= center_lat <= 84.0 and lon_span <= 6.0 and lat_span <= 10.0:
+        zone = int((center_lon + 180.0) // 6.0) + 1
+        zone = min(max(zone, 1), 60)
+        epsg = 32600 + zone if center_lat >= 0 else 32700 + zone
+        target_crs = CRS.from_epsg(epsg)
+        reason = (
+            f"extent center ({center_lon:.4f}, {center_lat:.4f}) fits UTM zone {zone}"
+        )
+    else:
+        target_crs = CRS.from_epsg(6933)
+        reason = (
+            "extent is too wide for a single UTM zone or outside UTM latitude bounds; "
+            "using global equal-area EPSG:6933"
+        )
+
+    authority = target_crs.to_authority()
+    crs_label = (
+        f"{authority[0]}:{authority[1]}" if authority else target_crs.to_string()
+    )
+    _MEASURE_CRS_ASSUMPTIONS.add(
+        f"[job:{tag}] measure_crs=auto selected {crs_label} for {operation}; "
+        f"{reason}."
+    )
+    return target_crs
+
+
+def _validate_measure_geometry(measure_gdf, operation, vector_path):
+    """Validate that measure vector geometry types match the operation.
+
+    Args:
+        measure_gdf: GeoDataFrame containing geometries to measure.
+        operation: Measure operation being run.
+        vector_path: Source path to include in validation errors.
+
+    Raises:
+        ValueError: If the measured geometry type is incompatible with
+            `operation`.
+    """
+    geometry_types = set(
+        measure_gdf.geometry.dropna().geom_type.str.replace("3D ", "", regex=False)
+    )
+    if not geometry_types:
+        return
+    if operation == "intersect_area_ha":
+        allowed_types = {"Polygon", "MultiPolygon"}
+    elif operation == "intersect_length_km":
+        allowed_types = {"LineString", "MultiLineString", "LinearRing"}
+    else:
+        allowed_types = {"Point", "MultiPoint"}
+
+    unexpected_types = sorted(geometry_types - allowed_types)
+    if unexpected_types:
+        raise ValueError(
+            f"{operation} cannot measure geometry types {unexpected_types} in "
+            f"{vector_path}. Expected one of {sorted(allowed_types)}."
+        )
+
+
+def run_vector_measure_job(
+    agg_vector,
+    agg_layer,
+    agg_fields,
+    base_measure_vector,
+    base_measure_layer,
+    operation,
+    measure_crs,
+    tag,
+):
+    """Run a vector-on-vector intersection measure job.
+
+    Args:
+        agg_vector: Aggregation vector path.
+        agg_layer: Aggregation vector layer name.
+        agg_fields: Field names that identify aggregation groups.
+        base_measure_vector: Vector path to measure inside aggregation groups.
+        base_measure_layer: Layer name in `base_measure_vector`.
+        operation: One of `intersect_area_ha`, `intersect_length_km`, or
+            `intersect_count`.
+        measure_crs: CRS for planar measurement, or `auto`.
+        tag: Job tag used in log and error messages.
+
+    Returns:
+        DataFrame containing aggregation fields and one measure column.
+    """
+    logger.info(
+        "running vector measure job | tag=%s operation=%s base=%s layer=%s",
+        tag,
+        operation,
+        base_measure_vector,
+        base_measure_layer,
+    )
+    agg_gdf = gpd.read_file(agg_vector, layer=agg_layer)
+    measure_gdf = gpd.read_file(base_measure_vector, layer=base_measure_layer)
+    measure_gdf = measure_gdf[
+        measure_gdf.geometry.notna() & (~measure_gdf.geometry.is_empty)
+    ].copy()
+    _validate_measure_geometry(measure_gdf, operation, base_measure_vector)
+
+    agg_groups = agg_gdf.dissolve(by=agg_fields, as_index=False)
+    agg_groups = agg_groups[agg_fields + ["geometry"]]
+    column_name = f"{operation}_{Path(base_measure_vector).stem}"
+    result_table = agg_groups[agg_fields].copy()
+    result_table[column_name] = 0 if operation == "intersect_count" else 0.0
+
+    if measure_gdf.empty:
+        logger.info("base measure vector has no non-empty geometries")
+        return result_table
+
+    target_crs = _select_measure_crs(
+        agg_groups, measure_gdf, measure_crs, operation, tag
+    )
+    agg_projected = agg_groups.to_crs(target_crs)
+    measure_projected = measure_gdf[["geometry"]].to_crs(target_crs)
+    measure_projected = measure_projected.explode(index_parts=False)
+
+    if operation == "intersect_count":
+        joined = gpd.sjoin(
+            measure_projected,
+            agg_projected[agg_fields + ["geometry"]],
+            how="inner",
+            predicate="intersects",
+        )
+        if joined.empty:
+            return result_table
+        measured = (
+            joined.groupby(agg_fields, dropna=False)
+            .size()
+            .rename(column_name)
+            .reset_index()
+        )
+    else:
+        intersection_gdf = gpd.overlay(
+            measure_projected,
+            agg_projected[agg_fields + ["geometry"]],
+            how="intersection",
+            keep_geom_type=False,
+        )
+        if intersection_gdf.empty:
+            return result_table
+        linear_units_to_meters = _linear_units_to_meters(target_crs)
+        if operation == "intersect_area_ha":
+            intersection_gdf[column_name] = (
+                intersection_gdf.geometry.area
+                * linear_units_to_meters
+                * linear_units_to_meters
+                / 10000.0
+            )
+        else:
+            intersection_gdf[column_name] = (
+                intersection_gdf.geometry.length * linear_units_to_meters / 1000.0
+            )
+        measured = (
+            intersection_gdf.groupby(agg_fields, dropna=False)[column_name]
+            .sum()
+            .reset_index()
+        )
+
+    result_table = result_table.drop(columns=[column_name]).merge(
+        measured, on=agg_fields, how="left", sort=False
+    )
+    result_table[column_name] = result_table[column_name].fillna(0)
+    if operation == "intersect_count":
+        result_table[column_name] = result_table[column_name].astype(np.int64)
+    return result_table
+
+
 def _write_zonal_outputs(
     result_table: pd.DataFrame,
     agg_vector: Path,
@@ -1477,6 +1809,9 @@ def run_zonal_stats_job(
     base_raster_path_list: list[Path],
     base_vector_path_list: list[Path],
     base_vector_fields: list[str],
+    base_measure_vector: Path | None,
+    base_measure_layer: str | None,
+    measure_crs: str,
     agg_vector: Path,
     agg_layer: str,
     agg_field,
@@ -1505,6 +1840,9 @@ def run_zonal_stats_job(
         base_vector_path_list: List of vector paths on which to compute nearest-
             geometry vector statistics. May be empty.
         base_vector_fields: Attribute field names to aggregate from base vectors.
+        base_measure_vector: Optional vector path whose intersections are measured.
+        base_measure_layer: Optional layer name in `base_measure_vector`.
+        measure_crs: CRS for vector intersection measurement, or `auto`.
         agg_vector: Path to the aggregation vector dataset.
         agg_layer: Name of the layer within `agg_vector` to use for aggregation.
         agg_field: Attribute field or fields defining aggregation zones/groups.
@@ -1534,6 +1872,27 @@ def run_zonal_stats_job(
 
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
+
+    if base_measure_vector is not None:
+        combined_dataframe = run_vector_measure_job(
+            agg_vector=agg_vector,
+            agg_layer=agg_layer,
+            agg_fields=agg_fields,
+            base_measure_vector=base_measure_vector,
+            base_measure_layer=base_measure_layer,
+            operation=core_ops[0],
+            measure_crs=measure_crs,
+            tag=tag,
+        )
+        _write_zonal_outputs(
+            combined_dataframe,
+            agg_vector,
+            agg_layer,
+            agg_fields,
+            output_csv,
+            output_gpkg,
+        )
+        return
 
     grouped_stats_list = []
     if base_raster_path_list:
@@ -1750,6 +2109,8 @@ def main():
 
     logging.getLogger(__name__).info("All %d jobs done", total_job_count)
     _log_area_hectare_assumptions()
+    for message in sorted(_MEASURE_CRS_ASSUMPTIONS):
+        logger.warning("Vector measure CRS choice: %s", message)
 
 
 if __name__ == "__main__":
