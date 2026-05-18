@@ -1,7 +1,7 @@
 from __future__ import annotations
 from threading import Thread
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 import collections
@@ -137,6 +137,42 @@ def _configure_gdal_cache(max_cache_bytes=_GDAL_CACHE_MAX_BYTES):
             current_cache_bytes / _BYTES_PER_MIB,
             max_cache_bytes / _BYTES_PER_MIB,
         )
+
+
+def _run_zonal_stats_job_process(output_label, job_kwargs, log_level):
+    """Run one configured job in an isolated process.
+
+    Args:
+        output_label: Human-readable output label for errors.
+        job_kwargs: Validated keyword arguments for `run_zonal_stats_job`.
+        log_level: Numeric logging level to configure in this process.
+
+    Returns:
+        Completed job metadata for the parent process.
+    """
+    _configure_logging(log_level)
+    _configure_gdal_cache()
+    _AREA_HECTARE_ASSUMPTIONS.clear()
+    _MEASURE_CRS_ASSUMPTIONS.clear()
+    job_kwargs = dict(job_kwargs)
+    task_graph = None
+    try:
+        # Each process owns its TaskGraph database. Keeping this at one worker
+        # avoids nested process fan-out while top-level jobs run in parallel.
+        task_graph = taskgraph.TaskGraph(
+            Path(job_kwargs["workdir"]) / "taskgraph", 1, None
+        )
+        job_kwargs["task_graph"] = task_graph
+        run_zonal_stats_job(**job_kwargs)
+        task_graph.join()
+        return {
+            "output_label": output_label,
+            "area_hectare_assumptions": sorted(_AREA_HECTARE_ASSUMPTIONS),
+            "measure_crs_assumptions": sorted(_MEASURE_CRS_ASSUMPTIONS),
+        }
+    finally:
+        if task_graph is not None:
+            task_graph.close()
 
 
 def _progress_monitor(progress_queue, total_jobs):
@@ -2447,8 +2483,19 @@ def main():
     parser.add_argument(
         "configs", nargs="+", help="Path(s) to INI configuration file(s)"
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of top-level jobs to run in parallel. Defaults to "
+            "min(4, half the available CPU count)."
+        ),
+    )
     parser.add_argument("--test", action="store_true")
     args = parser.parse_args()
+    if args.max_workers is not None and args.max_workers < 1:
+        raise ValueError("--max-workers must be at least 1")
 
     config_list = []
     for config_path in args.configs:
@@ -2460,28 +2507,8 @@ def main():
     _configure_logging(log_level)
     _configure_gdal_cache()
 
-    task_graph = taskgraph.TaskGraph(Path.cwd(), os.cpu_count() // 2 + 1, None)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    thread_list = []
-    thread_error_list = []
     job_run_list = []
-
-    def _run_zonal_stats_job_thread(output_label, job_kwargs):
-        status = "done"
-        try:
-            run_zonal_stats_job(**job_kwargs)
-        except Exception as error:
-            status = "failed"
-            logger.exception("job failed for output %s", output_label)
-            thread_error_list.append((output_label, error))
-        finally:
-            job_kwargs["progress_queue"].put(
-                {
-                    "event": "job_done",
-                    "tag": job_kwargs.get("tag"),
-                    "status": status,
-                },
-            )
 
     for cfg in config_list:
         for job in cfg["job_list"]:
@@ -2500,14 +2527,22 @@ def main():
                 )
                 job[output_key] = output_path_timestamped
                 output_path_list.append(output_path_timestamped)
-            job["task_graph"] = task_graph
+            job["task_graph"] = None
             output_label = ", ".join(
                 str(output_path) for output_path in output_path_list
             )
             job_run_list.append((output_label, job))
 
     total_job_count = len(job_run_list)
-    progress_manager = multiprocessing.Manager()
+    if total_job_count == 0:
+        logger.info("No jobs to run")
+        return
+
+    cpu_count = os.cpu_count() or 1
+    max_workers = args.max_workers or max(1, min(4, cpu_count // 2))
+    max_workers = max(1, min(max_workers, total_job_count))
+    process_context = multiprocessing.get_context("spawn")
+    progress_manager = process_context.Manager()
     progress_queue = progress_manager.Queue()
     progress_thread = Thread(
         target=_progress_monitor,
@@ -2517,31 +2552,58 @@ def main():
     progress_thread.start()
 
     try:
-        for output_label, job in job_run_list:
-            job["progress_queue"] = progress_queue
-            thread = Thread(
-                target=_run_zonal_stats_job_thread,
-                args=(output_label, job),
-            )
-            thread.start()
-            thread_list.append((output_label, thread))
+        logger.debug(
+            "running %d jobs with %d worker process(es)",
+            total_job_count,
+            max_workers,
+        )
+        future_to_job = {}
+        job_error_list = []
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            mp_context=process_context,
+        ) as executor:
+            for output_label, job in job_run_list:
+                job = dict(job)
+                job["progress_queue"] = progress_queue
+                future = executor.submit(
+                    _run_zonal_stats_job_process,
+                    output_label,
+                    job,
+                    log_level,
+                )
+                future_to_job[future] = (output_label, job["tag"])
 
-        logger.debug(f"******** running {total_job_count} jobs")
+            for future in as_completed(future_to_job):
+                output_label, tag = future_to_job[future]
+                status = "done"
+                try:
+                    result = future.result()
+                    _AREA_HECTARE_ASSUMPTIONS.update(
+                        result["area_hectare_assumptions"]
+                    )
+                    _MEASURE_CRS_ASSUMPTIONS.update(
+                        result["measure_crs_assumptions"]
+                    )
+                    logger.debug("%s is complete", output_label)
+                except Exception as error:
+                    status = "failed"
+                    logger.exception("job failed for output %s", output_label)
+                    job_error_list.append((output_label, error))
+                finally:
+                    progress_queue.put(
+                        {
+                            "event": "job_done",
+                            "tag": tag,
+                            "status": status,
+                        },
+                    )
 
-        for output_label, thread in thread_list:
-            thread.join()
-            if not any(error_path == output_label for error_path, _ in thread_error_list):
-                logger.debug(f"********* {output_label} is complete!")
-
-        if thread_error_list:
-            task_graph.close()
-            failed_outputs = ", ".join(str(path) for path, _ in thread_error_list)
+        if job_error_list:
+            failed_outputs = ", ".join(str(path) for path, _ in job_error_list)
             raise RuntimeError(f"zonal statistics jobs failed: {failed_outputs}") from (
-                thread_error_list[0][1]
+                job_error_list[0][1]
             )
-
-        task_graph.join()
-        task_graph.close()
     finally:
         progress_queue.put({"event": "stop"})
         progress_thread.join()
