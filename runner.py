@@ -1515,6 +1515,7 @@ def _linear_units_to_meters(crs):
 
 
 def _select_measure_crs(agg_gdf, measure_gdf, measure_crs, operation, tag):
+    """Choose the projected CRS used for vector intersection measurements."""
     agg_crs = CRS.from_user_input(agg_gdf.crs) if agg_gdf.crs else None
     base_crs = CRS.from_user_input(measure_gdf.crs) if measure_gdf.crs else None
     if agg_crs is None or base_crs is None:
