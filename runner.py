@@ -20,15 +20,17 @@ from datasketches import kll_floats_sketch
 from ecoshard import taskgraph, geoprocessing
 from osgeo import gdal, ogr, osr
 from pyproj import CRS, Geod, Transformer
+from shapely.geometry import MultiPolygon, Polygon
 from shapely.strtree import STRtree
 import pandas as pd
 import fiona
 import numpy as np
 import geopandas as gpd
 
-logging.getLogger("ecoshard").setLevel(logging.INFO)
+logging.getLogger("ecoshard").setLevel(logging.WARNING)
 logging.getLogger("fiona").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+_GDAL_ERROR_HANDLER_INSTALLED = False
 
 
 AREA_HECTARE_OPERATIONS = {
@@ -53,6 +55,60 @@ VALID_OPERATIONS = {
     "total_count",
     "valid_count",
 }
+
+
+class _TqdmLoggingHandler(logging.StreamHandler):
+    """Logging handler that does not overwrite active tqdm bars."""
+
+    def emit(self, record):
+        """Emit a formatted log record through tqdm.write.
+
+        Args:
+            record: Log record to format and write.
+        """
+        try:
+            tqdm.write(self.format(record))
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+
+def _gdal_error_handler(error_class, error_number, message):
+    """Route GDAL messages through Python logging instead of raw stderr.
+
+    Args:
+        error_class: GDAL error severity class.
+        error_number: GDAL error code.
+        message: GDAL message text.
+    """
+    if error_class >= gdal.CE_Failure:
+        logger.error("GDAL error %s: %s", error_number, message)
+    else:
+        logger.debug("GDAL warning %s: %s", error_number, message)
+
+
+def _configure_logging(level):
+    """Configure console logging for tqdm-based runner output.
+
+    Args:
+        level: Numeric logging level for the root logger.
+    """
+    handler = _TqdmLoggingHandler()
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d: %(message)s"
+        )
+    )
+    global _GDAL_ERROR_HANDLER_INSTALLED
+    root_logger = logging.getLogger()
+    root_logger.handlers[:] = [handler]
+    root_logger.setLevel(level)
+    logging.captureWarnings(True)
+    if not _GDAL_ERROR_HANDLER_INSTALLED:
+        gdal.PushErrorHandler(_gdal_error_handler)
+        _GDAL_ERROR_HANDLER_INSTALLED = True
+    for logger_name in ("ecoshard", "fiona", "geopandas", "pyogrio", "rasterio"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 def _progress_monitor(progress_queue, total_jobs):
@@ -249,6 +305,21 @@ def _safe_path_stem(path, max_length=60):
     return (safe_stem or "unnamed")[:max_length]
 
 
+def _promote_polygon_to_multipolygon(geometry):
+    """Promote single polygon geometries to multipolygon geometries.
+
+    Args:
+        geometry: Shapely geometry to normalize.
+
+    Returns:
+        A multipolygon when `geometry` is a non-empty polygon; otherwise the
+        original geometry.
+    """
+    if isinstance(geometry, Polygon) and not geometry.is_empty:
+        return MultiPolygon([geometry])
+    return geometry
+
+
 def _prepare_aggregate_vector_for_rasterization(
     aggregate_vector_path,
     aggregate_layer_name,
@@ -262,13 +333,13 @@ def _prepare_aggregate_vector_for_rasterization(
     target_vector_path.parent.mkdir(parents=True, exist_ok=True)
     target_vector_path.unlink(missing_ok=True)
 
-    vector_translate_kwargs = {"format": "GPKG"}
+    vector_translate_kwargs = {"format": "GPKG", "geometryType": "PROMOTE_TO_MULTI"}
     src_path = str(aggregate_vector_path)
     tmp_reprojected_path = None
     if needs_reproject:
         tmp_reprojected_path = target_vector_path.with_suffix(".reprojected.gpkg")
         tmp_reprojected_path.unlink(missing_ok=True)
-        logger.info(
+        logger.debug(
             "vector translate (reproject) start | output=%s | reproject=%s",
             tmp_reprojected_path,
             needs_reproject,
@@ -281,7 +352,7 @@ def _prepare_aggregate_vector_for_rasterization(
         )
         src_path = str(tmp_reprojected_path)
 
-    logger.info(
+    logger.debug(
         "vector translate (simplify) start | output=%s | simplifyTolerance=%s | reproject=%s",
         target_vector_path,
         simplify_tolerance,
@@ -321,7 +392,7 @@ def _prepare_aggregate_vector_for_rasterization(
     aggregate_layer = None
     aggregate_vector = None
 
-    logger.info("vector translate done | output=%s", target_vector_path)
+    logger.debug("vector translate done | output=%s", target_vector_path)
 
 
 def _rasterize_aggregate_fids(
@@ -339,7 +410,7 @@ def _rasterize_aggregate_fids(
     target_raster_path.parent.mkdir(parents=True, exist_ok=True)
     target_raster_path.unlink(missing_ok=True)
 
-    logger.info("creating agg fid raster: %s", target_raster_path)
+    logger.debug("creating agg fid raster: %s", target_raster_path)
     geoprocessing.new_raster_from_base(
         str(base_raster_path),
         str(target_raster_path),
@@ -366,7 +437,7 @@ def _rasterize_aggregate_fids(
         progress_start_value,
     )
     aggregate_layer.ResetReading()
-    logger.info("rasterize start")
+    logger.debug("rasterize start")
     error_code = gdal.RasterizeLayer(
         feature_id_raster_dataset,
         [1],
@@ -385,7 +456,7 @@ def _rasterize_aggregate_fids(
         raise RuntimeError(
             f"RasterizeLayer failed with error code {error_code} for {target_raster_path}"
         )
-    logger.info("rasterize done")
+    logger.debug("rasterize done")
 
 
 def _make_progress_callback(progress_queue, progress_id, phase, start_value=0):
@@ -820,7 +891,7 @@ def fast_zonal_statistics(
         },
     )
 
-    logger.info(
+    logger.debug(
         "fast_zonal_statistics start | raster=%s band=%s | vector=%s layer=%s "
         "fields=%s | ignore_nodata=%s | working_dir=%s clean=%s | "
         "percentiles=%s | calculate_area_ha=%s",
@@ -878,7 +949,7 @@ def fast_zonal_statistics(
     raster_pixel_width = abs(raster_info["pixel_size"][0])
     simplify_tolerance = raster_pixel_width * 0.5
 
-    logger.info(
+    logger.debug(
         "raster loaded | nodata=%s | pixel_size=%s | bbox=%s",
         raster_nodata,
         raster_info["pixel_size"],
@@ -893,7 +964,7 @@ def fast_zonal_statistics(
         raster_pixel_area_ha = _raster_pixel_area_ha(
             raster_path, raster_info, raster_srs
         )
-        logger.info("raster pixel area: %.12f ha", raster_pixel_area_ha)
+        logger.debug("raster pixel area: %.12f ha", raster_pixel_area_ha)
 
     source_vector = gdal.OpenEx(str(aggregate_vector_path), gdal.OF_VECTOR)
     source_layer = (
@@ -908,9 +979,9 @@ def fast_zonal_statistics(
         source_srs = source_srs.Clone()
         source_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
         needs_reproject = not source_srs.IsSame(raster_srs)
-        logger.info("vector SRS detected | needs_reproject=%s", needs_reproject)
+        logger.debug("vector SRS detected | needs_reproject=%s", needs_reproject)
     else:
-        logger.info("vector SRS missing/unknown | forcing reprojection to raster SRS")
+        logger.debug("vector SRS missing/unknown | forcing reprojection to raster SRS")
 
     source_layer = None
     source_vector = None
@@ -925,7 +996,7 @@ def fast_zonal_statistics(
     projected_vector_path = cache_working_dir / "projected_vector.gpkg"
     feature_id_raster_path = cache_working_dir / "agg_fid.tif"
     local_task_graph = taskgraph.TaskGraph(cache_working_dir / "taskgraph", 1, None)
-    logger.info("using zonal statistics cache dir: %s", cache_working_dir)
+    logger.debug("using zonal statistics cache dir: %s", cache_working_dir)
 
     def _raster_nodata_mask(value_array):
         finite_mask = np.isfinite(value_array)
@@ -965,7 +1036,7 @@ def fast_zonal_statistics(
             else aggregate_vector.GetLayer()
         )
 
-        logger.info(
+        logger.debug(
             "scanning vector for grouping field values: %s",
             aggregate_vector_field_label,
         )
@@ -987,7 +1058,7 @@ def fast_zonal_statistics(
             unique_group_values.add(group_value)
         aggregate_layer.ResetReading()
 
-        logger.info(
+        logger.debug(
             "vector scan done | features=%d | unique %s=%d",
             len(feature_id_set),
             aggregate_vector_field_label,
@@ -1005,7 +1076,7 @@ def fast_zonal_statistics(
 
         raster_bounding_box = raster_info["bounding_box"]
         vector_extent = aggregate_layer.GetExtent()
-        logger.info(
+        logger.debug(
             "extent check | raster_bbox=%s | vector_extent=%s",
             raster_bounding_box,
             vector_extent,
@@ -1032,7 +1103,7 @@ def fast_zonal_statistics(
                 group_value: dict(empty_group_stats_template)
                 for group_value in unique_group_values
             }
-            logger.info(
+            logger.debug(
                 "returning empty stats for %d groups (no intersection)",
                 len(unique_group_values),
             )
@@ -1047,17 +1118,17 @@ def fast_zonal_statistics(
             return grouped_stats
 
         raster_path_for_stats = raster_path
-        logger.info("opening raster for read: %s", raster_path_for_stats)
+        logger.debug("opening raster for read: %s", raster_path_for_stats)
         raster_dataset = gdal.OpenEx(raster_path_for_stats, gdal.OF_RASTER)
         raster_band = raster_dataset.GetRasterBand(raster_band_index)
-        logger.info(
+        logger.debug(
             "raster opened | size=%dx%d | band=%d",
             raster_band.XSize,
             raster_band.YSize,
             raster_band_index,
         )
 
-        logger.info(
+        logger.debug(
             "disjoint sets ready total_features=%d",
             len(feature_id_set),
         )
@@ -1123,7 +1194,7 @@ def fast_zonal_statistics(
                 largest_block=2**28,
             )
         )
-        logger.info(
+        logger.debug(
             "iterblocks prepared | blocks=%d",
             len(feature_id_raster_offsets),
         )
@@ -1142,7 +1213,7 @@ def fast_zonal_statistics(
         )
         feature_id_raster_band = feature_id_raster_dataset.GetRasterBand(1)
 
-        logger.info("gathering stats from raster blocks")
+        logger.debug("gathering stats from raster blocks")
         group_sketch = None
         if percentile_list:
             group_sketch = defaultdict(lambda: kll_floats_sketch(k=200))
@@ -1206,7 +1277,7 @@ def fast_zonal_statistics(
                     feature_values * feature_values, dtype=np.float64
                 )
 
-        logger.info("aggregating done")
+        logger.debug("aggregating done")
         progress_n += len(feature_id_raster_offsets)
         progress_queue.put(
             {
@@ -1224,7 +1295,7 @@ def fast_zonal_statistics(
         for missing_feature_id in remaining_unset_feature_ids:
             feature_stats_by_id[missing_feature_id]
 
-        logger.info(
+        logger.debug(
             "unset fid pass done | remaining_unset=%d | total_fids=%d",
             len(remaining_unset_feature_ids),
             len(feature_id_set),
@@ -1234,7 +1305,7 @@ def fast_zonal_statistics(
         raster_dataset = None
         aggregate_layer = None
 
-        logger.info("grouping fid stats -> %s values", aggregate_vector_field_label)
+        logger.debug("grouping fid stats -> %s values", aggregate_vector_field_label)
         grouped_stats = collections.defaultdict(
             lambda: dict(grouped_stats_working_template)
         )
@@ -1359,8 +1430,8 @@ def fast_zonal_statistics(
                 group_stats.get("stdev"),
                 sorted(group_stats.keys()),
             )
-        logger.info("grouping done | groups=%d", len(grouped_stats))
-        logger.info("fast_zonal_statistics done")
+        logger.debug("grouping done | groups=%d", len(grouped_stats))
+        logger.debug("fast_zonal_statistics done")
         progress_queue.put(
             {
                 "event": "analysis_close",
@@ -1372,7 +1443,7 @@ def fast_zonal_statistics(
     finally:
         local_task_graph.close()
         if clean_working_dir:
-            logger.info("cleaning zonal statistics cache dir: %s", cache_working_dir)
+            logger.debug("cleaning zonal statistics cache dir: %s", cache_working_dir)
             shutil.rmtree(cache_working_dir)
 
 
@@ -1426,7 +1497,7 @@ def run_vector_stats_job(
         raise ValueError(f"unexpected job type for run_vector_stats_job: {job_type}")
     agg_fields = agg_field
 
-    logger.info("parsing operations for tag=%s", tag)
+    logger.debug("parsing operations for tag=%s", tag)
     normalized_operations = [o.strip().lower() for o in operations if str(o).strip()]
     core_ops = []
     pct_list = []
@@ -1437,49 +1508,49 @@ def run_vector_stats_job(
             core_ops.append(operation)
     core_ops = list(dict.fromkeys(core_ops))
     pct_list = sorted(set(pct_list))
-    logger.info(
+    logger.debug(
         "operations parsed for tag=%s core_ops=%s pct_list=%s",
         tag,
         core_ops,
         pct_list,
     )
 
-    logger.info(
+    logger.debug(
         "reading agg vector for tag=%s path=%s layer=%s",
         tag,
         agg_vector,
         agg_layer,
     )
     agg_gdf = gpd.read_file(agg_vector, layer=agg_layer)
-    logger.info("agg vector read for tag=%s features=%d", tag, len(agg_gdf))
+    logger.debug("agg vector read for tag=%s features=%d", tag, len(agg_gdf))
 
     agg_crs = CRS.from_user_input(agg_gdf.crs) if agg_gdf.crs else None
-    logger.info("agg CRS for tag=%s crs=%s", tag, str(agg_crs) if agg_crs else None)
+    logger.debug("agg CRS for tag=%s crs=%s", tag, str(agg_crs) if agg_crs else None)
 
-    logger.info("dissolving agg features for tag=%s by=%s", tag, agg_fields)
+    logger.debug("dissolving agg features for tag=%s by=%s", tag, agg_fields)
     agg_groups = agg_gdf.dissolve(by=agg_fields)
-    logger.info("dissolve complete for tag=%s groups=%d", tag, len(agg_groups))
+    logger.debug("dissolve complete for tag=%s groups=%d", tag, len(agg_groups))
 
     group_geometries = list(agg_groups.geometry.values)
     group_keys = list(agg_groups.index)
     group_count = len(group_keys)
 
-    logger.info("building STRtree for tag=%s groups=%d", tag, group_count)
+    logger.debug("building STRtree for tag=%s groups=%d", tag, group_count)
     tree = STRtree(group_geometries)
-    logger.info("STRtree built for tag=%s", tag)
+    logger.debug("STRtree built for tag=%s", tag)
 
-    logger.info("building geometry-id index map for tag=%s groups=%d", tag, group_count)
+    logger.debug("building geometry-id index map for tag=%s groups=%d", tag, group_count)
     geom_id_to_idx = {
         id(geometry): index for index, geometry in enumerate(group_geometries)
     }
-    logger.info("geometry-id index map built for tag=%s", tag)
+    logger.debug("geometry-id index map built for tag=%s", tag)
 
     transformers_by_stem = {}
     assignments_by_stem = {}
     per_stem_frames = []
 
     chunk_size = 1_000
-    logger.info("chunk_size set for tag=%s chunk_size=%d", tag, chunk_size)
+    logger.debug("chunk_size set for tag=%s chunk_size=%d", tag, chunk_size)
 
     def _pct_to_suffix(percentile_value: float) -> str:
         return (
@@ -1940,7 +2011,7 @@ def run_vector_measure_job(
             "phase": "reading vectors",
         },
     )
-    logger.info(
+    logger.debug(
         "running vector measure job | tag=%s operation=%s base=%s layer=%s",
         tag,
         operation,
@@ -1977,7 +2048,7 @@ def run_vector_measure_job(
     result_table[column_name] = 0 if operation == "intersect_count" else 0.0
 
     if measure_gdf.empty:
-        logger.info("base measure vector has no non-empty geometries")
+        logger.debug("base measure vector has no non-empty geometries")
         progress_queue.put(
             {
                 "event": "analysis_close",
@@ -2125,6 +2196,10 @@ def _write_zonal_outputs(
         output_gdf = output_gdf.drop(columns=conflicting_columns)
 
     output_gdf = output_gdf.merge(result_table, on=agg_fields, how="left", sort=False)
+    geometry_types = set(output_gdf.geometry.geom_type.dropna())
+    if {"Polygon", "MultiPolygon"}.issubset(geometry_types):
+        output_gdf = output_gdf.copy()
+        output_gdf.geometry = output_gdf.geometry.apply(_promote_polygon_to_multipolygon)
     output_gpkg.unlink(missing_ok=True)
     output_gdf.to_file(output_gpkg, layer=agg_layer, driver="GPKG")
 
@@ -2345,10 +2420,15 @@ def main():
     parser.add_argument("--test", action="store_true")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d: %(message)s",
+    config_list = []
+    for config_path in args.configs:
+        config_list.append(parse_and_validate_config(Path(config_path)))
+
+    log_level = min(
+        getattr(logging, cfg["project"]["log_level"]) for cfg in config_list
     )
+    _configure_logging(log_level)
+
     task_graph = taskgraph.TaskGraph(Path.cwd(), os.cpu_count() // 2 + 1, None)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     thread_list = []
@@ -2372,12 +2452,9 @@ def main():
                 },
             )
 
-    for config_path in args.configs:
-        cfg_path = Path(config_path)
-        cfg = parse_and_validate_config(cfg_path)
-
+    for cfg in config_list:
         for job in cfg["job_list"]:
-            logger.info(
+            logger.debug(
                 "Validated job:%s (operations=%s)",
                 job["tag"],
                 ",".join(job["operations"]),
@@ -2418,12 +2495,12 @@ def main():
             thread.start()
             thread_list.append((output_label, thread))
 
-        logger.info(f"******** running {total_job_count} jobs")
+        logger.debug(f"******** running {total_job_count} jobs")
 
         for output_label, thread in thread_list:
             thread.join()
             if not any(error_path == output_label for error_path, _ in thread_error_list):
-                logger.info(f"********* {output_label} is complete!")
+                logger.debug(f"********* {output_label} is complete!")
 
         if thread_error_list:
             task_graph.close()
