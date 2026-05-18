@@ -1581,6 +1581,7 @@ def _select_measure_crs(agg_gdf, measure_gdf, measure_crs, operation, tag):
 
 
 def _validate_measure_geometry(measure_gdf, operation, vector_path):
+    """Validate that measure vector geometry types match the operation."""
     geometry_types = set(
         measure_gdf.geometry.dropna().geom_type.str.replace("3D ", "", regex=False)
     )
