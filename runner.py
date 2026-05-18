@@ -9,7 +9,9 @@ import argparse
 import configparser
 import glob
 import logging
+import multiprocessing
 import os
+import queue
 import shutil
 import tempfile
 import time
@@ -30,7 +32,6 @@ logging.getLogger("fiona").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
-_LOGGING_PERIOD = 10.0
 AREA_HECTARE_OPERATIONS = {
     "area_ha_total",
     "area_ha_valid",
@@ -53,6 +54,116 @@ VALID_OPERATIONS = {
     "total_count",
     "valid_count",
 }
+
+
+def _emit_progress(progress_queue, event):
+    """Send a progress event if a queue is configured.
+
+    Args:
+        progress_queue: Queue-like object receiving progress events, or `None`.
+        event: Pickleable event dictionary for the progress monitor.
+    """
+    if progress_queue is None:
+        return
+    try:
+        progress_queue.put(event)
+    except Exception:
+        logger.exception("failed to emit progress event: %s", event)
+
+
+def _progress_monitor(progress_queue, total_jobs):
+    """Render runner progress events as tqdm bars.
+
+    Args:
+        progress_queue: Queue-like object receiving progress event dictionaries.
+        total_jobs: Number of `[job:...]` sections expected to finish.
+    """
+    bars = {}
+    next_position = 1
+    job_bar = tqdm(
+        total=total_jobs,
+        desc="jobs",
+        unit="job",
+        position=0,
+        leave=True,
+    )
+
+    try:
+        while True:
+            try:
+                event = progress_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            event_type = event.get("event")
+            if event_type == "stop":
+                break
+
+            if event_type == "job_done":
+                job_bar.update(1)
+                job_bar.set_postfix_str(
+                    f'{event.get("tag", "job")} {event.get("status", "done")}',
+                    refresh=True,
+                )
+                continue
+
+            progress_id = event.get("id")
+            if not progress_id:
+                continue
+
+            if event_type == "analysis_start":
+                if progress_id in bars:
+                    bars[progress_id].close()
+                bars[progress_id] = tqdm(
+                    total=event.get("total", 1),
+                    desc=event.get("desc", progress_id),
+                    unit=event.get("unit", "step"),
+                    position=next_position,
+                    leave=True,
+                )
+                next_position += 1
+                phase = event.get("phase")
+                if phase:
+                    bars[progress_id].set_postfix_str(phase, refresh=True)
+                continue
+
+            progress_bar = bars.get(progress_id)
+            if progress_bar is None:
+                continue
+
+            if event_type == "analysis_total":
+                progress_bar.total = event.get("total", progress_bar.total)
+                progress_bar.unit = event.get("unit", progress_bar.unit)
+                phase = event.get("phase")
+                if phase:
+                    progress_bar.set_postfix_str(phase, refresh=True)
+                progress_bar.refresh()
+                continue
+
+            if event_type == "analysis_update":
+                increment = event.get("increment", 1)
+                if increment:
+                    progress_bar.update(increment)
+                phase = event.get("phase")
+                if phase:
+                    progress_bar.set_postfix_str(phase, refresh=True)
+                continue
+
+            if event_type == "analysis_close":
+                phase = event.get("phase")
+                if phase:
+                    progress_bar.set_postfix_str(phase, refresh=True)
+                if (
+                    progress_bar.total is not None
+                    and progress_bar.n < progress_bar.total
+                ):
+                    progress_bar.update(progress_bar.total - progress_bar.n)
+                progress_bar.close()
+                continue
+    finally:
+        for progress_bar in bars.values():
+            progress_bar.close()
+        job_bar.close()
 
 
 def _record_area_hectare_assumption(message):
@@ -703,10 +814,28 @@ def fast_zonal_statistics(
     clean_working_dir=False,
     percentile_list=None,
     calculate_area_ha=False,
+    progress_queue=None,
+    progress_id=None,
 ):
     raster_path, raster_band_index = base_raster_path_band
     aggregate_vector_fields = aggregate_vector_field
     aggregate_vector_field_label = ",".join(aggregate_vector_fields)
+    progress_id = (
+        progress_id
+        or f"raster:{Path(raster_path).stem}:{Path(aggregate_vector_path).stem}"
+    )
+    progress_n = 0
+    _emit_progress(
+        progress_queue,
+        {
+            "event": "analysis_start",
+            "id": progress_id,
+            "desc": f"raster {Path(raster_path).stem}",
+            "total": 5,
+            "unit": "step",
+            "phase": "loading inputs",
+        },
+    )
 
     logger.info(
         "fast_zonal_statistics start | raster=%s band=%s | vector=%s layer=%s "
@@ -812,9 +941,7 @@ def fast_zonal_statistics(
     cache_working_dir.mkdir(parents=True, exist_ok=True)
     projected_vector_path = cache_working_dir / "projected_vector.gpkg"
     feature_id_raster_path = cache_working_dir / "agg_fid.tif"
-    local_task_graph = taskgraph.TaskGraph(
-        cache_working_dir / "taskgraph", 1, 15.0
-    )
+    local_task_graph = taskgraph.TaskGraph(cache_working_dir / "taskgraph", 1, None)
     logger.info("using zonal statistics cache dir: %s", cache_working_dir)
 
     def _raster_nodata_mask(value_array):
@@ -838,6 +965,16 @@ def fast_zonal_statistics(
             task_name=f"prepare aggregate vector for {Path(aggregate_vector_path).stem}",
         )
         prepare_vector_task.join()
+        progress_n += 1
+        _emit_progress(
+            progress_queue,
+            {
+                "event": "analysis_update",
+                "id": progress_id,
+                "increment": 1,
+                "phase": "scanning aggregation vector",
+            },
+        )
 
         aggregate_vector = gdal.OpenEx(str(projected_vector_path), gdal.OF_VECTOR)
         aggregate_layer = (
@@ -874,6 +1011,16 @@ def fast_zonal_statistics(
             aggregate_vector_field_label,
             len(unique_group_values),
         )
+        progress_n += 1
+        _emit_progress(
+            progress_queue,
+            {
+                "event": "analysis_update",
+                "id": progress_id,
+                "increment": 1,
+                "phase": "checking extents",
+            },
+        )
 
         raster_bounding_box = raster_info["bounding_box"]
         vector_extent = aggregate_layer.GetExtent()
@@ -909,6 +1056,14 @@ def fast_zonal_statistics(
                 len(unique_group_values),
             )
             aggregate_layer = None
+            _emit_progress(
+                progress_queue,
+                {
+                    "event": "analysis_close",
+                    "id": progress_id,
+                    "phase": "no intersection",
+                },
+            )
             return grouped_stats
 
         raster_path_for_stats = raster_path
@@ -949,6 +1104,16 @@ def fast_zonal_statistics(
             task_name=f"rasterize aggregate fids for {Path(raster_path).stem}",
         )
         rasterize_task.join()
+        progress_n += 1
+        _emit_progress(
+            progress_queue,
+            {
+                "event": "analysis_update",
+                "id": progress_id,
+                "increment": 1,
+                "phase": "preparing raster blocks",
+            },
+        )
 
         feature_id_raster_offsets = list(
             geoprocessing.iterblocks(
@@ -961,6 +1126,16 @@ def fast_zonal_statistics(
             "iterblocks prepared | blocks=%d",
             len(feature_id_raster_offsets),
         )
+        _emit_progress(
+            progress_queue,
+            {
+                "event": "analysis_total",
+                "id": progress_id,
+                "total": progress_n + len(feature_id_raster_offsets) + 2,
+                "unit": "block",
+                "phase": "processing raster blocks",
+            },
+        )
 
         feature_id_raster_dataset = gdal.OpenEx(
             str(feature_id_raster_path), gdal.OF_RASTER
@@ -968,22 +1143,21 @@ def fast_zonal_statistics(
         feature_id_raster_band = feature_id_raster_dataset.GetRasterBand(1)
 
         logger.info("gathering stats from raster blocks")
-        block_log_time = time.time()
         group_sketch = None
         if percentile_list:
             group_sketch = defaultdict(lambda: kll_floats_sketch(k=200))
         for block_index, feature_id_offset in enumerate(feature_id_raster_offsets):
-            block_log_time = _invoke_timed_callback(
-                block_log_time,
-                lambda block_index_value=block_index: logger.info(
-                    "block processing | %.1f%% (%d/%d blocks)",
-                    100.0
-                    * float(block_index_value + 1)
-                    / len(feature_id_raster_offsets),
-                    block_index_value + 1,
-                    len(feature_id_raster_offsets),
-                ),
-                _LOGGING_PERIOD,
+            _emit_progress(
+                progress_queue,
+                {
+                    "event": "analysis_update",
+                    "id": progress_id,
+                    "increment": 1,
+                    "phase": (
+                        f"processing raster blocks {block_index + 1}/"
+                        f"{len(feature_id_raster_offsets)}"
+                    ),
+                },
             )
 
             feature_id_block = feature_id_raster_band.ReadAsArray(**feature_id_offset)
@@ -1034,6 +1208,16 @@ def fast_zonal_statistics(
                 )
 
         logger.info("aggregating done")
+        progress_n += len(feature_id_raster_offsets)
+        _emit_progress(
+            progress_queue,
+            {
+                "event": "analysis_update",
+                "id": progress_id,
+                "increment": 1,
+                "phase": "grouping feature statistics",
+            },
+        )
 
         feature_id_raster_band = None
         feature_id_raster_dataset = None
@@ -1179,6 +1363,14 @@ def fast_zonal_statistics(
             )
         logger.info("grouping done | groups=%d", len(grouped_stats))
         logger.info("fast_zonal_statistics done")
+        _emit_progress(
+            progress_queue,
+            {
+                "event": "analysis_close",
+                "id": progress_id,
+                "phase": "done",
+            },
+        )
         return dict(grouped_stats)
     finally:
         local_task_graph.close()
@@ -1198,6 +1390,7 @@ def run_vector_stats_job(
     workdir: Path,
     tag: str,
     job_type: str,
+    progress_queue=None,
 ):
     """Run a vector-based statistics job and write aggregated results to CSV.
 
@@ -1226,6 +1419,7 @@ def run_vector_stats_job(
         workdir: Working directory for intermediate job artifacts.
         tag: Job identifier used for logging and column name suffixes.
         job_type: Job type string; must be `"vector"`.
+        progress_queue: Optional queue for progress monitor events.
 
     Raises:
         ValueError: If `job_type` is not `"vector"` or if operation parsing fails.
@@ -1300,6 +1494,18 @@ def run_vector_stats_job(
     for base_vector_path in base_vector_path_list:
         base_vector_path = Path(base_vector_path)
         stem = base_vector_path.stem
+        progress_id = f"vector:{tag}:{stem}"
+        _emit_progress(
+            progress_queue,
+            {
+                "event": "analysis_start",
+                "id": progress_id,
+                "desc": f"vector {tag}:{stem}",
+                "total": 3,
+                "unit": "step",
+                "phase": "reading vector",
+            },
+        )
 
         base_gdf = gpd.read_file(base_vector_path)
         keep_cols = [c for c in base_vector_fields if c in base_gdf.columns]
@@ -1313,6 +1519,15 @@ def run_vector_stats_job(
             base_gdf = base_gdf.to_crs(agg_crs)
 
         transformers_by_stem[stem] = transformer
+        _emit_progress(
+            progress_queue,
+            {
+                "event": "analysis_update",
+                "id": progress_id,
+                "increment": 1,
+                "phase": "preparing nearest-neighbor chunks",
+            },
+        )
 
         feature_ids_all = base_gdf.index.to_numpy()
         geometries_all = base_gdf.geometry.values
@@ -1340,13 +1555,33 @@ def run_vector_stats_job(
             )
             for start_index in range(0, feature_count, chunk_size)
         ]
+        _emit_progress(
+            progress_queue,
+            {
+                "event": "analysis_total",
+                "id": progress_id,
+                "total": len(nearest_tasks) + 2,
+                "unit": "chunk",
+                "phase": "finding closest aggregation geometry",
+            },
+        )
 
         with ThreadPoolExecutor() as executor:
-            for start_index, nearest_chunk in tqdm(
+            for chunk_index, (start_index, nearest_chunk) in enumerate(
                 executor.map(_nearest_chunk_thread, nearest_tasks, chunksize=1),
-                total=len(nearest_tasks),
-                desc=f"finding closest geom: {stem}",
             ):
+                _emit_progress(
+                    progress_queue,
+                    {
+                        "event": "analysis_update",
+                        "id": progress_id,
+                        "increment": 1,
+                        "phase": (
+                            f"finding closest aggregation geometry "
+                            f"{chunk_index + 1}/{len(nearest_tasks)}"
+                        ),
+                    },
+                )
                 nearest_group_index[
                     start_index : start_index + len(nearest_chunk)
                 ] = nearest_chunk
@@ -1363,6 +1598,15 @@ def run_vector_stats_job(
         }
 
         stem_frame = pd.DataFrame(group_keys, columns=agg_fields)
+        _emit_progress(
+            progress_queue,
+            {
+                "event": "analysis_update",
+                "id": progress_id,
+                "increment": 0,
+                "phase": "summarizing vector attributes",
+            },
+        )
 
         if "total_count" in core_ops:
             stem_frame[f"total_count_{stem}"] = np.bincount(
@@ -1468,6 +1712,14 @@ def run_vector_stats_job(
                         stem_frame[column_name] = out
 
         per_stem_frames.append(stem_frame)
+        _emit_progress(
+            progress_queue,
+            {
+                "event": "analysis_close",
+                "id": progress_id,
+                "phase": "done",
+            },
+        )
 
     if per_stem_frames:
         result_table = per_stem_frames[0]
@@ -1667,6 +1919,7 @@ def run_vector_measure_job(
     operation,
     measure_crs,
     tag,
+    progress_queue=None,
 ):
     """Run a vector-on-vector intersection measure job.
 
@@ -1680,10 +1933,23 @@ def run_vector_measure_job(
             `intersect_count`.
         measure_crs: CRS for planar measurement, or `auto`.
         tag: Job tag used in log and error messages.
+        progress_queue: Optional queue for progress monitor events.
 
     Returns:
         DataFrame containing aggregation fields and one measure column.
     """
+    progress_id = f"measure:{tag}:{Path(base_measure_vector).stem}"
+    _emit_progress(
+        progress_queue,
+        {
+            "event": "analysis_start",
+            "id": progress_id,
+            "desc": f"measure {tag}:{Path(base_measure_vector).stem}",
+            "total": 6,
+            "unit": "step",
+            "phase": "reading vectors",
+        },
+    )
     logger.info(
         "running vector measure job | tag=%s operation=%s base=%s layer=%s",
         tag,
@@ -1693,11 +1959,29 @@ def run_vector_measure_job(
     )
     agg_gdf = gpd.read_file(agg_vector, layer=agg_layer)
     measure_gdf = gpd.read_file(base_measure_vector, layer=base_measure_layer)
+    _emit_progress(
+        progress_queue,
+        {
+            "event": "analysis_update",
+            "id": progress_id,
+            "increment": 1,
+            "phase": "validating measure geometry",
+        },
+    )
     measure_gdf = measure_gdf[
         measure_gdf.geometry.notna() & (~measure_gdf.geometry.is_empty)
     ].copy()
     _validate_measure_geometry(measure_gdf, operation, base_measure_vector)
 
+    _emit_progress(
+        progress_queue,
+        {
+            "event": "analysis_update",
+            "id": progress_id,
+            "increment": 1,
+            "phase": "dissolving aggregation vector",
+        },
+    )
     agg_groups = agg_gdf.dissolve(by=agg_fields, as_index=False)
     agg_groups = agg_groups[agg_fields + ["geometry"]]
     column_name = f"{operation}_{Path(base_measure_vector).stem}"
@@ -1706,14 +1990,40 @@ def run_vector_measure_job(
 
     if measure_gdf.empty:
         logger.info("base measure vector has no non-empty geometries")
+        _emit_progress(
+            progress_queue,
+            {
+                "event": "analysis_close",
+                "id": progress_id,
+                "phase": "no measure geometries",
+            },
+        )
         return result_table
 
     target_crs = _select_measure_crs(
         agg_groups, measure_gdf, measure_crs, operation, tag
     )
+    _emit_progress(
+        progress_queue,
+        {
+            "event": "analysis_update",
+            "id": progress_id,
+            "increment": 1,
+            "phase": "projecting vectors",
+        },
+    )
     agg_projected = agg_groups.to_crs(target_crs)
     measure_projected = measure_gdf[["geometry"]].to_crs(target_crs)
     measure_projected = measure_projected.explode(index_parts=False)
+    _emit_progress(
+        progress_queue,
+        {
+            "event": "analysis_update",
+            "id": progress_id,
+            "increment": 1,
+            "phase": "intersecting vectors",
+        },
+    )
 
     if operation == "intersect_count":
         joined = gpd.sjoin(
@@ -1723,6 +2033,14 @@ def run_vector_measure_job(
             predicate="intersects",
         )
         if joined.empty:
+            _emit_progress(
+                progress_queue,
+                {
+                    "event": "analysis_close",
+                    "id": progress_id,
+                    "phase": "no intersections",
+                },
+            )
             return result_table
         measured = (
             joined.groupby(agg_fields, dropna=False)
@@ -1738,6 +2056,14 @@ def run_vector_measure_job(
             keep_geom_type=False,
         )
         if intersection_gdf.empty:
+            _emit_progress(
+                progress_queue,
+                {
+                    "event": "analysis_close",
+                    "id": progress_id,
+                    "phase": "no intersections",
+                },
+            )
             return result_table
         linear_units_to_meters = _linear_units_to_meters(target_crs)
         if operation == "intersect_area_ha":
@@ -1756,6 +2082,15 @@ def run_vector_measure_job(
             .sum()
             .reset_index()
         )
+    _emit_progress(
+        progress_queue,
+        {
+            "event": "analysis_update",
+            "id": progress_id,
+            "increment": 1,
+            "phase": "merging measure results",
+        },
+    )
 
     result_table = result_table.drop(columns=[column_name]).merge(
         measured, on=agg_fields, how="left", sort=False
@@ -1763,6 +2098,14 @@ def run_vector_measure_job(
     result_table[column_name] = result_table[column_name].fillna(0)
     if operation == "intersect_count":
         result_table[column_name] = result_table[column_name].astype(np.int64)
+    _emit_progress(
+        progress_queue,
+        {
+            "event": "analysis_close",
+            "id": progress_id,
+            "phase": "done",
+        },
+    )
     return result_table
 
 
@@ -1821,6 +2164,7 @@ def run_zonal_stats_job(
     workdir: Path,
     tag: str,
     task_graph,
+    progress_queue=None,
 ):
     """Run a zonal statistics job over raster and/or vector base datasets.
 
@@ -1852,6 +2196,7 @@ def run_zonal_stats_job(
         workdir: Working directory for intermediate files and task graph outputs.
         tag: Job identifier used for temporary filenames and task labeling.
         task_graph: Task graph instance used to schedule raster and vector jobs.
+        progress_queue: Optional queue for progress monitor events.
 
     Raises:
         ValueError: If operation parsing fails or required inputs are inconsistent.
@@ -1883,6 +2228,7 @@ def run_zonal_stats_job(
             operation=core_ops[0],
             measure_crs=measure_crs,
             tag=tag,
+            progress_queue=progress_queue,
         )
         _write_zonal_outputs(
             combined_dataframe,
@@ -1912,6 +2258,8 @@ def run_zonal_stats_job(
                     "calculate_area_ha": bool(
                         AREA_HECTARE_OPERATIONS.intersection(core_ops)
                     ),
+                    "progress_queue": progress_queue,
+                    "progress_id": f"raster:{tag}:{base_raster_path.stem}",
                 },
                 store_result=True,
                 task_name=(
@@ -1941,6 +2289,7 @@ def run_zonal_stats_job(
                 "workdir": workdir,
                 "tag": tag,
                 "job_type": "vector",
+                "progress_queue": progress_queue,
             },
             task_name=f"vector stats for {tag}",
             target_path_list=[vector_tmp_csv],
@@ -2000,32 +2349,6 @@ def run_zonal_stats_job(
     )
 
 
-def _invoke_timed_callback(reference_time, callback_lambda, callback_period):
-    """Invoke callback if a certain amount of time has passed.
-
-    This is a convenience function to standardize update callbacks from the
-    module.
-
-    Args:
-        reference_time (float): time to base ``callback_period`` length from.
-        callback_lambda (lambda): function to invoke if difference between
-            current time and ``reference_time`` has exceeded
-            ``callback_period``.
-        callback_period (float): time in seconds to pass until
-            ``callback_lambda`` is invoked.
-
-    Return:
-        ``reference_time`` if ``callback_lambda`` not invoked, otherwise the
-        time when ``callback_lambda`` was invoked.
-
-    """
-    current_time = time.time()
-    if current_time - reference_time > callback_period:
-        callback_lambda()
-        return current_time
-    return reference_time
-
-
 def main():
     """CLI entrypoint for validating zonal-stats runner configurations.
 
@@ -2045,18 +2368,29 @@ def main():
         level=logging.DEBUG,
         format="%(asctime)s %(levelname)s %(name)s %(filename)s:%(lineno)d: %(message)s",
     )
-    task_graph = taskgraph.TaskGraph(Path.cwd(), os.cpu_count() // 2 + 1, 15.0)
+    task_graph = taskgraph.TaskGraph(Path.cwd(), os.cpu_count() // 2 + 1, None)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     thread_list = []
     thread_error_list = []
-    total_job_count = 0
+    job_run_list = []
 
     def _run_zonal_stats_job_thread(output_label, job_kwargs):
+        status = "done"
         try:
             run_zonal_stats_job(**job_kwargs)
         except Exception as error:
+            status = "failed"
             logger.exception("job failed for output %s", output_label)
             thread_error_list.append((output_label, error))
+        finally:
+            _emit_progress(
+                job_kwargs.get("progress_queue"),
+                {
+                    "event": "job_done",
+                    "tag": job_kwargs.get("tag"),
+                    "status": status,
+                },
+            )
 
     for config_path in args.configs:
         cfg_path = Path(config_path)
@@ -2082,30 +2416,48 @@ def main():
             output_label = ", ".join(
                 str(output_path) for output_path in output_path_list
             )
+            job_run_list.append((output_label, job))
 
+    total_job_count = len(job_run_list)
+    progress_manager = multiprocessing.Manager()
+    progress_queue = progress_manager.Queue()
+    progress_thread = Thread(
+        target=_progress_monitor,
+        args=(progress_queue, total_job_count),
+        daemon=True,
+    )
+    progress_thread.start()
+
+    try:
+        for output_label, job in job_run_list:
+            job["progress_queue"] = progress_queue
             thread = Thread(
                 target=_run_zonal_stats_job_thread,
                 args=(output_label, job),
             )
             thread.start()
             thread_list.append((output_label, thread))
-            total_job_count += 1
-    logger.info(f"******** running {total_job_count} jobs")
 
-    for output_label, thread in thread_list:
-        thread.join()
-        if not any(error_path == output_label for error_path, _ in thread_error_list):
-            logger.info(f"********* {output_label} is complete!")
+        logger.info(f"******** running {total_job_count} jobs")
 
-    if thread_error_list:
+        for output_label, thread in thread_list:
+            thread.join()
+            if not any(error_path == output_label for error_path, _ in thread_error_list):
+                logger.info(f"********* {output_label} is complete!")
+
+        if thread_error_list:
+            task_graph.close()
+            failed_outputs = ", ".join(str(path) for path, _ in thread_error_list)
+            raise RuntimeError(f"zonal statistics jobs failed: {failed_outputs}") from (
+                thread_error_list[0][1]
+            )
+
+        task_graph.join()
         task_graph.close()
-        failed_outputs = ", ".join(str(path) for path, _ in thread_error_list)
-        raise RuntimeError(f"zonal statistics jobs failed: {failed_outputs}") from (
-            thread_error_list[0][1]
-        )
-
-    task_graph.join()
-    task_graph.close()
+    finally:
+        _emit_progress(progress_queue, {"event": "stop"})
+        progress_thread.join()
+        progress_manager.shutdown()
 
     logging.getLogger(__name__).info("All %d jobs done", total_job_count)
     _log_area_hectare_assumptions()
