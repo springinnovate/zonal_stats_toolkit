@@ -1491,11 +1491,6 @@ def run_vector_stats_job(
     result_table.to_csv(output_csv, index=False)
 
 
-def _crs_label(crs):
-    authority = crs.to_authority()
-    return f"{authority[0]}:{authority[1]}" if authority else crs.to_string()
-
-
 def _bounds_to_wgs84(bounds, source_crs):
     transformer = Transformer.from_crs(source_crs, CRS.from_epsg(4326), always_xy=True)
     min_x, min_y, max_x, max_y = bounds
@@ -1535,9 +1530,13 @@ def _select_measure_crs(agg_gdf, measure_gdf, measure_crs, operation, tag):
         return target_crs
 
     if agg_crs == base_crs and agg_crs.is_projected:
+        authority = agg_crs.to_authority()
+        crs_label = (
+            f"{authority[0]}:{authority[1]}" if authority else agg_crs.to_string()
+        )
         _MEASURE_CRS_ASSUMPTIONS.add(
             f"[job:{tag}] measure_crs=auto used shared projected CRS "
-            f"{_crs_label(agg_crs)}."
+            f"{crs_label}."
         )
         return agg_crs
 
@@ -1567,9 +1566,13 @@ def _select_measure_crs(agg_gdf, measure_gdf, measure_crs, operation, tag):
             "using global equal-area EPSG:6933"
         )
 
+    authority = target_crs.to_authority()
+    crs_label = (
+        f"{authority[0]}:{authority[1]}" if authority else target_crs.to_string()
+    )
     _MEASURE_CRS_ASSUMPTIONS.add(
-        f"[job:{tag}] measure_crs=auto selected {_crs_label(target_crs)} for "
-        f"{operation}; {reason}."
+        f"[job:{tag}] measure_crs=auto selected {crs_label} for {operation}; "
+        f"{reason}."
     )
     return target_crs
 
