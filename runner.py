@@ -31,6 +31,8 @@ logging.getLogger("ecoshard").setLevel(logging.WARNING)
 logging.getLogger("fiona").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 _GDAL_ERROR_HANDLER_INSTALLED = False
+_GDAL_CACHE_MAX_BYTES = 512 * 1024**2
+_BYTES_PER_MIB = 1024**2
 
 
 AREA_HECTARE_OPERATIONS = {
@@ -109,6 +111,32 @@ def _configure_logging(level):
         _GDAL_ERROR_HANDLER_INSTALLED = True
     for logger_name in ("ecoshard", "fiona", "geopandas", "pyogrio", "rasterio"):
         logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+
+def _configure_gdal_cache(max_cache_bytes=_GDAL_CACHE_MAX_BYTES):
+    """Cap GDAL's process-wide block cache for chunked zonal stats reads.
+
+    Zonal stats reads raster blocks explicitly, so a very large GDAL block cache
+    mostly adds memory pressure when many jobs run concurrently. This only
+    lowers oversized cache settings and never increases a smaller existing cap.
+
+    Args:
+        max_cache_bytes: Maximum GDAL block cache size in bytes.
+    """
+    current_cache_bytes = gdal.GetCacheMax()
+    if current_cache_bytes > max_cache_bytes:
+        gdal.SetCacheMax(max_cache_bytes)
+        logger.debug(
+            "Capped GDAL block cache from %.1f MiB to %.1f MiB",
+            current_cache_bytes / _BYTES_PER_MIB,
+            max_cache_bytes / _BYTES_PER_MIB,
+        )
+    else:
+        logger.debug(
+            "GDAL block cache is %.1f MiB; cap is %.1f MiB, no change needed",
+            current_cache_bytes / _BYTES_PER_MIB,
+            max_cache_bytes / _BYTES_PER_MIB,
+        )
 
 
 def _progress_monitor(progress_queue, total_jobs):
@@ -2430,6 +2458,7 @@ def main():
         getattr(logging, cfg["project"]["log_level"]) for cfg in config_list
     )
     _configure_logging(log_level)
+    _configure_gdal_cache()
 
     task_graph = taskgraph.TaskGraph(Path.cwd(), os.cpu_count() // 2 + 1, None)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
