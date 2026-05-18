@@ -14,7 +14,6 @@ import os
 import queue
 import shutil
 import tempfile
-import time
 
 from tqdm import tqdm
 from datasketches import kll_floats_sketch
@@ -57,18 +56,13 @@ VALID_OPERATIONS = {
 
 
 def _emit_progress(progress_queue, event):
-    """Send a progress event if a queue is configured.
+    """Send a progress event to the monitor.
 
     Args:
-        progress_queue: Queue-like object receiving progress events, or `None`.
+        progress_queue: Queue-like object receiving progress events.
         event: Pickleable event dictionary for the progress monitor.
     """
-    if progress_queue is None:
-        return
-    try:
-        progress_queue.put(event)
-    except Exception:
-        logger.exception("failed to emit progress event: %s", event)
+    progress_queue.put(event)
 
 
 def _progress_monitor(progress_queue, total_jobs):
@@ -144,6 +138,15 @@ def _progress_monitor(progress_queue, total_jobs):
                 increment = event.get("increment", 1)
                 if increment:
                     progress_bar.update(increment)
+                phase = event.get("phase")
+                if phase:
+                    progress_bar.set_postfix_str(phase, refresh=True)
+                continue
+
+            if event_type == "analysis_set":
+                value = event.get("value", progress_bar.n)
+                if value > progress_bar.n:
+                    progress_bar.update(value - progress_bar.n)
                 phase = event.get("phase")
                 if phase:
                     progress_bar.set_postfix_str(phase, refresh=True)
@@ -337,6 +340,9 @@ def _rasterize_aggregate_fids(
     aggregate_layer_name,
     target_raster_path,
     target_nodata,
+    progress_queue,
+    progress_id,
+    progress_start_value,
 ):
     """Rasterize prepared aggregation feature IDs onto the base raster grid."""
     target_raster_path = Path(target_raster_path)
@@ -363,8 +369,11 @@ def _rasterize_aggregate_fids(
     if feature_id_raster_dataset is None:
         raise RuntimeError(f"Could not open target raster at {target_raster_path}")
 
-    rasterize_callback = _make_logger_callback(
-        "rasterizing polygons %.1f%% complete %s"
+    rasterize_callback = _make_progress_callback(
+        progress_queue,
+        progress_id,
+        "rasterizing polygons",
+        progress_start_value,
     )
     aggregate_layer.ResetReading()
     logger.info("rasterize start")
@@ -389,50 +398,39 @@ def _rasterize_aggregate_fids(
     logger.info("rasterize done")
 
 
-def _make_logger_callback(message):
-    """Build a timed logger callback that prints ``message`` replaced.
+def _make_progress_callback(progress_queue, progress_id, phase, start_value=0):
+    """Build a GDAL callback that emits integer percentage progress events.
 
     Args:
-        message (string): a string that expects 2 placement %% variables,
-            first for % complete from ``df_complete``, second from
-            ``p_progress_arg[0]``.
+        progress_queue: Queue-like object receiving progress events.
+        progress_id: Progress bar identifier to update.
+        phase: Human-readable phase label for the progress bar.
+        start_value: Existing progress bar value before this callback starts.
 
-    Return:
-        Function with signature:
-            logger_callback(df_complete, psz_message, p_progress_arg)
-
+    Returns:
+        GDAL-compatible callback that returns 1 to keep processing.
     """
 
-    def logger_callback(df_complete, _, p_progress_arg):
-        """Argument names come from the GDAL API for callbacks."""
-        try:
-            current_time = time.time()
-            if (current_time - logger_callback.last_time) > 5.0 or (
-                df_complete == 1.0 and logger_callback.total_time >= 5.0
-            ):
-                # In some multiprocess applications I was encountering a
-                # ``p_progress_arg`` of None. This is unexpected and I suspect
-                # was an issue for some kind of GDAL race condition. So I'm
-                # guarding against it here and reporting an appropriate log
-                # if it occurs.
-                if p_progress_arg:
-                    logger.info(message, df_complete * 100, p_progress_arg[0])
-                else:
-                    logger.info(message, df_complete * 100, "")
-                logger_callback.last_time = current_time
-                logger_callback.total_time += current_time
-        except AttributeError:
-            logger_callback.last_time = time.time()
-            logger_callback.total_time = 0.0
-        except Exception:
-            logger.exception(
-                "Unhandled error occurred while logging "
-                "progress.  df_complete: %s, p_progress_arg: %s",
-                df_complete,
-                p_progress_arg,
+    def progress_callback(df_complete, _, __):
+        """Argument names follow the GDAL callback API."""
+        complete_percent = int(round(df_complete * 100.0))
+        complete_percent = min(max(complete_percent, 0), 100)
+        increment = complete_percent - progress_callback.last_percent
+        if increment > 0:
+            _emit_progress(
+                progress_queue,
+                {
+                    "event": "analysis_set",
+                    "id": progress_id,
+                    "value": start_value + complete_percent,
+                    "phase": f"{phase} {complete_percent}%",
+                },
             )
+            progress_callback.last_percent = complete_percent
+        return 1
 
-    return logger_callback
+    progress_callback.last_percent = 0
+    return progress_callback
 
 
 def parse_and_validate_config(cfg_path: Path) -> dict:
@@ -814,16 +812,13 @@ def fast_zonal_statistics(
     clean_working_dir=False,
     percentile_list=None,
     calculate_area_ha=False,
-    progress_queue=None,
-    progress_id=None,
+    *,
+    progress_queue,
+    progress_id,
 ):
     raster_path, raster_band_index = base_raster_path_band
     aggregate_vector_fields = aggregate_vector_field
     aggregate_vector_field_label = ",".join(aggregate_vector_fields)
-    progress_id = (
-        progress_id
-        or f"raster:{Path(raster_path).stem}:{Path(aggregate_vector_path).stem}"
-    )
     progress_n = 0
     _emit_progress(
         progress_queue,
@@ -1090,6 +1085,7 @@ def fast_zonal_statistics(
         aggregate_layer = None
         aggregate_vector = None
 
+        rasterize_start_progress = progress_n
         rasterize_task = local_task_graph.add_task(
             func=_rasterize_aggregate_fids,
             args=(
@@ -1098,13 +1094,35 @@ def fast_zonal_statistics(
                 aggregate_layer_name,
                 feature_id_raster_path,
                 feature_id_raster_nodata,
+                progress_queue,
+                progress_id,
+                rasterize_start_progress,
             ),
             dependent_task_list=[prepare_vector_task],
             target_path_list=[feature_id_raster_path],
             task_name=f"rasterize aggregate fids for {Path(raster_path).stem}",
         )
+        _emit_progress(
+            progress_queue,
+            {
+                "event": "analysis_total",
+                "id": progress_id,
+                "total": progress_n + 101,
+                "unit": "step",
+                "phase": "rasterizing polygons",
+            },
+        )
         rasterize_task.join()
-        progress_n += 1
+        _emit_progress(
+            progress_queue,
+            {
+                "event": "analysis_set",
+                "id": progress_id,
+                "value": rasterize_start_progress + 100,
+                "phase": "preparing raster blocks",
+            },
+        )
+        progress_n += 100
         _emit_progress(
             progress_queue,
             {
@@ -1114,6 +1132,7 @@ def fast_zonal_statistics(
                 "phase": "preparing raster blocks",
             },
         )
+        progress_n += 1
 
         feature_id_raster_offsets = list(
             geoprocessing.iterblocks(
@@ -1390,7 +1409,7 @@ def run_vector_stats_job(
     workdir: Path,
     tag: str,
     job_type: str,
-    progress_queue=None,
+    progress_queue,
 ):
     """Run a vector-based statistics job and write aggregated results to CSV.
 
@@ -1419,7 +1438,7 @@ def run_vector_stats_job(
         workdir: Working directory for intermediate job artifacts.
         tag: Job identifier used for logging and column name suffixes.
         job_type: Job type string; must be `"vector"`.
-        progress_queue: Optional queue for progress monitor events.
+        progress_queue: Queue for progress monitor events.
 
     Raises:
         ValueError: If `job_type` is not `"vector"` or if operation parsing fails.
@@ -1919,7 +1938,7 @@ def run_vector_measure_job(
     operation,
     measure_crs,
     tag,
-    progress_queue=None,
+    progress_queue,
 ):
     """Run a vector-on-vector intersection measure job.
 
@@ -1933,7 +1952,7 @@ def run_vector_measure_job(
             `intersect_count`.
         measure_crs: CRS for planar measurement, or `auto`.
         tag: Job tag used in log and error messages.
-        progress_queue: Optional queue for progress monitor events.
+        progress_queue: Queue for progress monitor events.
 
     Returns:
         DataFrame containing aggregation fields and one measure column.
@@ -2164,7 +2183,7 @@ def run_zonal_stats_job(
     workdir: Path,
     tag: str,
     task_graph,
-    progress_queue=None,
+    progress_queue,
 ):
     """Run a zonal statistics job over raster and/or vector base datasets.
 
@@ -2196,7 +2215,7 @@ def run_zonal_stats_job(
         workdir: Working directory for intermediate files and task graph outputs.
         tag: Job identifier used for temporary filenames and task labeling.
         task_graph: Task graph instance used to schedule raster and vector jobs.
-        progress_queue: Optional queue for progress monitor events.
+        progress_queue: Queue for progress monitor events.
 
     Raises:
         ValueError: If operation parsing fails or required inputs are inconsistent.
