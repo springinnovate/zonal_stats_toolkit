@@ -1,35 +1,150 @@
+# Example runner configuration for zonal_stats_toolkit.
+#
+# The runner uses INI-style sections even though this file has a `.yaml`
+# extension. Paths may be absolute or relative to this config file.
+# Each `[job:<name>]` section runs independently and must define:
+#   - `agg_vector`
+#   - `agg_field`
+#   - `operations`
+#   - at least one output: `output_csv` or `output_gpkg`
+#   - exactly one input mode:
+#       `base_raster_pattern`, `base_vector_pattern`, or `base_measure_vector`
+
 [project]
 name = example_job
-default_workdir = ./work
+
+# Global working directory used for taskgraph caches and intermediate files.
+# Each job gets its own subdirectory under this path.
+global_work_dir = ./work
+
+# Standard Python logging level, such as DEBUG, INFO, WARNING, or ERROR.
 log_level = INFO
 
-[job:poverty_region]
-agg_vector = ./vectors/countries.gpkg
-agg_layer = countries
-agg_field = poverty_region
-workdir = ./work/poverty_region
-output_csv = ./out/poverty_region.csv
-operations = avg,stdev,total_count,valid_count
 
-[job:admin1_by_state]
-agg_vector = ./vectors/admin1.gpkg
-agg_layer = admin1
-agg_field = state_name
-workdir = ./work/admin1_by_state
-output_csv = ./out/admin1_by_state.csv
-operations = avg,stdev,total_count,valid_count
+# Raster zonal statistics.
+#
+# `base_raster_pattern` may be one path or a glob. Multiple rasters produce one
+# output column per operation per raster stem, such as `mean_precip_2020`.
+#
+# `agg_field` may be a comma-separated tuple. The tuple is treated as the
+# aggregation key, so duplicate COUNTY values can be disambiguated by STATE.
+#
+# `agg_layer` is optional only when the aggregation datasource has exactly one
+# layer. If the datasource has multiple layers, omitting `agg_layer` raises an
+# error instead of silently choosing the first layer.
+[job:raster_county_summary]
+agg_vector = ./vectors/counties.gpkg
+agg_layer = counties
+agg_field = STATEFP,COUNTYFP,GEOID
 
-[job:watersheds]
-agg_vector = ./vectors/watersheds.gpkg
-agg_layer = basins
-agg_field = basin_id
-workdir = ./work/watersheds
-output_csv = ./out/watersheds.csv
-operations = avg,stdev,total_count,valid_count
+# Supported raster operations:
+#   sum, mean, stdev, min, max, total_count, valid_count
+#   p<number> percentile operations, such as p5, p50, p95
+#   area_ha_total and area_ha_valid
+#
+# `area_ha_total` is total raster-pixel area per aggregation group.
+# `area_ha_valid` is raster-pixel area after applying the same valid-data rules
+# used by `valid_count`.
+operations = sum, mean, stdev, min, max, total_count, valid_count, p5, p50, p95, area_ha_total, area_ha_valid
 
-[job:country2]
-agg_vector = ./jeronimodata/vector_basedata/cartographic_ee_ee_r264_correspondence.gpkg
-agg_field = nev_name
-operations = p50
-base_raster_pattern=./*.tif
-base_vector_pattern=./coastal_risk_tnc_esa1992_2020_20251224_013825_Columbia.gpkg[Rt_1992,Rt_2020,Service_1992,Service_2020,Rt_change,Service_change]
+base_raster_pattern = ./rasters/*.tif
+
+# At least one of `output_csv` or `output_gpkg` is required. Supplying both is
+# allowed. GPKG output copies the aggregation vector and joins result columns
+# back onto its attributes. The runner appends a timestamp to output filenames
+# when jobs run from the CLI.
+output_csv = ./out/raster_county_summary.csv
+output_gpkg = ./out/raster_county_summary.gpkg
+
+
+# Vector attribute aggregation.
+#
+# `base_vector_pattern` assigns each base-vector feature to its nearest
+# aggregation geometry and summarizes numeric fields listed in brackets.
+#
+# The syntax is:
+#   base_vector_pattern = path_or_glob[field1,field2,...]
+#
+# Multiple comma-separated pattern entries are allowed, but all entries in the
+# same job must list the same fields. Matched vector files must have exactly one
+# layer; otherwise validation raises an error.
+[job:nearest_vector_attribute_summary]
+agg_vector = ./vectors/counties.gpkg
+agg_layer = counties
+agg_field = STATEFP,COUNTYFP,GEOID
+
+# Supported vector attribute operations:
+#   sum, mean, stdev, min, max, total_count, valid_count
+#   p<number> percentile operations, such as p50
+operations = sum, mean, stdev, min, max, total_count, valid_count, p50
+
+base_vector_pattern = ./vectors/monitoring_points_*.gpkg[nitrogen,phosphorus]
+output_csv = ./out/nearest_vector_attribute_summary.csv
+output_gpkg = ./out/nearest_vector_attribute_summary.gpkg
+
+
+# Vector intersection area measurement.
+#
+# `base_measure_vector` starts a separate vector-on-vector measurement job.
+# Measure jobs cannot also define `base_raster_pattern` or
+# `base_vector_pattern`, and must define exactly one `intersect_*` operation.
+#
+# For polygon or multipolygon measure vectors, use `intersect_area_ha`.
+# The output column is `intersect_area_ha_<base_measure_vector_stem>`.
+[job:county_surface_water_area]
+agg_vector = ./vectors/counties.gpkg
+agg_layer = counties
+agg_field = STATEFP,COUNTYFP,GEOID
+operations = intersect_area_ha
+
+base_measure_vector = ./vectors/surface_water.gpkg
+
+# `base_measure_layer` is optional only when the measure datasource has exactly
+# one layer. If it has multiple layers, omitting this raises an error.
+base_measure_layer = surface_water
+
+# `measure_crs = auto` uses a shared projected CRS when possible, otherwise it
+# chooses a local UTM CRS for small extents or EPSG:6933 for broad/global
+# extents. The selected CRS and reason are logged at the end of the run.
+# You may also provide an explicit projected CRS, such as EPSG:6933.
+measure_crs = auto
+
+output_csv = ./out/county_surface_water_area.csv
+output_gpkg = ./out/county_surface_water_area.gpkg
+
+
+# Vector intersection length measurement.
+#
+# For line or multiline measure vectors, use `intersect_length_km`.
+# The output column is `intersect_length_km_<base_measure_vector_stem>`.
+[job:county_stream_length]
+agg_vector = ./vectors/counties.gpkg
+agg_layer = counties
+agg_field = STATEFP,COUNTYFP,GEOID
+operations = intersect_length_km
+
+base_measure_vector = ./vectors/streams.gpkg
+base_measure_layer = streams
+measure_crs = auto
+
+output_csv = ./out/county_stream_length.csv
+output_gpkg = ./out/county_stream_length.gpkg
+
+
+# Vector intersection point counting.
+#
+# For point or multipoint measure vectors, use `intersect_count`.
+# The output column is `intersect_count_<base_measure_vector_stem>`.
+# Aggregation groups with no intersecting points are included with a value of 0.
+[job:county_well_count]
+agg_vector = ./vectors/counties.gpkg
+agg_layer = counties
+agg_field = STATEFP,COUNTYFP,GEOID
+operations = intersect_count
+
+base_measure_vector = ./vectors/wells.gpkg
+base_measure_layer = wells
+measure_crs = auto
+
+output_csv = ./out/county_well_count.csv
+output_gpkg = ./out/county_well_count.gpkg
