@@ -462,6 +462,7 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
     def _resolve_layer(
         vector_path: Path, layer_name: str, layer_config_key: str, tag: str
     ) -> str:
+        """Return a validated vector layer name, raising on ambiguous inputs."""
         layers = fiona.listlayers(str(vector_path))
         if not layers:
             raise ValueError(f"[job:{tag}] no layers found in {vector_path}")
