@@ -139,16 +139,6 @@ def _configure_gdal_cache(max_cache_bytes=_GDAL_CACHE_MAX_BYTES):
         )
 
 
-def _default_job_worker_count():
-    """Return a conservative process count for top-level jobs.
-
-    Returns:
-        Default number of top-level worker processes.
-    """
-    cpu_count = os.cpu_count() or 1
-    return max(1, min(4, cpu_count // 2))
-
-
 def _run_zonal_stats_job_process(output_label, job_kwargs, log_level):
     """Run one configured job in an isolated process.
 
@@ -2548,7 +2538,8 @@ def main():
         logger.info("No jobs to run")
         return
 
-    max_workers = args.max_workers or _default_job_worker_count()
+    cpu_count = os.cpu_count() or 1
+    max_workers = args.max_workers or max(1, min(4, cpu_count // 2))
     max_workers = max(1, min(max_workers, total_job_count))
     process_context = multiprocessing.get_context("spawn")
     progress_manager = process_context.Manager()
