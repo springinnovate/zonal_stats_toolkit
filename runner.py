@@ -462,7 +462,23 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
     def _resolve_layer(
         vector_path: Path, layer_name: str, layer_config_key: str, tag: str
     ) -> str:
-        """Return a validated vector layer name, raising on ambiguous inputs."""
+        """Return a validated vector layer name.
+
+        Args:
+            vector_path: Vector datasource path to inspect.
+            layer_name: User-provided layer name, or an empty string when no
+                layer was configured.
+            layer_config_key: Config key name to include in validation errors.
+            tag: Job tag to include in validation errors.
+
+        Returns:
+            The resolved layer name.
+
+        Raises:
+            ValueError: If the datasource has no layers, the requested layer is
+                missing, or the datasource has multiple layers and no layer was
+                configured.
+        """
         layers = fiona.listlayers(str(vector_path))
         if not layers:
             raise ValueError(f"[job:{tag}] no layers found in {vector_path}")
@@ -1492,7 +1508,15 @@ def run_vector_stats_job(
 
 
 def _bounds_to_wgs84(bounds, source_crs):
-    """Transform vector bounds into WGS84 longitude/latitude bounds."""
+    """Transform vector bounds into WGS84 longitude/latitude bounds.
+
+    Args:
+        bounds: Source bounds as `(min_x, min_y, max_x, max_y)`.
+        source_crs: CRS describing the source bounds.
+
+    Returns:
+        Bounds as `(min_lon, min_lat, max_lon, max_lat)`.
+    """
     transformer = Transformer.from_crs(source_crs, CRS.from_epsg(4326), always_xy=True)
     min_x, min_y, max_x, max_y = bounds
     lon_values, lat_values = transformer.transform(
@@ -1508,14 +1532,36 @@ def _bounds_to_wgs84(bounds, source_crs):
 
 
 def _linear_units_to_meters(crs):
-    """Return the conversion factor from CRS linear units to meters."""
+    """Return the conversion factor from CRS linear units to meters.
+
+    Args:
+        crs: Projected CRS whose axis units are used for measurement.
+
+    Returns:
+        Multiplier for converting one CRS linear unit to meters.
+    """
     if crs.axis_info:
         return crs.axis_info[0].unit_conversion_factor or 1.0
     return 1.0
 
 
 def _select_measure_crs(agg_gdf, measure_gdf, measure_crs, operation, tag):
-    """Choose the projected CRS used for vector intersection measurements."""
+    """Choose the projected CRS used for vector intersection measurements.
+
+    Args:
+        agg_gdf: Aggregation GeoDataFrame.
+        measure_gdf: GeoDataFrame containing geometries to measure.
+        measure_crs: User-configured CRS string, or `"auto"`.
+        operation: Measure operation being run.
+        tag: Job tag to include in validation errors and log messages.
+
+    Returns:
+        The CRS to use for planar intersection measurements.
+
+    Raises:
+        ValueError: If either input is missing a CRS, or if an explicit
+            non-projected CRS is configured for area or length measurement.
+    """
     agg_crs = CRS.from_user_input(agg_gdf.crs) if agg_gdf.crs else None
     base_crs = CRS.from_user_input(measure_gdf.crs) if measure_gdf.crs else None
     if agg_crs is None or base_crs is None:
@@ -1581,7 +1627,17 @@ def _select_measure_crs(agg_gdf, measure_gdf, measure_crs, operation, tag):
 
 
 def _validate_measure_geometry(measure_gdf, operation, vector_path):
-    """Validate that measure vector geometry types match the operation."""
+    """Validate that measure vector geometry types match the operation.
+
+    Args:
+        measure_gdf: GeoDataFrame containing geometries to measure.
+        operation: Measure operation being run.
+        vector_path: Source path to include in validation errors.
+
+    Raises:
+        ValueError: If the measured geometry type is incompatible with
+            `operation`.
+    """
     geometry_types = set(
         measure_gdf.geometry.dropna().geom_type.str.replace("3D ", "", regex=False)
     )
