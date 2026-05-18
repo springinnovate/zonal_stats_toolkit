@@ -55,16 +55,6 @@ VALID_OPERATIONS = {
 }
 
 
-def _emit_progress(progress_queue, event):
-    """Send a progress event to the monitor.
-
-    Args:
-        progress_queue: Queue-like object receiving progress events.
-        event: Pickleable event dictionary for the progress monitor.
-    """
-    progress_queue.put(event)
-
-
 def _progress_monitor(progress_queue, total_jobs):
     """Render runner progress events as tqdm bars.
 
@@ -417,8 +407,7 @@ def _make_progress_callback(progress_queue, progress_id, phase, start_value=0):
         complete_percent = min(max(complete_percent, 0), 100)
         increment = complete_percent - progress_callback.last_percent
         if increment > 0:
-            _emit_progress(
-                progress_queue,
+            progress_queue.put(
                 {
                     "event": "analysis_set",
                     "id": progress_id,
@@ -820,8 +809,7 @@ def fast_zonal_statistics(
     aggregate_vector_fields = aggregate_vector_field
     aggregate_vector_field_label = ",".join(aggregate_vector_fields)
     progress_n = 0
-    _emit_progress(
-        progress_queue,
+    progress_queue.put(
         {
             "event": "analysis_start",
             "id": progress_id,
@@ -961,8 +949,7 @@ def fast_zonal_statistics(
         )
         prepare_vector_task.join()
         progress_n += 1
-        _emit_progress(
-            progress_queue,
+        progress_queue.put(
             {
                 "event": "analysis_update",
                 "id": progress_id,
@@ -1007,8 +994,7 @@ def fast_zonal_statistics(
             len(unique_group_values),
         )
         progress_n += 1
-        _emit_progress(
-            progress_queue,
+        progress_queue.put(
             {
                 "event": "analysis_update",
                 "id": progress_id,
@@ -1051,8 +1037,7 @@ def fast_zonal_statistics(
                 len(unique_group_values),
             )
             aggregate_layer = None
-            _emit_progress(
-                progress_queue,
+            progress_queue.put(
                 {
                     "event": "analysis_close",
                     "id": progress_id,
@@ -1102,8 +1087,7 @@ def fast_zonal_statistics(
             target_path_list=[feature_id_raster_path],
             task_name=f"rasterize aggregate fids for {Path(raster_path).stem}",
         )
-        _emit_progress(
-            progress_queue,
+        progress_queue.put(
             {
                 "event": "analysis_total",
                 "id": progress_id,
@@ -1113,8 +1097,7 @@ def fast_zonal_statistics(
             },
         )
         rasterize_task.join()
-        _emit_progress(
-            progress_queue,
+        progress_queue.put(
             {
                 "event": "analysis_set",
                 "id": progress_id,
@@ -1123,8 +1106,7 @@ def fast_zonal_statistics(
             },
         )
         progress_n += 100
-        _emit_progress(
-            progress_queue,
+        progress_queue.put(
             {
                 "event": "analysis_update",
                 "id": progress_id,
@@ -1145,8 +1127,7 @@ def fast_zonal_statistics(
             "iterblocks prepared | blocks=%d",
             len(feature_id_raster_offsets),
         )
-        _emit_progress(
-            progress_queue,
+        progress_queue.put(
             {
                 "event": "analysis_total",
                 "id": progress_id,
@@ -1166,8 +1147,7 @@ def fast_zonal_statistics(
         if percentile_list:
             group_sketch = defaultdict(lambda: kll_floats_sketch(k=200))
         for block_index, feature_id_offset in enumerate(feature_id_raster_offsets):
-            _emit_progress(
-                progress_queue,
+            progress_queue.put(
                 {
                     "event": "analysis_update",
                     "id": progress_id,
@@ -1228,8 +1208,7 @@ def fast_zonal_statistics(
 
         logger.info("aggregating done")
         progress_n += len(feature_id_raster_offsets)
-        _emit_progress(
-            progress_queue,
+        progress_queue.put(
             {
                 "event": "analysis_update",
                 "id": progress_id,
@@ -1382,8 +1361,7 @@ def fast_zonal_statistics(
             )
         logger.info("grouping done | groups=%d", len(grouped_stats))
         logger.info("fast_zonal_statistics done")
-        _emit_progress(
-            progress_queue,
+        progress_queue.put(
             {
                 "event": "analysis_close",
                 "id": progress_id,
@@ -1514,8 +1492,7 @@ def run_vector_stats_job(
         base_vector_path = Path(base_vector_path)
         stem = base_vector_path.stem
         progress_id = f"vector:{tag}:{stem}"
-        _emit_progress(
-            progress_queue,
+        progress_queue.put(
             {
                 "event": "analysis_start",
                 "id": progress_id,
@@ -1538,8 +1515,7 @@ def run_vector_stats_job(
             base_gdf = base_gdf.to_crs(agg_crs)
 
         transformers_by_stem[stem] = transformer
-        _emit_progress(
-            progress_queue,
+        progress_queue.put(
             {
                 "event": "analysis_update",
                 "id": progress_id,
@@ -1574,8 +1550,7 @@ def run_vector_stats_job(
             )
             for start_index in range(0, feature_count, chunk_size)
         ]
-        _emit_progress(
-            progress_queue,
+        progress_queue.put(
             {
                 "event": "analysis_total",
                 "id": progress_id,
@@ -1589,8 +1564,7 @@ def run_vector_stats_job(
             for chunk_index, (start_index, nearest_chunk) in enumerate(
                 executor.map(_nearest_chunk_thread, nearest_tasks, chunksize=1),
             ):
-                _emit_progress(
-                    progress_queue,
+                progress_queue.put(
                     {
                         "event": "analysis_update",
                         "id": progress_id,
@@ -1617,8 +1591,7 @@ def run_vector_stats_job(
         }
 
         stem_frame = pd.DataFrame(group_keys, columns=agg_fields)
-        _emit_progress(
-            progress_queue,
+        progress_queue.put(
             {
                 "event": "analysis_update",
                 "id": progress_id,
@@ -1731,8 +1704,7 @@ def run_vector_stats_job(
                         stem_frame[column_name] = out
 
         per_stem_frames.append(stem_frame)
-        _emit_progress(
-            progress_queue,
+        progress_queue.put(
             {
                 "event": "analysis_close",
                 "id": progress_id,
@@ -1958,8 +1930,7 @@ def run_vector_measure_job(
         DataFrame containing aggregation fields and one measure column.
     """
     progress_id = f"measure:{tag}:{Path(base_measure_vector).stem}"
-    _emit_progress(
-        progress_queue,
+    progress_queue.put(
         {
             "event": "analysis_start",
             "id": progress_id,
@@ -1978,8 +1949,7 @@ def run_vector_measure_job(
     )
     agg_gdf = gpd.read_file(agg_vector, layer=agg_layer)
     measure_gdf = gpd.read_file(base_measure_vector, layer=base_measure_layer)
-    _emit_progress(
-        progress_queue,
+    progress_queue.put(
         {
             "event": "analysis_update",
             "id": progress_id,
@@ -1992,8 +1962,7 @@ def run_vector_measure_job(
     ].copy()
     _validate_measure_geometry(measure_gdf, operation, base_measure_vector)
 
-    _emit_progress(
-        progress_queue,
+    progress_queue.put(
         {
             "event": "analysis_update",
             "id": progress_id,
@@ -2009,8 +1978,7 @@ def run_vector_measure_job(
 
     if measure_gdf.empty:
         logger.info("base measure vector has no non-empty geometries")
-        _emit_progress(
-            progress_queue,
+        progress_queue.put(
             {
                 "event": "analysis_close",
                 "id": progress_id,
@@ -2022,8 +1990,7 @@ def run_vector_measure_job(
     target_crs = _select_measure_crs(
         agg_groups, measure_gdf, measure_crs, operation, tag
     )
-    _emit_progress(
-        progress_queue,
+    progress_queue.put(
         {
             "event": "analysis_update",
             "id": progress_id,
@@ -2034,8 +2001,7 @@ def run_vector_measure_job(
     agg_projected = agg_groups.to_crs(target_crs)
     measure_projected = measure_gdf[["geometry"]].to_crs(target_crs)
     measure_projected = measure_projected.explode(index_parts=False)
-    _emit_progress(
-        progress_queue,
+    progress_queue.put(
         {
             "event": "analysis_update",
             "id": progress_id,
@@ -2052,8 +2018,7 @@ def run_vector_measure_job(
             predicate="intersects",
         )
         if joined.empty:
-            _emit_progress(
-                progress_queue,
+            progress_queue.put(
                 {
                     "event": "analysis_close",
                     "id": progress_id,
@@ -2075,8 +2040,7 @@ def run_vector_measure_job(
             keep_geom_type=False,
         )
         if intersection_gdf.empty:
-            _emit_progress(
-                progress_queue,
+            progress_queue.put(
                 {
                     "event": "analysis_close",
                     "id": progress_id,
@@ -2101,8 +2065,7 @@ def run_vector_measure_job(
             .sum()
             .reset_index()
         )
-    _emit_progress(
-        progress_queue,
+    progress_queue.put(
         {
             "event": "analysis_update",
             "id": progress_id,
@@ -2117,8 +2080,7 @@ def run_vector_measure_job(
     result_table[column_name] = result_table[column_name].fillna(0)
     if operation == "intersect_count":
         result_table[column_name] = result_table[column_name].astype(np.int64)
-    _emit_progress(
-        progress_queue,
+    progress_queue.put(
         {
             "event": "analysis_close",
             "id": progress_id,
@@ -2402,8 +2364,7 @@ def main():
             logger.exception("job failed for output %s", output_label)
             thread_error_list.append((output_label, error))
         finally:
-            _emit_progress(
-                job_kwargs.get("progress_queue"),
+            job_kwargs["progress_queue"].put(
                 {
                     "event": "job_done",
                     "tag": job_kwargs.get("tag"),
@@ -2474,7 +2435,7 @@ def main():
         task_graph.join()
         task_graph.close()
     finally:
-        _emit_progress(progress_queue, {"event": "stop"})
+        progress_queue.put({"event": "stop"})
         progress_thread.join()
         progress_manager.shutdown()
 
