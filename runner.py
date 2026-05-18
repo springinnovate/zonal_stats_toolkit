@@ -70,12 +70,6 @@ def _log_area_hectare_assumptions():
         logger.warning("Area hectare assumption: %s", message)
 
 
-def _log_measure_crs_assumptions():
-    """Log vector measure CRS choices after all jobs complete."""
-    for message in sorted(_MEASURE_CRS_ASSUMPTIONS):
-        logger.warning("Vector measure CRS choice: %s", message)
-
-
 def _raster_pixel_area_ha(raster_path, raster_info, raster_srs):
     """Estimate one raster pixel's area in hectares.
 
@@ -2051,7 +2045,8 @@ def main():
 
     logging.getLogger(__name__).info("All %d jobs done", total_job_count)
     _log_area_hectare_assumptions()
-    _log_measure_crs_assumptions()
+    for message in sorted(_MEASURE_CRS_ASSUMPTIONS):
+        logger.warning("Vector measure CRS choice: %s", message)
 
 
 if __name__ == "__main__":
