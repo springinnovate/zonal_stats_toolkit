@@ -1,0 +1,42 @@
+# Native mamba environment for running zonal_stats_toolkit without Docker.
+#
+# Create:
+#   mamba env create -f environment-runner.yml
+#
+# Update after edits:
+#   mamba env update -f environment-runner.yml --prune
+#
+# Run:
+#   mamba activate zonal-stats-toolkit
+#   python runner.py path\to\job.yaml
+#
+# Keep GDAL/Fiona/GeoPandas/Shapely/PyProj on conda-forge. Installing those
+# packages from pip on Windows is much more likely to create binary-library
+# conflicts.
+name: zonal-stats-toolkit
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - gdal
+  - fiona
+  - geopandas
+  - numpy
+  - pandas
+  - pyproj
+  - rasterio
+  - rtree
+  - scipy
+  - shapely
+  - tqdm
+  - cython
+  - numexpr
+  - psutil
+  - pyyaml
+  - retrying
+  - setuptools
+  - wheel
+  - pip:
+      - datasketches
+      - git+https://github.com/springinnovate/ecoshard.git
