@@ -70,15 +70,6 @@ def _log_area_hectare_assumptions():
         logger.warning("Area hectare assumption: %s", message)
 
 
-def _record_measure_crs_assumption(message):
-    """Track an auto-selected vector measure CRS for end-of-run logging.
-
-    Args:
-        message: Human-readable description of the selected CRS and why.
-    """
-    _MEASURE_CRS_ASSUMPTIONS.add(message)
-
-
 def _log_measure_crs_assumptions():
     """Log vector measure CRS choices after all jobs complete."""
     for message in sorted(_MEASURE_CRS_ASSUMPTIONS):
@@ -1549,7 +1540,7 @@ def _select_measure_crs(agg_gdf, measure_gdf, measure_crs, operation, tag):
         return target_crs
 
     if agg_crs == base_crs and agg_crs.is_projected:
-        _record_measure_crs_assumption(
+        _MEASURE_CRS_ASSUMPTIONS.add(
             f"[job:{tag}] measure_crs=auto used shared projected CRS "
             f"{_crs_label(agg_crs)}."
         )
@@ -1581,7 +1572,7 @@ def _select_measure_crs(agg_gdf, measure_gdf, measure_crs, operation, tag):
             "using global equal-area EPSG:6933"
         )
 
-    _record_measure_crs_assumption(
+    _MEASURE_CRS_ASSUMPTIONS.add(
         f"[job:{tag}] measure_crs=auto selected {_crs_label(target_crs)} for "
         f"{operation}; {reason}."
     )
