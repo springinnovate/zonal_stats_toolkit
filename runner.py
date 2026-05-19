@@ -781,9 +781,10 @@ def _rasterize_aggregate_fids(
         )
 
     try:
-        if worker_count == 1:
-            for tile, tile_path in tile_specs:
-                _rasterize_aggregate_fid_tile(
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            future_to_tile_spec = {
+                executor.submit(
+                    _rasterize_aggregate_fid_tile,
                     aggregate_vector_path,
                     aggregate_layer_name,
                     tile_path,
@@ -791,28 +792,13 @@ def _rasterize_aggregate_fids(
                     base_geotransform,
                     projection_wkt,
                     target_nodata,
-                )
+                ): (tile, tile_path)
+                for tile, tile_path in tile_specs
+            }
+            for future in as_completed(future_to_tile_spec):
+                future.result()
                 completed_tiles += 1
                 _report_tile_progress()
-        else:
-            with ProcessPoolExecutor(max_workers=worker_count) as executor:
-                future_to_tile_spec = {
-                    executor.submit(
-                        _rasterize_aggregate_fid_tile,
-                        aggregate_vector_path,
-                        aggregate_layer_name,
-                        tile_path,
-                        tile,
-                        base_geotransform,
-                        projection_wkt,
-                        target_nodata,
-                    ): (tile, tile_path)
-                    for tile, tile_path in tile_specs
-                }
-                for future in as_completed(future_to_tile_spec):
-                    future.result()
-                    completed_tiles += 1
-                    _report_tile_progress()
 
         progress_queue.put(
             {
