@@ -638,7 +638,17 @@ def _rasterize_aggregate_fid_tile(
 
 
 def _stitch_raster_tiles(target_raster_path, tile_specs):
-    """Copy completed rasterized tiles into the target raster."""
+    """Copy completed rasterized tiles into the target raster.
+
+    Args:
+        target_raster_path: Path to the full-size raster opened for update.
+        tile_specs: Iterable of `(tile, tile_path)` pairs, where `tile`
+            defines the output offset and `tile_path` points to a completed
+            tile raster.
+
+    Raises:
+        RuntimeError: If the target raster or any tile raster cannot be opened.
+    """
     target_dataset = gdal.OpenEx(
         str(target_raster_path), gdal.GA_Update | gdal.OF_RASTER
     )
