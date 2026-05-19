@@ -700,6 +700,10 @@ def _rasterize_aggregate_fids(
         rasterize_worker_count: Number of tile worker processes, or `None` to
             use the default.
 
+    Returns:
+        Number of progress steps completed while rasterizing and stitching
+        tiles.
+
     Raises:
         RuntimeError: If the base raster cannot be opened or tile rasterization
             fails.
@@ -753,25 +757,28 @@ def _rasterize_aggregate_fids(
         tile_dir,
     )
 
+    progress_steps = len(tile_specs) + 1
+    progress_queue.put(
+        {
+            "event": "analysis_total",
+            "id": progress_id,
+            "total": progress_start_value + progress_steps,
+            "unit": "tile",
+            "phase": "rasterizing polygon tiles",
+        },
+    )
+
     completed_tiles = 0
-    last_percent = 0
 
     def _report_tile_progress():
-        nonlocal last_percent
-        complete_percent = int(round(completed_tiles * 100.0 / len(tile_specs)))
-        if complete_percent > last_percent:
-            progress_queue.put(
-                {
-                    "event": "analysis_set",
-                    "id": progress_id,
-                    "value": progress_start_value + complete_percent,
-                    "phase": (
-                        f"rasterizing polygons {completed_tiles}/"
-                        f"{len(tile_specs)}"
-                    ),
-                },
-            )
-            last_percent = complete_percent
+        progress_queue.put(
+            {
+                "event": "analysis_update",
+                "id": progress_id,
+                "increment": 1,
+                "phase": "rasterizing polygon tiles",
+            },
+        )
 
     try:
         if worker_count == 1:
@@ -809,9 +816,9 @@ def _rasterize_aggregate_fids(
 
         progress_queue.put(
             {
-                "event": "analysis_set",
+                "event": "analysis_update",
                 "id": progress_id,
-                "value": progress_start_value + 100,
+                "increment": 1,
                 "phase": "stitching rasterized tiles",
             },
         )
@@ -819,6 +826,7 @@ def _rasterize_aggregate_fids(
     finally:
         shutil.rmtree(tile_dir, ignore_errors=True)
     logger.debug("rasterize done")
+    return progress_steps
 
 
 def _make_progress_callback(progress_queue, progress_id, phase, start_value=0):
@@ -1497,16 +1505,7 @@ def fast_zonal_statistics(
         aggregate_vector = None
 
         rasterize_start_progress = progress_n
-        progress_queue.put(
-            {
-                "event": "analysis_total",
-                "id": progress_id,
-                "total": progress_n + 101,
-                "unit": "step",
-                "phase": "rasterizing polygons",
-            },
-        )
-        _rasterize_aggregate_fids(
+        rasterize_progress_count = _rasterize_aggregate_fids(
             raster_path_for_stats,
             projected_vector_path,
             aggregate_layer_name,
@@ -1516,15 +1515,7 @@ def fast_zonal_statistics(
             progress_id,
             rasterize_start_progress,
         )
-        progress_queue.put(
-            {
-                "event": "analysis_set",
-                "id": progress_id,
-                "value": rasterize_start_progress + 100,
-                "phase": "preparing raster blocks",
-            },
-        )
-        progress_n += 100
+        progress_n += rasterize_progress_count
         progress_queue.put(
             {
                 "event": "analysis_update",
