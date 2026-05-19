@@ -2623,7 +2623,7 @@ def run_zonal_stats_job(
         )
         return
 
-    grouped_stats_list = []
+    raster_dataframes = []
     if base_raster_path_list:
         for base_raster_path in base_raster_path_list:
             base_raster_path = Path(base_raster_path)
@@ -2642,9 +2642,23 @@ def run_zonal_stats_job(
                 progress_queue=progress_queue,
                 progress_id=f"raster:{tag}:{base_raster_path.stem}",
             )
-            grouped_stats_list.append(
-                (base_raster_path.stem, agg_fields, grouped_stats)
-            )
+            raster_rows = []
+            for group_value, statistics in grouped_stats.items():
+                if len(agg_fields) == 1:
+                    row = {agg_fields[0]: group_value}
+                else:
+                    row = dict(zip(agg_fields, group_value))
+                for operation in core_ops:
+                    row[f"{operation}_{base_raster_path.stem}"] = statistics.get(
+                        operation
+                    )
+                for percentile_key in pct_keys:
+                    row[f"{percentile_key}_{base_raster_path.stem}"] = (
+                        statistics.get(percentile_key)
+                    )
+                raster_rows.append(row)
+
+            raster_dataframes.append(pd.DataFrame(raster_rows))
 
     combined_dataframe = None
 
@@ -2676,23 +2690,6 @@ def run_zonal_stats_job(
             vector_dataframe = vector_dataframe.rename(columns={"base_vector": "base"})
 
         combined_dataframe = vector_dataframe
-
-    raster_dataframes = []
-
-    for raster_stem, aggregation_field_names, grouped_stats in grouped_stats_list:
-        raster_rows = []
-        for group_value, statistics in grouped_stats.items():
-            if len(aggregation_field_names) == 1:
-                row = {aggregation_field_names[0]: group_value}
-            else:
-                row = dict(zip(aggregation_field_names, group_value))
-            for operation in core_ops:
-                row[f"{operation}_{raster_stem}"] = statistics.get(operation)
-            for percentile_key in pct_keys:
-                row[f"{percentile_key}_{raster_stem}"] = statistics.get(percentile_key)
-            raster_rows.append(row)
-
-        raster_dataframes.append(pd.DataFrame(raster_rows))
 
     raster_dataframe = None
     for raster_frame in raster_dataframes:
