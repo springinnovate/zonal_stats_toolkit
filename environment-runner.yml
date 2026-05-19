@@ -33,6 +33,7 @@ dependencies:
   - cython
   - numexpr
   - psutil
+  - pytest
   - pyyaml
   - retrying
   - setuptools
