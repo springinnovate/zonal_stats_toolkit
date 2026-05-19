@@ -496,7 +496,16 @@ def _iter_raster_tiles(raster_x_size, raster_y_size, tile_size):
 
 
 def _tile_geotransform(base_geotransform, tile):
-    """Return a geotransform shifted to a tile's upper-left pixel."""
+    """Return a geotransform shifted to a tile's upper-left pixel.
+
+    Args:
+        base_geotransform: Six-element GDAL geotransform for the full raster.
+        tile: Tile window dictionary with `xoff` and `yoff` entries.
+
+    Returns:
+        Six-element GDAL geotransform whose origin is the tile's upper-left
+        pixel.
+    """
     return (
         base_geotransform[0]
         + tile["xoff"] * base_geotransform[1]
