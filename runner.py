@@ -561,7 +561,24 @@ def _rasterize_aggregate_fid_tile(
     projection_wkt,
     target_nodata,
 ):
-    """Rasterize aggregate FIDs for one raster tile."""
+    """Rasterize aggregate FIDs for one raster tile.
+
+    Args:
+        aggregate_vector_path: Path to the prepared aggregation vector.
+        aggregate_layer_name: Layer name in `aggregate_vector_path`, or `None`
+            to use the default layer.
+        tile_path: Path where the tile GeoTIFF will be written.
+        tile: Tile window dictionary with offsets and dimensions.
+        base_geotransform: Six-element GDAL geotransform for the full raster.
+        projection_wkt: WKT projection for the output tile raster.
+        target_nodata: Nodata value to initialize in the tile raster.
+
+    Returns:
+        Path to the completed tile raster.
+
+    Raises:
+        RuntimeError: If the vector, layer, or rasterization step fails.
+    """
     tile_path = Path(tile_path)
     tile_path.parent.mkdir(parents=True, exist_ok=True)
     tile_path.unlink(missing_ok=True)
