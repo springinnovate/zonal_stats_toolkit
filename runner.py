@@ -521,7 +521,16 @@ def _tile_geotransform(base_geotransform, tile):
 
 
 def _tile_bounds(base_geotransform, tile):
-    """Return a tile bounding box in raster coordinates."""
+    """Return a tile bounding box in raster coordinates.
+
+    Args:
+        base_geotransform: Six-element GDAL geotransform for the full raster.
+        tile: Tile window dictionary with `xoff`, `yoff`, `win_xsize`, and
+            `win_ysize` entries.
+
+    Returns:
+        Tuple of `(min_x, min_y, max_x, max_y)` covering the tile footprint.
+    """
     xoff = tile["xoff"]
     yoff = tile["yoff"]
     xsize = tile["win_xsize"]
