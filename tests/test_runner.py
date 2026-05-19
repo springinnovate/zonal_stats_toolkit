@@ -355,6 +355,8 @@ def test_prepare_and_rasterize_aggregate_fids(
         progress_queue,
         "id",
         0,
+        tile_size=2,
+        rasterize_worker_count=2,
     )
     dataset = gdal.OpenEx(str(fid_raster), gdal.OF_RASTER)
     array = dataset.GetRasterBand(1).ReadAsArray()
@@ -362,6 +364,55 @@ def test_prepare_and_rasterize_aggregate_fids(
     assert set(np.unique(array)) == {1, 2}
     assert np.all(array[:, :2] == 1)
     assert np.all(array[:, 2:] == 2)
+
+
+def test_rasterize_aggregate_fids_can_spawn_from_job_process(
+    tmp_path, projected_zone_vector, projected_raster, multiprocessing_queue
+):
+    prepared_vector = tmp_path / "prepared_nested.gpkg"
+    runner._prepare_aggregate_vector_for_rasterization(
+        projected_zone_vector,
+        "zones",
+        prepared_vector,
+        _projection_wkt(6933),
+        0.0,
+        False,
+    )
+    fid_raster = tmp_path / "fid_nested.tif"
+    with runner.ProcessPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            runner._rasterize_aggregate_fids,
+            projected_raster,
+            prepared_vector,
+            "zones",
+            fid_raster,
+            -1,
+            multiprocessing_queue,
+            "id",
+            0,
+            2,
+            2,
+        )
+        future.result()
+
+    dataset = gdal.OpenEx(str(fid_raster), gdal.OF_RASTER)
+    array = dataset.GetRasterBand(1).ReadAsArray()
+    dataset = None
+    assert np.all(array[:, :2] == 1)
+    assert np.all(array[:, 2:] == 2)
+
+
+def test_iter_raster_tiles_and_tile_bounds():
+    tiles = list(runner._iter_raster_tiles(5, 4, 2))
+    assert tiles == [
+        {"xoff": 0, "yoff": 0, "win_xsize": 2, "win_ysize": 2},
+        {"xoff": 2, "yoff": 0, "win_xsize": 2, "win_ysize": 2},
+        {"xoff": 4, "yoff": 0, "win_xsize": 1, "win_ysize": 2},
+        {"xoff": 0, "yoff": 2, "win_xsize": 2, "win_ysize": 2},
+        {"xoff": 2, "yoff": 2, "win_xsize": 2, "win_ysize": 2},
+        {"xoff": 4, "yoff": 2, "win_xsize": 1, "win_ysize": 2},
+    ]
+    assert runner._tile_bounds((0, 1, 0, 4, 0, -1), tiles[1]) == (2, 2, 4, 4)
 
 
 def test_fast_zonal_statistics_computes_grouped_raster_stats(
