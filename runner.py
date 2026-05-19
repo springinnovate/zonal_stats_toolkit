@@ -682,7 +682,28 @@ def _rasterize_aggregate_fids(
     tile_size=_RASTERIZE_TILE_SIZE,
     rasterize_worker_count=None,
 ):
-    """Rasterize prepared aggregation feature IDs onto the base raster grid."""
+    """Rasterize prepared aggregation feature IDs onto the base raster grid.
+
+    Args:
+        base_raster_path: Raster whose grid defines the output alignment.
+        aggregate_vector_path: Path to the prepared aggregation vector.
+        aggregate_layer_name: Layer name in `aggregate_vector_path`, or `None`
+            to use the default layer.
+        target_raster_path: Path where the full aggregation-FID raster is
+            written.
+        target_nodata: Nodata value for pixels outside aggregation features.
+        progress_queue: Queue-like object receiving progress events.
+        progress_id: Progress bar identifier to update.
+        progress_start_value: Existing progress value before rasterization
+            starts.
+        tile_size: Maximum tile width and height in pixels.
+        rasterize_worker_count: Number of tile worker processes, or `None` to
+            use the default.
+
+    Raises:
+        RuntimeError: If the base raster cannot be opened or tile rasterization
+            fails.
+    """
     target_raster_path = Path(target_raster_path)
     target_raster_path.parent.mkdir(parents=True, exist_ok=True)
     target_raster_path.unlink(missing_ok=True)
