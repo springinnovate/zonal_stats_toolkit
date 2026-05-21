@@ -41,11 +41,14 @@ agg_field = STATEFP,COUNTYFP,GEOID
 #   sum, mean, stdev, min, max, total_count, valid_count
 #   p<number> percentile operations, such as p5, p50, p95
 #   area_ha_total and area_ha_valid
+#   proportion_valid_nonzero
 #
 # `area_ha_total` is total raster-pixel area per aggregation group.
 # `area_ha_valid` is raster-pixel area after applying the same valid-data rules
 # used by `valid_count`.
-operations = sum, mean, stdev, min, max, total_count, valid_count, p5, p50, p95, area_ha_total, area_ha_valid
+# `proportion_valid_nonzero` is the count of valid, nonzero pixels divided by
+# `total_count`, so nodata pixels are included in the denominator.
+operations = sum, mean, stdev, min, max, total_count, valid_count, p5, p50, p95, area_ha_total, area_ha_valid, proportion_valid_nonzero
 
 base_raster_pattern = ./rasters/*.tif
 

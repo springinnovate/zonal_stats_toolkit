@@ -253,7 +253,7 @@ def test_parse_and_validate_config_resolves_paths(
                 f"agg_vector = {projected_zone_vector.name}",
                 "agg_layer = zones",
                 "agg_field = STATE, COUNTY",
-                "operations = sum, mean, total_count, valid_count",
+                "operations = sum, mean, total_count, valid_count, proportion_valid_nonzero",
                 f"base_raster_pattern = {projected_raster.name}",
                 "output_csv = output/results.csv",
             ]
@@ -264,6 +264,7 @@ def test_parse_and_validate_config_resolves_paths(
     assert parsed["project"]["global_work_dir"] == tmp_path / "work"
     assert job["agg_vector"] == projected_zone_vector
     assert job["agg_field"] == ["STATE", "COUNTY"]
+    assert "proportion_valid_nonzero" in job["operations"]
     assert job["base_raster_path_list"] == [projected_raster]
     assert job["output_csv"] == "output/results.csv"
     assert job["workdir"] == tmp_path / "work" / "raster_job"
@@ -326,6 +327,31 @@ def test_parse_and_validate_config_rejects_bad_measure_operation(
         )
     )
     with pytest.raises(ValueError, match="must define exactly one operation"):
+        runner.parse_and_validate_config(cfg_path)
+
+
+def test_parse_and_validate_config_rejects_raster_only_operation_without_raster(
+    tmp_path, projected_zone_vector
+):
+    cfg_path = tmp_path / "project.yml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "[project]",
+                "name = project",
+                "global_work_dir = work",
+                "",
+                "[job:bad]",
+                f"agg_vector = {projected_zone_vector.name}",
+                "agg_layer = zones",
+                "agg_field = STATE",
+                "operations = proportion_valid_nonzero",
+                f"base_vector_pattern = {projected_zone_vector.name}[value]",
+                "output_csv = output.csv",
+            ]
+        )
+    )
+    with pytest.raises(ValueError, match="raster-only operations"):
         runner.parse_and_validate_config(cfg_path)
 
 
@@ -442,9 +468,11 @@ def test_fast_zonal_statistics_computes_grouped_raster_stats(
     assert left["p50"] == pytest.approx(9.0)
     assert left["area_ha_total"] == pytest.approx(0.0008)
     assert left["area_ha_valid"] == pytest.approx(0.0007)
+    assert left["proportion_valid_nonzero"] == pytest.approx(7 / 8)
     assert right["total_count"] == 8
     assert right["valid_count"] == 8
     assert right["sum"] == pytest.approx(76.0)
+    assert right["proportion_valid_nonzero"] == pytest.approx(1.0)
 
 
 def test_run_vector_stats_job_writes_nearest_attribute_stats(
@@ -575,7 +603,7 @@ def test_run_zonal_stats_job_raster_integration(
             agg_vector=projected_zone_vector,
             agg_layer="zones",
             agg_field=["STATE", "COUNTY"],
-            operations=["sum", "valid_count"],
+            operations=["sum", "valid_count", "proportion_valid_nonzero"],
             output_csv=output_csv,
             output_gpkg=None,
             workdir=tmp_path / "work",
@@ -587,8 +615,18 @@ def test_run_zonal_stats_job_raster_integration(
     finally:
         task_graph.close()
     result = pd.read_csv(output_csv)
-    assert set(result.columns) == {"STATE", "COUNTY", "sum_values", "valid_count_values"}
+    assert set(result.columns) == {
+        "STATE",
+        "COUNTY",
+        "sum_values",
+        "valid_count_values",
+        "proportion_valid_nonzero_values",
+    }
     assert result["sum_values"].sum() == pytest.approx(130.0)
+    left = result[result["COUNTY"].astype(str).str.zfill(3) == "001"].iloc[0]
+    right = result[result["COUNTY"].astype(str).str.zfill(3) == "002"].iloc[0]
+    assert left["proportion_valid_nonzero_values"] == pytest.approx(7 / 8)
+    assert right["proportion_valid_nonzero_values"] == pytest.approx(1.0)
 
 
 def test_run_zonal_stats_job_measure_integration(tmp_path, projected_zone_vector):
