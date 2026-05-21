@@ -73,7 +73,14 @@ VALID_OPERATIONS = {
 
 
 def _is_percentile_operation(operation):
-    """Return whether an operation token is a percentile specifier."""
+    """Return whether an operation token is a percentile specifier.
+
+    Args:
+        operation: Normalized operation token from the configuration.
+
+    Returns:
+        True if `operation` is formatted as `p<number>`, otherwise False.
+    """
     if not operation.startswith("p") or len(operation) == 1:
         return False
     try:
