@@ -47,6 +47,10 @@ AREA_HECTARE_OPERATIONS = {
     "area_ha_total",
     "area_ha_valid",
 }
+RASTER_PROPORTION_OPERATIONS = {
+    "proportion_valid_nonzero",
+}
+RASTER_ONLY_OPERATIONS = AREA_HECTARE_OPERATIONS | RASTER_PROPORTION_OPERATIONS
 MEASURE_OPERATIONS = {
     "intersect_area_ha",
     "intersect_length_km",
@@ -55,7 +59,7 @@ MEASURE_OPERATIONS = {
 _AREA_HECTARE_ASSUMPTIONS = set()
 _MEASURE_CRS_ASSUMPTIONS = set()
 VALID_OPERATIONS = {
-    *AREA_HECTARE_OPERATIONS,
+    *RASTER_ONLY_OPERATIONS,
     *MEASURE_OPERATIONS,
     "mean",
     "stdev",
@@ -65,6 +69,17 @@ VALID_OPERATIONS = {
     "total_count",
     "valid_count",
 }
+
+
+def _is_percentile_operation(operation):
+    """Return whether an operation token is a percentile specifier."""
+    if not operation.startswith("p") or len(operation) == 1:
+        return False
+    try:
+        float(operation[1:])
+    except ValueError:
+        return False
+    return True
 
 
 class _TqdmLoggingHandler(logging.StreamHandler):
@@ -769,7 +784,7 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
             raise ValueError(f"[job:{tag}] operations is empty")
 
         invalid_ops = sorted(set(operations) - VALID_OPERATIONS)
-        if any(op for op in invalid_ops if not op.startswith("p")):
+        if any(op for op in invalid_ops if not _is_percentile_operation(op)):
             raise ValueError(
                 f"[job:{tag}] invalid operations: {invalid_ops}. "
                 f"Valid operations: {sorted(VALID_OPERATIONS)}"
@@ -899,11 +914,12 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                 "base_vector_pattern, or base_measure_vector"
             )
         if (
-            AREA_HECTARE_OPERATIONS.intersection(operations)
+            RASTER_ONLY_OPERATIONS.intersection(operations)
             and not base_raster_path_list
         ):
             raise ValueError(
-                f"[job:{tag}] area_ha operations require base_raster_pattern"
+                f"[job:{tag}] raster-only operations require base_raster_pattern: "
+                f"{sorted(RASTER_ONLY_OPERATIONS.intersection(operations))}"
             )
 
         job_list.append(
@@ -999,6 +1015,8 @@ def fast_zonal_statistics(
         "total_count": 0,
         "nodata_count": 0,
         "valid_count": 0,
+        "valid_nonzero_count": 0,
+        "proportion_valid_nonzero": 0.0,
         "area_ha_total": 0.0,
         "area_ha_valid": 0.0,
         "sum": 0.0,
@@ -1014,6 +1032,7 @@ def fast_zonal_statistics(
         "max": None,
         "total_count": 0,
         "nodata_count": 0,
+        "valid_nonzero_count": 0,
         "sum": 0.0,
         "sumsq": 0.0,
     }
@@ -1322,13 +1341,18 @@ def fast_zonal_statistics(
 
                 feature_nodata_mask = _raster_nodata_mask(feature_values)
                 nodata_count = int(np.count_nonzero(feature_nodata_mask))
+                valid_feature_values = feature_values[~feature_nodata_mask]
+                valid_nonzero_count = int(
+                    np.count_nonzero(valid_feature_values != 0)
+                )
 
                 feature_stats = feature_stats_by_id[feature_id]
                 feature_stats["total_count"] += total_count
                 feature_stats["nodata_count"] += nodata_count
+                feature_stats["valid_nonzero_count"] += valid_nonzero_count
 
                 if ignore_nodata:
-                    feature_values = feature_values[~feature_nodata_mask]
+                    feature_values = valid_feature_values
                 if feature_values.size == 0:
                     continue
 
@@ -1391,6 +1415,9 @@ def fast_zonal_statistics(
 
             group_stats["total_count"] += feature_stats["total_count"]
             group_stats["nodata_count"] += feature_stats["nodata_count"]
+            group_stats["valid_nonzero_count"] += feature_stats[
+                "valid_nonzero_count"
+            ]
             group_stats["sum"] += feature_stats["sum"]
             group_stats["sumsq"] += feature_stats["sumsq"]
 
@@ -1408,6 +1435,11 @@ def fast_zonal_statistics(
         for group_value, group_stats in grouped_stats.items():
             valid_count = group_stats["total_count"] - group_stats["nodata_count"]
             group_stats["valid_count"] = valid_count
+            group_stats["proportion_valid_nonzero"] = (
+                group_stats["valid_nonzero_count"] / group_stats["total_count"]
+                if group_stats["total_count"] > 0
+                else 0.0
+            )
             if raster_pixel_area_ha is not None:
                 group_stats["area_ha_total"] = (
                     group_stats["total_count"] * raster_pixel_area_ha
@@ -1437,6 +1469,11 @@ def fast_zonal_statistics(
 
             valid_count = group_stats["total_count"] - group_stats["nodata_count"]
             group_stats["valid_count"] = valid_count
+            group_stats["proportion_valid_nonzero"] = (
+                group_stats["valid_nonzero_count"] / group_stats["total_count"]
+                if group_stats["total_count"] > 0
+                else 0.0
+            )
             if raster_pixel_area_ha is not None:
                 group_stats["area_ha_total"] = (
                     group_stats["total_count"] * raster_pixel_area_ha
@@ -1576,7 +1613,7 @@ def run_vector_stats_job(
     core_ops = []
     pct_list = []
     for operation in normalized_operations:
-        if operation.startswith("p") and len(operation) > 1:
+        if _is_percentile_operation(operation):
             pct_list.append(float(operation[1:]))
         else:
             core_ops.append(operation)
@@ -2339,7 +2376,7 @@ def run_zonal_stats_job(
     core_ops = []
     pct_list = []
     for op in ops:
-        if op.startswith("p") and len(op) > 1:
+        if _is_percentile_operation(op):
             pct_list.append(float(op[1:]))
         else:
             core_ops.append(op)
