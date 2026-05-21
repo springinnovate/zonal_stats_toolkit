@@ -1,7 +1,7 @@
 from __future__ import annotations
 from threading import Thread
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 import collections
@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 _GDAL_ERROR_HANDLER_INSTALLED = False
 _GDAL_CACHE_MAX_BYTES = 512 * 1024**2
 _BYTES_PER_MIB = 1024**2
+_RASTERIZE_TILE_SIZE = 1024
+_RASTERIZE_WORKER_COUNT = 4
 
 
 AREA_HECTARE_OPERATIONS = {
@@ -469,6 +471,205 @@ def _prepare_aggregate_vector_for_rasterization(
     logger.debug("vector translate done | output=%s", target_vector_path)
 
 
+def _iter_raster_tiles(raster_x_size, raster_y_size, tile_size):
+    """Yield windows that cover a raster grid.
+
+    Args:
+        raster_x_size: Raster width in pixels.
+        raster_y_size: Raster height in pixels.
+        tile_size: Maximum tile width and height in pixels.
+
+    Yields:
+        Dictionaries with GDAL-style `xoff`, `yoff`, `win_xsize`, and
+        `win_ysize` entries.
+    """
+    for yoff in range(0, raster_y_size, tile_size):
+        win_ysize = min(tile_size, raster_y_size - yoff)
+        for xoff in range(0, raster_x_size, tile_size):
+            win_xsize = min(tile_size, raster_x_size - xoff)
+            yield {
+                "xoff": xoff,
+                "yoff": yoff,
+                "win_xsize": win_xsize,
+                "win_ysize": win_ysize,
+            }
+
+
+def _tile_geotransform(base_geotransform, tile):
+    """Return a geotransform shifted to a tile's upper-left pixel.
+
+    Args:
+        base_geotransform: Six-element GDAL geotransform for the full raster.
+        tile: Tile window dictionary with `xoff` and `yoff` entries.
+
+    Returns:
+        Six-element GDAL geotransform whose origin is the tile's upper-left
+        pixel.
+    """
+    return (
+        base_geotransform[0]
+        + tile["xoff"] * base_geotransform[1]
+        + tile["yoff"] * base_geotransform[2],
+        base_geotransform[1],
+        base_geotransform[2],
+        base_geotransform[3]
+        + tile["xoff"] * base_geotransform[4]
+        + tile["yoff"] * base_geotransform[5],
+        base_geotransform[4],
+        base_geotransform[5],
+    )
+
+
+def _tile_bounds(base_geotransform, tile):
+    """Return a tile bounding box in raster coordinates.
+
+    Args:
+        base_geotransform: Six-element GDAL geotransform for the full raster.
+        tile: Tile window dictionary with `xoff`, `yoff`, `win_xsize`, and
+            `win_ysize` entries.
+
+    Returns:
+        Tuple of `(min_x, min_y, max_x, max_y)` covering the tile footprint.
+    """
+    xoff = tile["xoff"]
+    yoff = tile["yoff"]
+    xsize = tile["win_xsize"]
+    ysize = tile["win_ysize"]
+    corners = (
+        (xoff, yoff),
+        (xoff + xsize, yoff),
+        (xoff + xsize, yoff + ysize),
+        (xoff, yoff + ysize),
+    )
+    x_values = [
+        base_geotransform[0] + px * base_geotransform[1] + py * base_geotransform[2]
+        for px, py in corners
+    ]
+    y_values = [
+        base_geotransform[3] + px * base_geotransform[4] + py * base_geotransform[5]
+        for px, py in corners
+    ]
+    return (min(x_values), min(y_values), max(x_values), max(y_values))
+
+
+def _rasterize_aggregate_fid_tile(
+    aggregate_vector_path,
+    aggregate_layer_name,
+    tile_path,
+    tile,
+    base_geotransform,
+    projection_wkt,
+    target_nodata,
+):
+    """Rasterize aggregate FIDs for one raster tile.
+
+    Args:
+        aggregate_vector_path: Path to the prepared aggregation vector.
+        aggregate_layer_name: Layer name in `aggregate_vector_path`, or `None`
+            to use the default layer.
+        tile_path: Path where the tile GeoTIFF will be written.
+        tile: Tile window dictionary with offsets and dimensions.
+        base_geotransform: Six-element GDAL geotransform for the full raster.
+        projection_wkt: WKT projection for the output tile raster.
+        target_nodata: Nodata value to initialize in the tile raster.
+
+    Returns:
+        Path to the completed tile raster.
+
+    Raises:
+        RuntimeError: If the vector, layer, or rasterization step fails.
+    """
+    tile_path = Path(tile_path)
+    tile_path.parent.mkdir(parents=True, exist_ok=True)
+    tile_path.unlink(missing_ok=True)
+
+    driver = gdal.GetDriverByName("GTiff")
+    tile_dataset = driver.Create(
+        str(tile_path),
+        tile["win_xsize"],
+        tile["win_ysize"],
+        1,
+        gdal.GDT_Int32,
+        options=["TILED=YES", "COMPRESS=LZW"],
+    )
+    tile_dataset.SetGeoTransform(_tile_geotransform(base_geotransform, tile))
+    tile_dataset.SetProjection(projection_wkt)
+    tile_band = tile_dataset.GetRasterBand(1)
+    tile_band.SetNoDataValue(target_nodata)
+    tile_band.Fill(target_nodata)
+
+    aggregate_vector = gdal.OpenEx(str(aggregate_vector_path), gdal.OF_VECTOR)
+    if aggregate_vector is None:
+        raise RuntimeError(f"Could not open aggregate vector {aggregate_vector_path}")
+    aggregate_layer = (
+        aggregate_vector.GetLayerByName(aggregate_layer_name)
+        if aggregate_layer_name is not None
+        else aggregate_vector.GetLayer()
+    )
+    if aggregate_layer is None:
+        raise RuntimeError(
+            f"Could not open aggregate layer {aggregate_layer_name} "
+            f"in {aggregate_vector_path}"
+        )
+
+    min_x, min_y, max_x, max_y = _tile_bounds(base_geotransform, tile)
+    aggregate_layer.SetSpatialFilterRect(min_x, min_y, max_x, max_y)
+    aggregate_layer.ResetReading()
+    error_code = gdal.RasterizeLayer(
+        tile_dataset,
+        [1],
+        aggregate_layer,
+        options=[
+            "ALL_TOUCHED=FALSE",
+            "ATTRIBUTE=original_fid",
+        ],
+    )
+    aggregate_layer.SetSpatialFilter(None)
+    tile_dataset.FlushCache()
+    tile_band = None
+    tile_dataset = None
+    aggregate_layer = None
+    aggregate_vector = None
+    if error_code != 0:
+        raise RuntimeError(
+            f"RasterizeLayer failed with error code {error_code} for {tile_path}"
+        )
+    return tile_path
+
+
+def _stitch_raster_tiles(target_raster_path, tile_specs):
+    """Copy completed rasterized tiles into the target raster.
+
+    Args:
+        target_raster_path: Path to the full-size raster opened for update.
+        tile_specs: Iterable of `(tile, tile_path)` pairs, where `tile`
+            defines the output offset and `tile_path` points to a completed
+            tile raster.
+
+    Raises:
+        RuntimeError: If the target raster or any tile raster cannot be opened.
+    """
+    target_dataset = gdal.OpenEx(
+        str(target_raster_path), gdal.GA_Update | gdal.OF_RASTER
+    )
+    if target_dataset is None:
+        raise RuntimeError(f"Could not open target raster at {target_raster_path}")
+    target_band = target_dataset.GetRasterBand(1)
+    try:
+        for tile, tile_path in tile_specs:
+            tile_dataset = gdal.OpenEx(str(tile_path), gdal.OF_RASTER)
+            if tile_dataset is None:
+                raise RuntimeError(f"Could not open rasterized tile at {tile_path}")
+            tile_array = tile_dataset.GetRasterBand(1).ReadAsArray()
+            target_band.WriteArray(tile_array, tile["xoff"], tile["yoff"])
+            tile_dataset = None
+        target_band.FlushCache()
+        target_dataset.FlushCache()
+    finally:
+        target_band = None
+        target_dataset = None
+
+
 def _rasterize_aggregate_fids(
     base_raster_path,
     aggregate_vector_path,
@@ -478,8 +679,35 @@ def _rasterize_aggregate_fids(
     progress_queue,
     progress_id,
     progress_start_value,
+    tile_size=_RASTERIZE_TILE_SIZE,
+    rasterize_worker_count=None,
 ):
-    """Rasterize prepared aggregation feature IDs onto the base raster grid."""
+    """Rasterize prepared aggregation feature IDs onto the base raster grid.
+
+    Args:
+        base_raster_path: Raster whose grid defines the output alignment.
+        aggregate_vector_path: Path to the prepared aggregation vector.
+        aggregate_layer_name: Layer name in `aggregate_vector_path`, or `None`
+            to use the default layer.
+        target_raster_path: Path where the full aggregation-FID raster is
+            written.
+        target_nodata: Nodata value for pixels outside aggregation features.
+        progress_queue: Queue-like object receiving progress events.
+        progress_id: Progress bar identifier to update.
+        progress_start_value: Existing progress value before rasterization
+            starts.
+        tile_size: Maximum tile width and height in pixels.
+        rasterize_worker_count: Number of tile worker processes, or `None` to
+            use the default.
+
+    Returns:
+        Number of progress steps completed while rasterizing and stitching
+        tiles.
+
+    Raises:
+        RuntimeError: If the base raster cannot be opened or tile rasterization
+            fails.
+    """
     target_raster_path = Path(target_raster_path)
     target_raster_path.parent.mkdir(parents=True, exist_ok=True)
     target_raster_path.unlink(missing_ok=True)
@@ -492,45 +720,99 @@ def _rasterize_aggregate_fids(
         [target_nodata],
     )
 
-    aggregate_vector = gdal.OpenEx(str(aggregate_vector_path), gdal.OF_VECTOR)
-    aggregate_layer = (
-        aggregate_vector.GetLayerByName(aggregate_layer_name)
-        if aggregate_layer_name is not None
-        else aggregate_vector.GetLayer()
-    )
-    feature_id_raster_dataset = gdal.OpenEx(
-        str(target_raster_path), gdal.GA_Update | gdal.OF_RASTER
-    )
-    if feature_id_raster_dataset is None:
-        raise RuntimeError(f"Could not open target raster at {target_raster_path}")
+    base_raster = gdal.OpenEx(str(base_raster_path), gdal.OF_RASTER)
+    if base_raster is None:
+        raise RuntimeError(f"Could not open base raster at {base_raster_path}")
+    base_geotransform = base_raster.GetGeoTransform()
+    projection_wkt = base_raster.GetProjection()
+    raster_x_size = base_raster.RasterXSize
+    raster_y_size = base_raster.RasterYSize
+    base_raster = None
 
-    rasterize_callback = _make_progress_callback(
-        progress_queue,
-        progress_id,
-        "rasterizing polygons",
-        progress_start_value,
-    )
-    aggregate_layer.ResetReading()
-    logger.debug("rasterize start")
-    error_code = gdal.RasterizeLayer(
-        feature_id_raster_dataset,
-        [1],
-        aggregate_layer,
-        callback=rasterize_callback,
-        options=[
-            "ALL_TOUCHED=FALSE",
-            "ATTRIBUTE=original_fid",
-        ],
-    )
-    feature_id_raster_dataset.FlushCache()
-    feature_id_raster_dataset = None
-    aggregate_layer = None
-    aggregate_vector = None
-    if error_code != 0:
-        raise RuntimeError(
-            f"RasterizeLayer failed with error code {error_code} for {target_raster_path}"
+    tile_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f"{target_raster_path.stem}_tiles_",
+            dir=target_raster_path.parent,
         )
+    )
+    tile_specs = []
+    for tile_index, tile in enumerate(
+        _iter_raster_tiles(raster_x_size, raster_y_size, tile_size)
+    ):
+        tile_path = (
+            tile_dir
+            / f"tile_{tile_index:06d}_{tile['xoff']}_{tile['yoff']}.tif"
+        )
+        tile_specs.append((tile, tile_path))
+
+    worker_count = rasterize_worker_count or min(
+        _RASTERIZE_WORKER_COUNT, os.cpu_count() or 1
+    )
+    worker_count = max(1, min(worker_count, len(tile_specs)))
+    logger.debug(
+        "rasterize start | tiles=%d | tile_size=%d | workers=%d | tile_dir=%s",
+        len(tile_specs),
+        tile_size,
+        worker_count,
+        tile_dir,
+    )
+
+    progress_steps = len(tile_specs) + 1
+    progress_queue.put(
+        {
+            "event": "analysis_total",
+            "id": progress_id,
+            "total": progress_start_value + progress_steps,
+            "unit": "tile",
+            "phase": "rasterizing polygon tiles",
+        },
+    )
+
+    completed_tiles = 0
+
+    def _report_tile_progress():
+        progress_queue.put(
+            {
+                "event": "analysis_update",
+                "id": progress_id,
+                "increment": 1,
+                "phase": "rasterizing polygon tiles",
+            },
+        )
+
+    try:
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            future_to_tile_spec = {
+                executor.submit(
+                    _rasterize_aggregate_fid_tile,
+                    aggregate_vector_path,
+                    aggregate_layer_name,
+                    tile_path,
+                    tile,
+                    base_geotransform,
+                    projection_wkt,
+                    target_nodata,
+                ): (tile, tile_path)
+                for tile, tile_path in tile_specs
+            }
+            for future in as_completed(future_to_tile_spec):
+                future.result()
+                completed_tiles += 1
+                _report_tile_progress()
+
+        progress_queue.put(
+            {
+                "event": "analysis_update",
+                "id": progress_id,
+                "increment": 1,
+                "phase": "stitching rasterized tiles",
+            },
+        )
+        _stitch_raster_tiles(target_raster_path, tile_specs)
+    finally:
+        shutil.rmtree(tile_dir, ignore_errors=True)
     logger.debug("rasterize done")
+    return progress_steps
 
 
 def _make_progress_callback(progress_queue, progress_id, phase, start_value=0):
@@ -1069,7 +1351,6 @@ def fast_zonal_statistics(
     cache_working_dir.mkdir(parents=True, exist_ok=True)
     projected_vector_path = cache_working_dir / "projected_vector.gpkg"
     feature_id_raster_path = cache_working_dir / "agg_fid.tif"
-    local_task_graph = taskgraph.TaskGraph(cache_working_dir / "taskgraph", 1, None)
     logger.debug("using zonal statistics cache dir: %s", cache_working_dir)
 
     def _raster_nodata_mask(value_array):
@@ -1079,20 +1360,14 @@ def fast_zonal_statistics(
         return np.isclose(value_array, raster_nodata) | ~finite_mask
 
     try:
-        prepare_vector_task = local_task_graph.add_task(
-            func=_prepare_aggregate_vector_for_rasterization,
-            args=(
-                aggregate_vector_path,
-                aggregate_layer_name,
-                projected_vector_path,
-                raster_info["projection_wkt"],
-                simplify_tolerance,
-                needs_reproject,
-            ),
-            target_path_list=[projected_vector_path],
-            task_name=f"prepare aggregate vector for {Path(aggregate_vector_path).stem}",
+        _prepare_aggregate_vector_for_rasterization(
+            aggregate_vector_path,
+            aggregate_layer_name,
+            projected_vector_path,
+            raster_info["projection_wkt"],
+            simplify_tolerance,
+            needs_reproject,
         )
-        prepare_vector_task.join()
         progress_n += 1
         progress_queue.put(
             {
@@ -1216,41 +1491,17 @@ def fast_zonal_statistics(
         aggregate_vector = None
 
         rasterize_start_progress = progress_n
-        rasterize_task = local_task_graph.add_task(
-            func=_rasterize_aggregate_fids,
-            args=(
-                raster_path_for_stats,
-                projected_vector_path,
-                aggregate_layer_name,
-                feature_id_raster_path,
-                feature_id_raster_nodata,
-                progress_queue,
-                progress_id,
-                rasterize_start_progress,
-            ),
-            dependent_task_list=[prepare_vector_task],
-            target_path_list=[feature_id_raster_path],
-            task_name=f"rasterize aggregate fids for {Path(raster_path).stem}",
+        rasterize_progress_count = _rasterize_aggregate_fids(
+            raster_path_for_stats,
+            projected_vector_path,
+            aggregate_layer_name,
+            feature_id_raster_path,
+            feature_id_raster_nodata,
+            progress_queue,
+            progress_id,
+            rasterize_start_progress,
         )
-        progress_queue.put(
-            {
-                "event": "analysis_total",
-                "id": progress_id,
-                "total": progress_n + 101,
-                "unit": "step",
-                "phase": "rasterizing polygons",
-            },
-        )
-        rasterize_task.join()
-        progress_queue.put(
-            {
-                "event": "analysis_set",
-                "id": progress_id,
-                "value": rasterize_start_progress + 100,
-                "phase": "preparing raster blocks",
-            },
-        )
-        progress_n += 100
+        progress_n += rasterize_progress_count
         progress_queue.put(
             {
                 "event": "analysis_update",
@@ -1515,7 +1766,6 @@ def fast_zonal_statistics(
         )
         return dict(grouped_stats)
     finally:
-        local_task_graph.close()
         if clean_working_dir:
             logger.debug("cleaning zonal statistics cache dir: %s", cache_working_dir)
             shutil.rmtree(cache_working_dir)
@@ -2302,9 +2552,10 @@ def run_zonal_stats_job(
 
     Computes statistics for one or more base rasters and/or base vector datasets
     using geometries from an aggregation vector layer. Raster zonal statistics are
-    executed via a task graph using `fast_zonal_statistics`, while vector-based
-    statistics are delegated to `run_vector_stats_job`. Results from all inputs
-    are merged on the aggregation field and written to the configured outputs.
+    executed directly so the rasterization step can manage its own process pool,
+    while vector-based statistics are delegated to `run_vector_stats_job`. Results
+    from all inputs are merged on the aggregation field and written to the
+    configured outputs.
 
     Both raster- and vector-derived statistics support core operations
     (e.g. count, sum, mean) and percentile operations (e.g. `p50`). All paths,
@@ -2372,36 +2623,42 @@ def run_zonal_stats_job(
         )
         return
 
-    grouped_stats_list = []
+    raster_dataframes = []
     if base_raster_path_list:
-        raster_rows = []
         for base_raster_path in base_raster_path_list:
             base_raster_path = Path(base_raster_path)
-
-            grouped_stats_task = task_graph.add_task(
-                func=fast_zonal_statistics,
-                args=((base_raster_path, 1), agg_vector, agg_fields),
-                kwargs={
-                    "aggregate_layer_name": agg_layer,
-                    "ignore_nodata": True,
-                    "working_dir": workdir,
-                    "clean_working_dir": False,
-                    "percentile_list": pct_list,
-                    "calculate_area_ha": bool(
-                        AREA_HECTARE_OPERATIONS.intersection(core_ops)
-                    ),
-                    "progress_queue": progress_queue,
-                    "progress_id": f"raster:{tag}:{base_raster_path.stem}",
-                },
-                store_result=True,
-                task_name=(
-                    f"fast_zonal_statistics for {Path(base_raster_path).stem}, "
-                    f"{Path(agg_vector).stem} {','.join(agg_fields)}"
+            grouped_stats = fast_zonal_statistics(
+                (base_raster_path, 1),
+                agg_vector,
+                agg_fields,
+                aggregate_layer_name=agg_layer,
+                ignore_nodata=True,
+                working_dir=workdir,
+                clean_working_dir=False,
+                percentile_list=pct_list,
+                calculate_area_ha=bool(
+                    AREA_HECTARE_OPERATIONS.intersection(core_ops)
                 ),
+                progress_queue=progress_queue,
+                progress_id=f"raster:{tag}:{base_raster_path.stem}",
             )
-            grouped_stats_list.append(
-                (base_raster_path.stem, agg_fields, grouped_stats_task)
-            )
+            raster_rows = []
+            for group_value, statistics in grouped_stats.items():
+                if len(agg_fields) == 1:
+                    row = {agg_fields[0]: group_value}
+                else:
+                    row = dict(zip(agg_fields, group_value))
+                for operation in core_ops:
+                    row[f"{operation}_{base_raster_path.stem}"] = statistics.get(
+                        operation
+                    )
+                for percentile_key in pct_keys:
+                    row[f"{percentile_key}_{base_raster_path.stem}"] = (
+                        statistics.get(percentile_key)
+                    )
+                raster_rows.append(row)
+
+            raster_dataframes.append(pd.DataFrame(raster_rows))
 
     combined_dataframe = None
 
@@ -2433,25 +2690,6 @@ def run_zonal_stats_job(
             vector_dataframe = vector_dataframe.rename(columns={"base_vector": "base"})
 
         combined_dataframe = vector_dataframe
-
-    raster_dataframes = []
-
-    for raster_stem, aggregation_field_names, group_task in grouped_stats_list:
-        grouped_stats = group_task.get()
-
-        raster_rows = []
-        for group_value, statistics in grouped_stats.items():
-            if len(aggregation_field_names) == 1:
-                row = {aggregation_field_names[0]: group_value}
-            else:
-                row = dict(zip(aggregation_field_names, group_value))
-            for operation in core_ops:
-                row[f"{operation}_{raster_stem}"] = statistics.get(operation)
-            for percentile_key in pct_keys:
-                row[f"{percentile_key}_{raster_stem}"] = statistics.get(percentile_key)
-            raster_rows.append(row)
-
-        raster_dataframes.append(pd.DataFrame(raster_rows))
 
     raster_dataframe = None
     for raster_frame in raster_dataframes:
