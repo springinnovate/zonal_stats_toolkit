@@ -1289,6 +1289,7 @@ def fast_zonal_statistics(
     clean_working_dir=False,
     percentile_list=None,
     calculate_area_ha=False,
+    rasterize_worker_count=None,
     *,
     progress_queue,
     progress_id,
@@ -1564,6 +1565,7 @@ def fast_zonal_statistics(
             progress_queue,
             progress_id,
             rasterize_start_progress,
+            rasterize_worker_count=rasterize_worker_count,
         )
         progress_n += rasterize_progress_count
         progress_queue.put(
@@ -2612,6 +2614,86 @@ def _write_zonal_outputs(
     output_gdf.to_file(output_gpkg, layer=agg_layer, driver="GPKG")
 
 
+def _raster_zonal_stats_dataframe(
+    raster_index: int,
+    base_raster_path: Path,
+    agg_vector: Path,
+    agg_fields: list[str],
+    agg_layer: str,
+    workdir: Path,
+    core_ops: list[str],
+    pct_list: list[float],
+    pct_keys: list[str],
+    calculate_area_ha: bool,
+    progress_queue,
+    tag: str,
+    rasterize_worker_count: int | None,
+) -> tuple[int, pd.DataFrame, list[str]]:
+    """Compute one raster's zonal statistics and convert them to a dataframe.
+
+    Args:
+        raster_index: Original position of the raster in the job configuration.
+        base_raster_path: Raster path to process.
+        agg_vector: Path to the aggregation vector dataset.
+        agg_fields: Attribute fields identifying aggregation groups.
+        agg_layer: Aggregation vector layer name.
+        workdir: Directory for intermediate files.
+        core_ops: Non-percentile operations to include in output columns.
+        pct_list: Percentile values to compute.
+        pct_keys: Percentile column prefixes matching `pct_list`.
+        calculate_area_ha: Whether hectare area metrics are required.
+        progress_queue: Queue for progress monitor events.
+        tag: Job identifier used in progress IDs.
+        rasterize_worker_count: Tile rasterization worker count for this raster.
+
+    Returns:
+        Tuple of original raster index, result dataframe, and area-assumption
+        messages emitted while processing this raster.
+    """
+    _configure_gdal_cache()
+    previous_area_assumptions = set(_AREA_HECTARE_ASSUMPTIONS)
+    _AREA_HECTARE_ASSUMPTIONS.clear()
+
+    try:
+        base_raster_path = Path(base_raster_path)
+        grouped_stats = fast_zonal_statistics(
+            (base_raster_path, 1),
+            agg_vector,
+            agg_fields,
+            aggregate_layer_name=agg_layer,
+            ignore_nodata=True,
+            working_dir=workdir,
+            clean_working_dir=False,
+            percentile_list=pct_list,
+            calculate_area_ha=calculate_area_ha,
+            rasterize_worker_count=rasterize_worker_count,
+            progress_queue=progress_queue,
+            progress_id=f"raster:{tag}:{base_raster_path.stem}",
+        )
+        raster_rows = []
+        for group_value, statistics in grouped_stats.items():
+            if len(agg_fields) == 1:
+                row = {agg_fields[0]: group_value}
+            else:
+                row = dict(zip(agg_fields, group_value))
+            for operation in core_ops:
+                row[f"{operation}_{base_raster_path.stem}"] = statistics.get(operation)
+            for percentile_key in pct_keys:
+                row[f"{percentile_key}_{base_raster_path.stem}"] = statistics.get(
+                    percentile_key
+                )
+            raster_rows.append(row)
+
+        return (
+            raster_index,
+            pd.DataFrame(raster_rows),
+            sorted(_AREA_HECTARE_ASSUMPTIONS),
+        )
+    finally:
+        _AREA_HECTARE_ASSUMPTIONS.clear()
+        _AREA_HECTARE_ASSUMPTIONS.update(previous_area_assumptions)
+
+
 def run_zonal_stats_job(
     base_raster_path_list: list[Path],
     base_vector_path_list: list[Path],
@@ -2629,6 +2711,7 @@ def run_zonal_stats_job(
     tag: str,
     task_graph,
     progress_queue,
+    raster_workers: int = 1,
 ):
     """Run a zonal statistics job over raster and/or vector base datasets.
 
@@ -2662,6 +2745,7 @@ def run_zonal_stats_job(
         tag: Job identifier used for temporary filenames and task labeling.
         task_graph: Task graph instance used to schedule raster and vector jobs.
         progress_queue: Queue for progress monitor events.
+        raster_workers: Maximum number of rasters to process concurrently.
 
     Raises:
         ValueError: If operation parsing fails or required inputs are inconsistent.
@@ -2682,6 +2766,8 @@ def run_zonal_stats_job(
 
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
+    if raster_workers < 1:
+        raise ValueError("raster_workers must be at least 1")
 
     if base_measure_vector is not None:
         combined_dataframe = run_vector_measure_job(
@@ -2707,40 +2793,49 @@ def run_zonal_stats_job(
 
     raster_dataframes = []
     if base_raster_path_list:
-        for base_raster_path in base_raster_path_list:
-            base_raster_path = Path(base_raster_path)
-            grouped_stats = fast_zonal_statistics(
-                (base_raster_path, 1),
+        raster_worker_count = max(
+            1, min(int(raster_workers), len(base_raster_path_list))
+        )
+        rasterize_worker_count = None if raster_worker_count == 1 else 1
+        raster_jobs = [
+            (
+                raster_index,
+                Path(base_raster_path),
                 agg_vector,
                 agg_fields,
-                aggregate_layer_name=agg_layer,
-                ignore_nodata=True,
-                working_dir=workdir,
-                clean_working_dir=False,
-                percentile_list=pct_list,
-                calculate_area_ha=bool(
-                    AREA_HECTARE_OPERATIONS.intersection(core_ops)
-                ),
-                progress_queue=progress_queue,
-                progress_id=f"raster:{tag}:{base_raster_path.stem}",
+                agg_layer,
+                workdir,
+                core_ops,
+                pct_list,
+                pct_keys,
+                bool(AREA_HECTARE_OPERATIONS.intersection(core_ops)),
+                progress_queue,
+                tag,
+                rasterize_worker_count,
             )
-            raster_rows = []
-            for group_value, statistics in grouped_stats.items():
-                if len(agg_fields) == 1:
-                    row = {agg_fields[0]: group_value}
-                else:
-                    row = dict(zip(agg_fields, group_value))
-                for operation in core_ops:
-                    row[f"{operation}_{base_raster_path.stem}"] = statistics.get(
-                        operation
-                    )
-                for percentile_key in pct_keys:
-                    row[f"{percentile_key}_{base_raster_path.stem}"] = (
-                        statistics.get(percentile_key)
-                    )
-                raster_rows.append(row)
+            for raster_index, base_raster_path in enumerate(base_raster_path_list)
+        ]
+        logger.debug(
+            "running %d raster(s) for job:%s with %d raster worker process(es)",
+            len(raster_jobs),
+            tag,
+            raster_worker_count,
+        )
+        raster_results = []
+        with ProcessPoolExecutor(max_workers=raster_worker_count) as executor:
+            future_to_raster_path = {
+                executor.submit(_raster_zonal_stats_dataframe, *raster_job): raster_job[
+                    1
+                ]
+                for raster_job in raster_jobs
+            }
+            for future in as_completed(future_to_raster_path):
+                raster_results.append(future.result())
 
-            raster_dataframes.append(pd.DataFrame(raster_rows))
+        raster_results.sort(key=lambda result: result[0])
+        for _, raster_dataframe, area_assumptions in raster_results:
+            _AREA_HECTARE_ASSUMPTIONS.update(area_assumptions)
+            raster_dataframes.append(raster_dataframe)
 
     combined_dataframe = None
 
@@ -2825,10 +2920,23 @@ def main():
             "CPU count)."
         ),
     )
+    parser.add_argument(
+        "--raster-workers",
+        dest="raster_workers",
+        type=int,
+        default=None,
+        help=(
+            "Worker processes for independent rasters within each job. Defaults "
+            "to min(4, --job-workers). Increase carefully on disk- or "
+            "memory-constrained systems."
+        ),
+    )
     parser.add_argument("--test", action="store_true")
     args = parser.parse_args()
     if args.job_workers is not None and args.job_workers < 1:
         raise ValueError("--job-workers must be at least 1")
+    if args.raster_workers is not None and args.raster_workers < 1:
+        raise ValueError("--raster-workers must be at least 1")
 
     config_list = []
     for config_path in args.configs:
@@ -2874,6 +2982,8 @@ def main():
     cpu_count = os.cpu_count() or 1
     job_workers = args.job_workers or max(1, min(4, cpu_count // 2))
     job_workers = max(1, job_workers)
+    raster_workers = args.raster_workers or max(1, min(4, job_workers))
+    raster_workers = max(1, raster_workers)
     process_context = multiprocessing.get_context("spawn")
     progress_manager = process_context.Manager()
     progress_queue = progress_manager.Queue()
@@ -2886,9 +2996,11 @@ def main():
 
     try:
         logger.debug(
-            "running %d jobs sequentially with %d internal worker process(es)",
+            "running %d jobs sequentially with %d internal worker process(es) "
+            "and %d raster worker process(es)",
             total_job_count,
             job_workers,
+            raster_workers,
         )
         job_error = None
         for output_label, job in job_run_list:
@@ -2897,6 +3009,7 @@ def main():
             status = "done"
             try:
                 job["progress_queue"] = progress_queue
+                job["raster_workers"] = raster_workers
                 progress_queue.put({"event": "job_start", "tag": tag})
                 with ProcessPoolExecutor(
                     max_workers=1,

@@ -656,6 +656,85 @@ def test_run_zonal_stats_job_raster_integration(
     assert right["proportion_valid_nonzero_values"] == pytest.approx(1.0)
 
 
+def test_run_zonal_stats_job_parallelizes_multiple_rasters(
+    monkeypatch, tmp_path, projected_zone_vector
+):
+    class ImmediateFuture:
+        def __init__(self, result):
+            self._result = result
+
+        def result(self):
+            return self._result
+
+    class FakeProcessPoolExecutor:
+        instances = []
+
+        def __init__(self, max_workers, **kwargs):
+            self.max_workers = max_workers
+            self.submitted = []
+            FakeProcessPoolExecutor.instances.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def submit(self, func, *args, **kwargs):
+            self.submitted.append((func, args, kwargs))
+            return ImmediateFuture(func(*args, **kwargs))
+
+    calls = []
+
+    def fake_fast_zonal_statistics(
+        base_raster_path_band,
+        aggregate_vector_path,
+        aggregate_vector_field,
+        *,
+        rasterize_worker_count,
+        **kwargs,
+    ):
+        raster_path, _ = base_raster_path_band
+        calls.append((Path(raster_path).stem, rasterize_worker_count))
+        return {"A": {"sum": 1 if Path(raster_path).stem == "first" else 2}}
+
+    monkeypatch.setattr(runner, "ProcessPoolExecutor", FakeProcessPoolExecutor)
+    monkeypatch.setattr(runner, "as_completed", lambda futures: futures)
+    monkeypatch.setattr(runner, "fast_zonal_statistics", fake_fast_zonal_statistics)
+
+    output_csv = tmp_path / "parallel.csv"
+    runner.run_zonal_stats_job(
+        base_raster_path_list=[tmp_path / "first.tif", tmp_path / "second.tif"],
+        base_vector_path_list=[],
+        base_vector_fields=[],
+        base_measure_vector=None,
+        base_measure_layer=None,
+        measure_crs="auto",
+        agg_vector=projected_zone_vector,
+        agg_layer="zones",
+        agg_field=["STATE"],
+        operations=["sum"],
+        output_csv=output_csv,
+        output_gpkg=None,
+        workdir=tmp_path / "work",
+        tag="parallel_rasters",
+        task_graph=None,
+        progress_queue=queue.Queue(),
+        raster_workers=2,
+    )
+
+    assert FakeProcessPoolExecutor.instances[0].max_workers == 2
+    assert calls == [("first", 1), ("second", 1)]
+
+    result = pd.read_csv(output_csv)
+    assert list(result.columns) == ["STATE", "sum_first", "sum_second"]
+    assert result.iloc[0].to_dict() == {
+        "STATE": "A",
+        "sum_first": 1,
+        "sum_second": 2,
+    }
+
+
 def test_run_zonal_stats_job_measure_integration(tmp_path, projected_zone_vector):
     measure_gdf = gpd.GeoDataFrame(
         {"geometry": [Point(0.5, 0.5), Point(3.0, 0.5)]},
