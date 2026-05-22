@@ -831,10 +831,9 @@ def _rasterize_aggregate_fids(
         )
 
     try:
-        with ProcessPoolExecutor(max_workers=worker_count) as executor:
-            future_to_tile_spec = {
-                executor.submit(
-                    _rasterize_aggregate_fid_tile,
+        if worker_count == 1:
+            for tile, tile_path in tile_specs:
+                _rasterize_aggregate_fid_tile(
                     aggregate_vector_path,
                     aggregate_layer_name,
                     tile_path,
@@ -842,13 +841,28 @@ def _rasterize_aggregate_fids(
                     base_geotransform,
                     projection_wkt,
                     target_nodata,
-                ): (tile, tile_path)
-                for tile, tile_path in tile_specs
-            }
-            for future in as_completed(future_to_tile_spec):
-                future.result()
+                )
                 completed_tiles += 1
                 _report_tile_progress()
+        else:
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                future_to_tile_spec = {
+                    executor.submit(
+                        _rasterize_aggregate_fid_tile,
+                        aggregate_vector_path,
+                        aggregate_layer_name,
+                        tile_path,
+                        tile,
+                        base_geotransform,
+                        projection_wkt,
+                        target_nodata,
+                    ): (tile, tile_path)
+                    for tile, tile_path in tile_specs
+                }
+                for future in as_completed(future_to_tile_spec):
+                    future.result()
+                    completed_tiles += 1
+                    _report_tile_progress()
 
         progress_queue.put(
             {
@@ -871,6 +885,67 @@ def _rasterize_aggregate_fids(
         shutil.rmtree(tile_dir, ignore_errors=True)
     logger.debug("rasterize done")
     return progress_steps
+
+
+def _rasterize_vector_mask(
+    base_raster_path,
+    mask_vector_path,
+    mask_layer_name,
+    target_raster_path,
+):
+    """Rasterize a vector mask onto a base raster grid.
+
+    Args:
+        base_raster_path: Raster whose grid defines the output alignment.
+        mask_vector_path: Vector datasource containing mask geometries.
+        mask_layer_name: Layer name in `mask_vector_path`.
+        target_raster_path: Byte raster path to write, with 1 inside the mask
+            and 0 outside.
+
+    Raises:
+        RuntimeError: If the mask raster or vector cannot be opened or
+            rasterization fails.
+    """
+    target_raster_path = Path(target_raster_path)
+    target_raster_path.parent.mkdir(parents=True, exist_ok=True)
+    target_raster_path.unlink(missing_ok=True)
+
+    geoprocessing.new_raster_from_base(
+        str(base_raster_path),
+        str(target_raster_path),
+        gdal.GDT_Byte,
+        [0],
+    )
+    target_dataset = gdal.OpenEx(
+        str(target_raster_path), gdal.GA_Update | gdal.OF_RASTER
+    )
+    mask_vector = gdal.OpenEx(str(mask_vector_path), gdal.OF_VECTOR)
+    if target_dataset is None:
+        raise RuntimeError(f"Could not open target mask raster at {target_raster_path}")
+    if mask_vector is None:
+        raise RuntimeError(f"Could not open mask vector at {mask_vector_path}")
+    mask_layer = mask_vector.GetLayerByName(mask_layer_name)
+    if mask_layer is None:
+        raise RuntimeError(
+            f'Could not open mask layer "{mask_layer_name}" in {mask_vector_path}'
+        )
+
+    try:
+        error_code = gdal.RasterizeLayer(
+            target_dataset,
+            [1],
+            mask_layer,
+            burn_values=[1],
+        )
+        if error_code != 0:
+            raise RuntimeError(
+                f"RasterizeLayer failed with error code {error_code} for "
+                f"{mask_vector_path}"
+            )
+    finally:
+        mask_layer = None
+        mask_vector = None
+        target_dataset = None
 
 
 def _make_progress_callback(progress_queue, progress_id, phase, start_value=0):
@@ -1147,6 +1222,8 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
         base_vector_fields = []
         base_measure_vector = None
         base_measure_layer = None
+        base_raster_mask_vector = None
+        base_raster_mask_layer = None
         measure_crs = job.get("measure_crs", "auto").strip() or "auto"
 
         base_raster_pattern = job.get("base_raster_pattern", "").strip()
@@ -1156,6 +1233,21 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                 raise FileNotFoundError(
                     f"[job:{tag}] no files found at {base_raster_pattern}"
                 )
+
+        base_raster_mask_vector_raw = job.get("base_raster_mask_vector", "").strip()
+        if base_raster_mask_vector_raw:
+            base_raster_mask_vector = _abs_from_cfg_dir(base_raster_mask_vector_raw)
+            if not base_raster_mask_vector.exists():
+                raise FileNotFoundError(
+                    f"[job:{tag}] base_raster_mask_vector not found: "
+                    f"{base_raster_mask_vector}"
+                )
+            base_raster_mask_layer = _resolve_layer(
+                base_raster_mask_vector,
+                job.get("base_raster_mask_layer", "").strip(),
+                "base_raster_mask_layer",
+                tag,
+            )
 
         base_vector_pattern = job.get("base_vector_pattern", "").strip()
         if base_vector_pattern:
@@ -1230,6 +1322,10 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
             raise ValueError(
                 f"[job:{tag}] measure operations require base_measure_vector"
             )
+        if base_raster_mask_vector is not None and not base_raster_path_list:
+            raise ValueError(
+                f"[job:{tag}] base_raster_mask_vector requires base_raster_pattern"
+            )
 
         if (
             (not base_raster_path_list)
@@ -1260,6 +1356,8 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                 "output_csv": output_csv,
                 "output_gpkg": output_gpkg,
                 "base_raster_path_list": base_raster_path_list,
+                "base_raster_mask_vector": base_raster_mask_vector,
+                "base_raster_mask_layer": base_raster_mask_layer,
                 "base_vector_path_list": base_vector_path_list,
                 "base_vector_fields": base_vector_fields,
                 "base_measure_vector": base_measure_vector,
@@ -1284,11 +1382,14 @@ def fast_zonal_statistics(
     aggregate_vector_path,
     aggregate_vector_field,
     aggregate_layer_name=None,
+    raster_mask_vector_path=None,
+    raster_mask_layer_name=None,
     ignore_nodata=True,
     working_dir=None,
     clean_working_dir=False,
     percentile_list=None,
     calculate_area_ha=False,
+    rasterize_worker_count=None,
     *,
     progress_queue,
     progress_id,
@@ -1414,7 +1515,9 @@ def fast_zonal_statistics(
     )
     cache_working_dir.mkdir(parents=True, exist_ok=True)
     projected_vector_path = cache_working_dir / "projected_vector.gpkg"
+    projected_mask_vector_path = cache_working_dir / "projected_mask_vector.gpkg"
     feature_id_raster_path = cache_working_dir / "agg_fid.tif"
+    mask_raster_path = cache_working_dir / "raster_mask.tif"
     logger.debug("using zonal statistics cache dir: %s", cache_working_dir)
 
     def _raster_nodata_mask(value_array):
@@ -1441,6 +1544,42 @@ def fast_zonal_statistics(
                 "phase": "scanning aggregation vector",
             },
         )
+
+        if raster_mask_vector_path is not None:
+            mask_vector = gdal.OpenEx(str(raster_mask_vector_path), gdal.OF_VECTOR)
+            if mask_vector is None:
+                raise RuntimeError(
+                    f"Could not open raster mask vector at {raster_mask_vector_path}"
+                )
+            mask_layer = mask_vector.GetLayerByName(raster_mask_layer_name)
+            if mask_layer is None:
+                raise RuntimeError(
+                    f'Could not open raster mask layer "{raster_mask_layer_name}" '
+                    f"in {raster_mask_vector_path}"
+                )
+            mask_srs = mask_layer.GetSpatialRef()
+            mask_needs_reproject = True
+            if mask_srs is not None:
+                mask_srs = mask_srs.Clone()
+                mask_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+                mask_needs_reproject = not mask_srs.IsSame(raster_srs)
+            mask_layer = None
+            mask_vector = None
+
+            _prepare_aggregate_vector_for_rasterization(
+                raster_mask_vector_path,
+                raster_mask_layer_name,
+                projected_mask_vector_path,
+                raster_info["projection_wkt"],
+                simplify_tolerance,
+                mask_needs_reproject,
+            )
+            _rasterize_vector_mask(
+                raster_path,
+                projected_mask_vector_path,
+                raster_mask_layer_name,
+                mask_raster_path,
+            )
 
         aggregate_vector = gdal.OpenEx(str(projected_vector_path), gdal.OF_VECTOR)
         aggregate_layer = (
@@ -1564,6 +1703,7 @@ def fast_zonal_statistics(
             progress_queue,
             progress_id,
             rasterize_start_progress,
+            rasterize_worker_count=rasterize_worker_count,
         )
         progress_n += rasterize_progress_count
         progress_queue.put(
@@ -1601,6 +1741,11 @@ def fast_zonal_statistics(
             str(feature_id_raster_path), gdal.OF_RASTER
         )
         feature_id_raster_band = feature_id_raster_dataset.GetRasterBand(1)
+        mask_raster_dataset = None
+        mask_raster_band = None
+        if raster_mask_vector_path is not None:
+            mask_raster_dataset = gdal.OpenEx(str(mask_raster_path), gdal.OF_RASTER)
+            mask_raster_band = mask_raster_dataset.GetRasterBand(1)
 
         logger.debug("gathering stats from raster blocks")
         group_sketch = None
@@ -1623,6 +1768,9 @@ def fast_zonal_statistics(
             raster_value_block = raster_band.ReadAsArray(**feature_id_offset)
 
             in_polygon_mask = feature_id_block != feature_id_raster_nodata
+            if mask_raster_band is not None:
+                mask_block = mask_raster_band.ReadAsArray(**feature_id_offset)
+                in_polygon_mask &= mask_block == 1
             if not np.any(in_polygon_mask):
                 continue
 
@@ -1684,6 +1832,8 @@ def fast_zonal_statistics(
 
         feature_id_raster_band = None
         feature_id_raster_dataset = None
+        mask_raster_band = None
+        mask_raster_dataset = None
 
         remaining_unset_feature_ids = feature_id_set.difference(feature_stats_by_id)
         for missing_feature_id in remaining_unset_feature_ids:
@@ -2612,6 +2762,93 @@ def _write_zonal_outputs(
     output_gdf.to_file(output_gpkg, layer=agg_layer, driver="GPKG")
 
 
+def _raster_zonal_stats_dataframe(
+    raster_index: int,
+    base_raster_path: Path,
+    base_raster_mask_vector: Path | None,
+    base_raster_mask_layer: str | None,
+    agg_vector: Path,
+    agg_fields: list[str],
+    agg_layer: str,
+    workdir: Path,
+    core_ops: list[str],
+    pct_list: list[float],
+    pct_keys: list[str],
+    calculate_area_ha: bool,
+    progress_queue,
+    tag: str,
+    rasterize_worker_count: int | None,
+) -> tuple[int, pd.DataFrame, list[str]]:
+    """Compute one raster's zonal statistics and convert them to a dataframe.
+
+    Args:
+        raster_index: Original position of the raster in the job configuration.
+        base_raster_path: Raster path to process.
+        base_raster_mask_vector: Optional vector path limiting raster pixels to
+            the mask footprint.
+        base_raster_mask_layer: Layer name in `base_raster_mask_vector`.
+        agg_vector: Path to the aggregation vector dataset.
+        agg_fields: Attribute fields identifying aggregation groups.
+        agg_layer: Aggregation vector layer name.
+        workdir: Directory for intermediate files.
+        core_ops: Non-percentile operations to include in output columns.
+        pct_list: Percentile values to compute.
+        pct_keys: Percentile column prefixes matching `pct_list`.
+        calculate_area_ha: Whether hectare area metrics are required.
+        progress_queue: Queue for progress monitor events.
+        tag: Job identifier used in progress IDs.
+        rasterize_worker_count: Tile rasterization worker count for this raster.
+
+    Returns:
+        Tuple of original raster index, result dataframe, and area-assumption
+        messages emitted while processing this raster.
+    """
+    _configure_gdal_cache()
+    previous_area_assumptions = set(_AREA_HECTARE_ASSUMPTIONS)
+    _AREA_HECTARE_ASSUMPTIONS.clear()
+
+    try:
+        base_raster_path = Path(base_raster_path)
+        grouped_stats = fast_zonal_statistics(
+            (base_raster_path, 1),
+            agg_vector,
+            agg_fields,
+            aggregate_layer_name=agg_layer,
+            raster_mask_vector_path=base_raster_mask_vector,
+            raster_mask_layer_name=base_raster_mask_layer,
+            ignore_nodata=True,
+            working_dir=workdir,
+            clean_working_dir=False,
+            percentile_list=pct_list,
+            calculate_area_ha=calculate_area_ha,
+            rasterize_worker_count=rasterize_worker_count,
+            progress_queue=progress_queue,
+            progress_id=f"raster:{tag}:{base_raster_path.stem}",
+        )
+        raster_rows = []
+        for group_value, statistics in grouped_stats.items():
+            if len(agg_fields) == 1:
+                row = {agg_fields[0]: group_value}
+            else:
+                row = dict(zip(agg_fields, group_value))
+            for operation in core_ops:
+                row[f"{operation}_{base_raster_path.stem}"] = statistics.get(operation)
+            for percentile_key in pct_keys:
+                row[f"{percentile_key}_{base_raster_path.stem}"] = statistics.get(
+                    percentile_key
+                )
+            raster_rows.append(row)
+
+        return (
+            raster_index,
+            pd.DataFrame(raster_rows),
+            sorted(_AREA_HECTARE_ASSUMPTIONS),
+        )
+    finally:
+        _AREA_HECTARE_ASSUMPTIONS.clear()
+        _AREA_HECTARE_ASSUMPTIONS.update(previous_area_assumptions)
+
+
 def run_zonal_stats_job(
     base_raster_path_list: list[Path],
     base_vector_path_list: list[Path],
@@ -2629,6 +2866,9 @@ def run_zonal_stats_job(
     tag: str,
     task_graph,
     progress_queue,
+    raster_workers: int = 1,
+    base_raster_mask_vector: Path | None = None,
+    base_raster_mask_layer: str | None = None,
 ):
     """Run a zonal statistics job over raster and/or vector base datasets.
 
@@ -2662,6 +2902,10 @@ def run_zonal_stats_job(
         tag: Job identifier used for temporary filenames and task labeling.
         task_graph: Task graph instance used to schedule raster and vector jobs.
         progress_queue: Queue for progress monitor events.
+        raster_workers: Maximum number of rasters to process concurrently.
+        base_raster_mask_vector: Optional vector path limiting raster pixels to
+            the mask footprint.
+        base_raster_mask_layer: Layer name in `base_raster_mask_vector`.
 
     Raises:
         ValueError: If operation parsing fails or required inputs are inconsistent.
@@ -2682,6 +2926,8 @@ def run_zonal_stats_job(
 
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
+    if raster_workers < 1:
+        raise ValueError("raster_workers must be at least 1")
 
     if base_measure_vector is not None:
         combined_dataframe = run_vector_measure_job(
@@ -2707,40 +2953,55 @@ def run_zonal_stats_job(
 
     raster_dataframes = []
     if base_raster_path_list:
-        for base_raster_path in base_raster_path_list:
-            base_raster_path = Path(base_raster_path)
-            grouped_stats = fast_zonal_statistics(
-                (base_raster_path, 1),
+        raster_worker_count = max(
+            1, min(int(raster_workers), len(base_raster_path_list))
+        )
+        rasterize_worker_count = None if raster_worker_count == 1 else 1
+        raster_jobs = [
+            (
+                raster_index,
+                Path(base_raster_path),
+                base_raster_mask_vector,
+                base_raster_mask_layer,
                 agg_vector,
                 agg_fields,
-                aggregate_layer_name=agg_layer,
-                ignore_nodata=True,
-                working_dir=workdir,
-                clean_working_dir=False,
-                percentile_list=pct_list,
-                calculate_area_ha=bool(
-                    AREA_HECTARE_OPERATIONS.intersection(core_ops)
-                ),
-                progress_queue=progress_queue,
-                progress_id=f"raster:{tag}:{base_raster_path.stem}",
+                agg_layer,
+                workdir,
+                core_ops,
+                pct_list,
+                pct_keys,
+                bool(AREA_HECTARE_OPERATIONS.intersection(core_ops)),
+                progress_queue,
+                tag,
+                rasterize_worker_count,
             )
-            raster_rows = []
-            for group_value, statistics in grouped_stats.items():
-                if len(agg_fields) == 1:
-                    row = {agg_fields[0]: group_value}
-                else:
-                    row = dict(zip(agg_fields, group_value))
-                for operation in core_ops:
-                    row[f"{operation}_{base_raster_path.stem}"] = statistics.get(
-                        operation
-                    )
-                for percentile_key in pct_keys:
-                    row[f"{percentile_key}_{base_raster_path.stem}"] = (
-                        statistics.get(percentile_key)
-                    )
-                raster_rows.append(row)
+            for raster_index, base_raster_path in enumerate(base_raster_path_list)
+        ]
+        raster_results = []
+        if raster_worker_count == 1:
+            for raster_job in raster_jobs:
+                raster_results.append(_raster_zonal_stats_dataframe(*raster_job))
+        else:
+            logger.debug(
+                "running %d raster(s) for job:%s with %d raster worker process(es)",
+                len(raster_jobs),
+                tag,
+                raster_worker_count,
+            )
+            with ProcessPoolExecutor(max_workers=raster_worker_count) as executor:
+                future_to_raster_path = {
+                    executor.submit(
+                        _raster_zonal_stats_dataframe, *raster_job
+                    ): raster_job[1]
+                    for raster_job in raster_jobs
+                }
+                for future in as_completed(future_to_raster_path):
+                    raster_results.append(future.result())
 
-            raster_dataframes.append(pd.DataFrame(raster_rows))
+        raster_results.sort(key=lambda result: result[0])
+        for _, raster_dataframe, area_assumptions in raster_results:
+            _AREA_HECTARE_ASSUMPTIONS.update(area_assumptions)
+            raster_dataframes.append(raster_dataframe)
 
     combined_dataframe = None
 
@@ -2825,10 +3086,23 @@ def main():
             "CPU count)."
         ),
     )
+    parser.add_argument(
+        "--raster-workers",
+        dest="raster_workers",
+        type=int,
+        default=None,
+        help=(
+            "Worker processes for independent rasters within each job. Defaults "
+            "to min(4, --job-workers). Increase carefully on disk- or "
+            "memory-constrained systems."
+        ),
+    )
     parser.add_argument("--test", action="store_true")
     args = parser.parse_args()
     if args.job_workers is not None and args.job_workers < 1:
         raise ValueError("--job-workers must be at least 1")
+    if args.raster_workers is not None and args.raster_workers < 1:
+        raise ValueError("--raster-workers must be at least 1")
 
     config_list = []
     for config_path in args.configs:
@@ -2874,6 +3148,8 @@ def main():
     cpu_count = os.cpu_count() or 1
     job_workers = args.job_workers or max(1, min(4, cpu_count // 2))
     job_workers = max(1, job_workers)
+    raster_workers = args.raster_workers or max(1, min(4, job_workers))
+    raster_workers = max(1, raster_workers)
     process_context = multiprocessing.get_context("spawn")
     progress_manager = process_context.Manager()
     progress_queue = progress_manager.Queue()
@@ -2886,9 +3162,11 @@ def main():
 
     try:
         logger.debug(
-            "running %d jobs sequentially with %d internal worker process(es)",
+            "running %d jobs sequentially with %d internal worker process(es) "
+            "and %d raster worker process(es)",
             total_job_count,
             job_workers,
+            raster_workers,
         )
         job_error = None
         for output_label, job in job_run_list:
@@ -2897,6 +3175,7 @@ def main():
             status = "done"
             try:
                 job["progress_queue"] = progress_queue
+                job["raster_workers"] = raster_workers
                 progress_queue.put({"event": "job_start", "tag": tag})
                 with ProcessPoolExecutor(
                     max_workers=1,
