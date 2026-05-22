@@ -256,6 +256,7 @@ def test_parse_and_validate_config_resolves_paths(
                 "operations = sum, mean, total_count, valid_count, proportion_valid_nonzero",
                 f"base_raster_pattern = {projected_raster.name}",
                 "output_csv = output/results.csv",
+                "output_gpkg = output/results.gpkg",
             ]
         )
     )
@@ -266,7 +267,8 @@ def test_parse_and_validate_config_resolves_paths(
     assert job["agg_field"] == ["STATE", "COUNTY"]
     assert "proportion_valid_nonzero" in job["operations"]
     assert job["base_raster_path_list"] == [projected_raster]
-    assert job["output_csv"] == "output/results.csv"
+    assert job["output_csv"] == tmp_path / "output" / "results.csv"
+    assert job["output_gpkg"] == tmp_path / "output" / "results.gpkg"
     assert job["workdir"] == tmp_path / "work" / "raster_job"
 
 
