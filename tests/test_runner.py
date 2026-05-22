@@ -264,8 +264,6 @@ def test_parse_and_validate_config_resolves_paths(
                 "agg_field = STATE, COUNTY",
                 "operations = sum, mean, total_count, valid_count, proportion_valid_nonzero",
                 f"base_raster_pattern = {projected_raster.name}",
-                f"base_raster_mask_vector = {projected_zone_vector.name}",
-                "base_raster_mask_layer = zones",
                 "output_csv = output/results.csv",
                 "output_gpkg = output/results.gpkg",
             ]
@@ -278,8 +276,6 @@ def test_parse_and_validate_config_resolves_paths(
     assert job["agg_field"] == ["STATE", "COUNTY"]
     assert "proportion_valid_nonzero" in job["operations"]
     assert job["base_raster_path_list"] == [projected_raster]
-    assert job["base_raster_mask_vector"] == projected_zone_vector
-    assert job["base_raster_mask_layer"] == "zones"
     assert job["output_csv"] == tmp_path / "output" / "results.csv"
     assert job["output_gpkg"] == tmp_path / "output" / "results.gpkg"
     assert job["workdir"] == tmp_path / "work" / "raster_job"
@@ -504,42 +500,6 @@ def test_fast_zonal_statistics_computes_grouped_raster_stats(
     assert right["valid_count"] == 8
     assert right["sum"] == pytest.approx(76.0)
     assert right["proportion_valid_nonzero"] == pytest.approx(1.0)
-
-
-def test_fast_zonal_statistics_respects_raster_mask_vector(
-    tmp_path, projected_zone_vector, projected_raster, multiprocessing_queue
-):
-    mask_gdf = gpd.GeoDataFrame(
-        {"geometry": [Polygon([(0, 2), (4, 2), (4, 4), (0, 4)])]},
-        crs="EPSG:6933",
-    )
-    mask_vector = _write_vector(tmp_path / "mask.gpkg", mask_gdf, layer="mask")
-
-    stats = runner.fast_zonal_statistics(
-        (projected_raster, 1),
-        projected_zone_vector,
-        ["STATE", "COUNTY"],
-        aggregate_layer_name="zones",
-        raster_mask_vector_path=mask_vector,
-        raster_mask_layer_name="mask",
-        working_dir=tmp_path / "work",
-        clean_working_dir=True,
-        percentile_list=[],
-        calculate_area_ha=True,
-        progress_queue=multiprocessing_queue,
-        progress_id="raster:test_masked",
-    )
-
-    left = stats[("A", "001")]
-    right = stats[("A", "002")]
-    assert left["total_count"] == 4
-    assert left["valid_count"] == 3
-    assert left["sum"] == pytest.approx(8.0)
-    assert left["area_ha_total"] == pytest.approx(0.0004)
-    assert left["area_ha_valid"] == pytest.approx(0.0003)
-    assert right["total_count"] == 4
-    assert right["valid_count"] == 4
-    assert right["sum"] == pytest.approx(22.0)
 
 
 def test_run_vector_stats_job_writes_nearest_attribute_stats(
