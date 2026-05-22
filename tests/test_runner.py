@@ -22,6 +22,15 @@ def _projection_wkt(epsg):
     return srs.ExportToWkt()
 
 
+def _drain_queue(progress_queue):
+    events = []
+    while True:
+        try:
+            events.append(progress_queue.get_nowait())
+        except queue.Empty:
+            return events
+
+
 def _write_raster(path, array, *, epsg=6933, nodata=-1, origin=(0, 4), pixel_size=1):
     path = Path(path)
     driver = gdal.GetDriverByName("GTiff")
@@ -391,6 +400,22 @@ def test_prepare_and_rasterize_aggregate_fids(
     assert np.all(array[:, :2] == 1)
     assert np.all(array[:, 2:] == 2)
 
+    events = _drain_queue(progress_queue)
+    stitch_events = [
+        event
+        for event in events
+        if event.get("phase") in {
+            "stitching rasterized tiles",
+            "stitched rasterized tiles",
+        }
+    ]
+    assert [
+        (event["phase"], event["increment"]) for event in stitch_events
+    ] == [
+        ("stitching rasterized tiles", 0),
+        ("stitched rasterized tiles", 1),
+    ]
+
 
 def test_rasterize_aggregate_fids_can_spawn_from_job_process(
     tmp_path, projected_zone_vector, projected_raster, multiprocessing_queue
@@ -721,6 +746,74 @@ def test_progress_monitor_stops_cleanly():
     progress_queue = queue.Queue()
     progress_queue.put({"event": "stop"})
     runner._progress_monitor(progress_queue, total_jobs=1)
+
+
+def test_progress_monitor_shows_active_job_phase(monkeypatch):
+    class FakeTqdm:
+        instances = []
+
+        def __init__(self, total, desc, unit, position, leave):
+            self.total = total
+            self.desc = desc
+            self.unit = unit
+            self.position = position
+            self.leave = leave
+            self.n = 0
+            self.postfix_values = []
+            self.closed = False
+            FakeTqdm.instances.append(self)
+
+        def update(self, increment):
+            self.n += increment
+
+        def set_postfix_str(self, value, refresh=True):
+            self.postfix_values.append(value)
+
+        def refresh(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    progress_queue = queue.Queue()
+    progress_queue.put({"event": "job_start", "tag": "counties_ecosystem_services"})
+    progress_queue.put(
+        {
+            "event": "analysis_start",
+            "id": "raster:counties_ecosystem_services:annual_value",
+            "desc": "raster annual_value",
+            "total": 4,
+            "phase": "scanning aggregation vector",
+        }
+    )
+    progress_queue.put(
+        {
+            "event": "analysis_update",
+            "id": "raster:counties_ecosystem_services:annual_value",
+            "increment": 0,
+            "phase": "stitching rasterized tiles",
+        }
+    )
+    progress_queue.put(
+        {
+            "event": "job_done",
+            "tag": "counties_ecosystem_services",
+            "status": "done",
+        }
+    )
+    progress_queue.put({"event": "stop"})
+
+    monkeypatch.setattr(runner, "tqdm", FakeTqdm)
+
+    runner._progress_monitor(progress_queue, total_jobs=1)
+
+    job_bar = FakeTqdm.instances[0]
+    assert "counties_ecosystem_services running" in job_bar.postfix_values
+    assert (
+        "counties_ecosystem_services: raster annual_value - "
+        "stitching rasterized tiles"
+    ) in job_bar.postfix_values
+    assert "counties_ecosystem_services done" in job_bar.postfix_values
 
 
 def test_main_returns_when_no_jobs(monkeypatch, tmp_path):

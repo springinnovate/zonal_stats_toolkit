@@ -217,7 +217,9 @@ def _progress_monitor(progress_queue, total_jobs):
         total_jobs: Number of `[job:...]` sections expected to finish.
     """
     bars = {}
+    bar_descriptions = {}
     next_position = 1
+    active_job_tag = None
     job_bar = tqdm(
         total=total_jobs,
         desc="jobs",
@@ -237,6 +239,11 @@ def _progress_monitor(progress_queue, total_jobs):
             if event_type == "stop":
                 break
 
+            if event_type == "job_start":
+                active_job_tag = event.get("tag", "job")
+                job_bar.set_postfix_str(f"{active_job_tag} running", refresh=True)
+                continue
+
             if event_type == "job_done":
                 job_bar.update(1)
                 job_bar.set_postfix_str(
@@ -249,12 +256,27 @@ def _progress_monitor(progress_queue, total_jobs):
             if not progress_id:
                 continue
 
+            def _show_active_phase(phase, active_label=None):
+                """Set the top-level job bar to the current analysis phase."""
+                if not phase:
+                    return
+                active_label = active_label or bar_descriptions.get(
+                    progress_id, progress_id
+                )
+                job_prefix = f"{active_job_tag}: " if active_job_tag else ""
+                job_bar.set_postfix_str(
+                    f"{job_prefix}{active_label} - {phase}",
+                    refresh=True,
+                )
+
             if event_type == "analysis_start":
                 if progress_id in bars:
                     bars[progress_id].close()
+                desc = event.get("desc", progress_id)
+                bar_descriptions[progress_id] = desc
                 bars[progress_id] = tqdm(
                     total=event.get("total", 1),
-                    desc=event.get("desc", progress_id),
+                    desc=desc,
                     unit=event.get("unit", "step"),
                     position=next_position,
                     leave=True,
@@ -263,6 +285,7 @@ def _progress_monitor(progress_queue, total_jobs):
                 phase = event.get("phase")
                 if phase:
                     bars[progress_id].set_postfix_str(phase, refresh=True)
+                    _show_active_phase(phase, desc)
                 continue
 
             progress_bar = bars.get(progress_id)
@@ -275,6 +298,7 @@ def _progress_monitor(progress_queue, total_jobs):
                 phase = event.get("phase")
                 if phase:
                     progress_bar.set_postfix_str(phase, refresh=True)
+                    _show_active_phase(phase)
                 progress_bar.refresh()
                 continue
 
@@ -285,6 +309,7 @@ def _progress_monitor(progress_queue, total_jobs):
                 phase = event.get("phase")
                 if phase:
                     progress_bar.set_postfix_str(phase, refresh=True)
+                    _show_active_phase(phase)
                 continue
 
             if event_type == "analysis_set":
@@ -294,12 +319,14 @@ def _progress_monitor(progress_queue, total_jobs):
                 phase = event.get("phase")
                 if phase:
                     progress_bar.set_postfix_str(phase, refresh=True)
+                    _show_active_phase(phase)
                 continue
 
             if event_type == "analysis_close":
                 phase = event.get("phase")
                 if phase:
                     progress_bar.set_postfix_str(phase, refresh=True)
+                    _show_active_phase(phase)
                 if (
                     progress_bar.total is not None
                     and progress_bar.n < progress_bar.total
@@ -827,11 +854,19 @@ def _rasterize_aggregate_fids(
             {
                 "event": "analysis_update",
                 "id": progress_id,
-                "increment": 1,
+                "increment": 0,
                 "phase": "stitching rasterized tiles",
             },
         )
         _stitch_raster_tiles(target_raster_path, tile_specs)
+        progress_queue.put(
+            {
+                "event": "analysis_update",
+                "id": progress_id,
+                "increment": 1,
+                "phase": "stitched rasterized tiles",
+            },
+        )
     finally:
         shutil.rmtree(tile_dir, ignore_errors=True)
     logger.debug("rasterize done")
@@ -2860,6 +2895,7 @@ def main():
             status = "done"
             try:
                 job["progress_queue"] = progress_queue
+                progress_queue.put({"event": "job_start", "tag": tag})
                 with ProcessPoolExecutor(
                     max_workers=1,
                     mp_context=process_context,
