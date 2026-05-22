@@ -831,9 +831,10 @@ def _rasterize_aggregate_fids(
         )
 
     try:
-        if worker_count == 1:
-            for tile, tile_path in tile_specs:
-                _rasterize_aggregate_fid_tile(
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            future_to_tile_spec = {
+                executor.submit(
+                    _rasterize_aggregate_fid_tile,
                     aggregate_vector_path,
                     aggregate_layer_name,
                     tile_path,
@@ -841,28 +842,13 @@ def _rasterize_aggregate_fids(
                     base_geotransform,
                     projection_wkt,
                     target_nodata,
-                )
+                ): (tile, tile_path)
+                for tile, tile_path in tile_specs
+            }
+            for future in as_completed(future_to_tile_spec):
+                future.result()
                 completed_tiles += 1
                 _report_tile_progress()
-        else:
-            with ProcessPoolExecutor(max_workers=worker_count) as executor:
-                future_to_tile_spec = {
-                    executor.submit(
-                        _rasterize_aggregate_fid_tile,
-                        aggregate_vector_path,
-                        aggregate_layer_name,
-                        tile_path,
-                        tile,
-                        base_geotransform,
-                        projection_wkt,
-                        target_nodata,
-                    ): (tile, tile_path)
-                    for tile, tile_path in tile_specs
-                }
-                for future in as_completed(future_to_tile_spec):
-                    future.result()
-                    completed_tiles += 1
-                    _report_tile_progress()
 
         progress_queue.put(
             {
@@ -2829,26 +2815,22 @@ def run_zonal_stats_job(
             )
             for raster_index, base_raster_path in enumerate(base_raster_path_list)
         ]
+        logger.debug(
+            "running %d raster(s) for job:%s with %d raster worker process(es)",
+            len(raster_jobs),
+            tag,
+            raster_worker_count,
+        )
         raster_results = []
-        if raster_worker_count == 1:
-            for raster_job in raster_jobs:
-                raster_results.append(_raster_zonal_stats_dataframe(*raster_job))
-        else:
-            logger.debug(
-                "running %d raster(s) for job:%s with %d raster worker process(es)",
-                len(raster_jobs),
-                tag,
-                raster_worker_count,
-            )
-            with ProcessPoolExecutor(max_workers=raster_worker_count) as executor:
-                future_to_raster_path = {
-                    executor.submit(
-                        _raster_zonal_stats_dataframe, *raster_job
-                    ): raster_job[1]
-                    for raster_job in raster_jobs
-                }
-                for future in as_completed(future_to_raster_path):
-                    raster_results.append(future.result())
+        with ProcessPoolExecutor(max_workers=raster_worker_count) as executor:
+            future_to_raster_path = {
+                executor.submit(_raster_zonal_stats_dataframe, *raster_job): raster_job[
+                    1
+                ]
+                for raster_job in raster_jobs
+            }
+            for future in as_completed(future_to_raster_path):
+                raster_results.append(future.result())
 
         raster_results.sort(key=lambda result: result[0])
         for _, raster_dataframe, area_assumptions in raster_results:
