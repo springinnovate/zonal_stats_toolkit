@@ -1130,12 +1130,14 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                     f"Available fields: {sorted(props.keys())}"
                 )
 
-        output_csv = job.get("output_csv", "").strip()
-        output_gpkg = job.get("output_gpkg", "").strip()
-        if not output_csv and not output_gpkg:
+        output_csv_raw = job.get("output_csv", "").strip()
+        output_gpkg_raw = job.get("output_gpkg", "").strip()
+        if not output_csv_raw and not output_gpkg_raw:
             raise ValueError(
                 f"[job:{tag}] must define at least one of output_csv or output_gpkg"
             )
+        output_csv = _abs_from_cfg_dir(output_csv_raw) if output_csv_raw else None
+        output_gpkg = _abs_from_cfg_dir(output_gpkg_raw) if output_gpkg_raw else None
 
         workdir = global_work_dir / Path(tag)
         workdir.mkdir(parents=True, exist_ok=True)
@@ -1255,8 +1257,8 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                 "agg_field": agg_fields,
                 "operations": operations,
                 "workdir": workdir,
-                "output_csv": output_csv or None,
-                "output_gpkg": output_gpkg or None,
+                "output_csv": output_csv,
+                "output_gpkg": output_gpkg,
                 "base_raster_path_list": base_raster_path_list,
                 "base_vector_path_list": base_vector_path_list,
                 "base_vector_fields": base_vector_fields,
