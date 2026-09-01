@@ -9,6 +9,7 @@ import argparse
 import configparser
 import glob
 import logging
+import math
 import multiprocessing
 import os
 import queue
@@ -43,6 +44,8 @@ _GDAL_CACHE_MAX_BYTES = 512 * 1024**2
 _BYTES_PER_MIB = 1024**2
 _RASTERIZE_TILE_SIZE = 1024
 _RASTERIZE_WORKER_COUNT = 4
+_DEFAULT_MAX_SIMPLIFY_TOLERANCE_METERS = 15.0
+_SIMPLIFICATION_PART_SIZE_FACTOR = 10.0
 
 
 AREA_HECTARE_OPERATIONS = {
@@ -445,6 +448,154 @@ def _promote_polygon_to_multipolygon(geometry):
     return geometry
 
 
+def _meters_per_crs_unit(raster_crs):
+    """Return a conservative conversion from horizontal CRS units to metres."""
+    if raster_crs.is_projected:
+        conversion_factors = [
+            axis.unit_conversion_factor
+            for axis in raster_crs.axis_info[:2]
+            if axis.unit_conversion_factor is not None
+            and math.isfinite(axis.unit_conversion_factor)
+            and axis.unit_conversion_factor > 0
+        ]
+        if not conversion_factors:
+            raise ValueError(
+                f"Raster CRS has no usable linear-unit conversion: {raster_crs}"
+            )
+        # Using the larger axis scale ensures the physical cap is not exceeded
+        # if a projected CRS reports different horizontal-axis units.
+        return max(conversion_factors), "projected CRS linear units"
+
+    if not raster_crs.is_geographic:
+        raise ValueError(
+            "Raster CRS must be projected or geographic to apply a metre-based "
+            "geometry simplification cap"
+        )
+
+    angular_conversion_factors = [
+        axis.unit_conversion_factor
+        for axis in raster_crs.axis_info[:2]
+        if axis.unit_conversion_factor is not None
+        and math.isfinite(axis.unit_conversion_factor)
+        and axis.unit_conversion_factor > 0
+    ]
+    if not angular_conversion_factors:
+        raise ValueError(
+            f"Raster CRS has no usable angular-unit conversion: {raster_crs}"
+        )
+    semi_major_metre = raster_crs.ellipsoid.semi_major_metre
+    semi_minor_metre = raster_crs.ellipsoid.semi_minor_metre
+    if not all(
+        math.isfinite(value) and value > 0
+        for value in (semi_major_metre, semi_minor_metre)
+    ):
+        raise ValueError(
+            f"Raster CRS has no usable ellipsoid dimensions: {raster_crs}"
+        )
+    # The maximum ellipsoid radius of curvature bounds the physical distance of
+    # an angular-unit displacement at any latitude. This keeps the configured
+    # metre tolerance conservative without involving raster resolution.
+    maximum_radius_of_curvature = semi_major_metre**2 / semi_minor_metre
+    return (
+        maximum_radius_of_curvature * max(angular_conversion_factors),
+        "conservative geographic angular-unit scale",
+    )
+
+
+def _simplification_tolerance_in_crs_units(
+    raster_info, max_simplify_tolerance_meters
+):
+    """Convert a configured physical simplification tolerance to CRS units."""
+    raster_crs = CRS.from_wkt(raster_info["projection_wkt"])
+    metres_per_crs_unit, conversion_description = _meters_per_crs_unit(raster_crs)
+    tolerance_crs_units = max_simplify_tolerance_meters / metres_per_crs_unit
+    return {
+        "tolerance_crs_units": tolerance_crs_units,
+        "tolerance_distance_m": max_simplify_tolerance_meters,
+        "metres_per_crs_unit": metres_per_crs_unit,
+        "conversion_description": conversion_description,
+    }
+
+
+def _polygon_part_characteristic_size(polygon_part):
+    """Estimate a polygon part's size while remaining sensitive to narrowness."""
+    area = abs(polygon_part.GetArea())
+    boundary = polygon_part.Boundary()
+    perimeter = boundary.Length() if boundary is not None else 0.0
+    if area <= 0 or perimeter <= 0:
+        return 0.0
+    # sqrt(area) protects small compact parts. 2A/P approaches the width of a
+    # long narrow part and also responds to intricate, corridor-like boundaries.
+    return min(math.sqrt(area), 2.0 * area / perimeter)
+
+
+def _polygon_part_simplification_tolerance(polygon_part, simplify_tolerance):
+    """Cap simplification so no polygon part receives a disproportionate value."""
+    if simplify_tolerance <= 0:
+        return 0.0
+    characteristic_size = _polygon_part_characteristic_size(polygon_part)
+    return min(
+        simplify_tolerance,
+        characteristic_size / _SIMPLIFICATION_PART_SIZE_FACTOR,
+    )
+
+
+def _simplify_polygonal_geometry_by_part(geometry, simplify_tolerance):
+    """Simplify polygon members independently and report size-capped members."""
+    geometry_type = ogr.GT_Flatten(geometry.GetGeometryType())
+    if geometry_type == ogr.wkbPolygon:
+        polygon_parts = [geometry]
+    elif geometry_type == ogr.wkbMultiPolygon:
+        polygon_parts = [
+            geometry.GetGeometryRef(index)
+            for index in range(geometry.GetGeometryCount())
+        ]
+    else:
+        if simplify_tolerance <= 0:
+            return geometry.Clone(), 0, 0
+        simplified = geometry.SimplifyPreserveTopology(simplify_tolerance)
+        if simplified is None or simplified.IsEmpty():
+            return geometry.Clone(), 0, 1
+        return simplified, 1, 0
+
+    simplified_geometry = ogr.Geometry(ogr.wkbMultiPolygon)
+    simplified_part_count = 0
+    size_capped_part_count = 0
+    for polygon_part in polygon_parts:
+        part_tolerance = _polygon_part_simplification_tolerance(
+            polygon_part, simplify_tolerance
+        )
+        if part_tolerance < simplify_tolerance:
+            size_capped_part_count += 1
+        if part_tolerance > 0:
+            simplified_part = polygon_part.SimplifyPreserveTopology(part_tolerance)
+        else:
+            simplified_part = polygon_part.Clone()
+        if simplified_part is None or simplified_part.IsEmpty():
+            simplified_part = polygon_part.Clone()
+        if not simplified_part.IsValid():
+            logger.warning(
+                "Simplification produced an invalid polygon part; retaining its "
+                "original geometry"
+            )
+            simplified_part = polygon_part.Clone()
+        simplified_part_type = ogr.GT_Flatten(simplified_part.GetGeometryType())
+        if simplified_part_type == ogr.wkbPolygon:
+            simplified_geometry.AddGeometry(simplified_part)
+        elif simplified_part_type == ogr.wkbMultiPolygon:
+            for index in range(simplified_part.GetGeometryCount()):
+                simplified_geometry.AddGeometry(simplified_part.GetGeometryRef(index))
+        else:
+            logger.warning(
+                "Simplification changed a polygon part to %s; retaining its "
+                "original geometry",
+                simplified_part.GetGeometryName(),
+            )
+            simplified_geometry.AddGeometry(polygon_part)
+        simplified_part_count += int(part_tolerance > 0)
+    return simplified_geometry, simplified_part_count, size_capped_part_count
+
+
 def _prepare_aggregate_vector_for_rasterization(
     aggregate_vector_path,
     aggregate_layer_name,
@@ -479,17 +630,57 @@ def _prepare_aggregate_vector_for_rasterization(
         src_path = str(tmp_reprojected_path)
 
     logger.debug(
-        "vector translate (simplify) start | output=%s | simplifyTolerance=%s | reproject=%s",
+        "vector copy/simplify start | output=%s | simplifyTolerance=%s | reproject=%s",
         target_vector_path,
         simplify_tolerance,
         needs_reproject,
     )
-    gdal.VectorTranslate(
-        str(target_vector_path),
-        src_path,
-        simplifyTolerance=simplify_tolerance,
-        **vector_translate_kwargs,
+    source_vector = gdal.OpenEx(src_path, gdal.OF_VECTOR)
+    source_layer = (
+        source_vector.GetLayerByName(aggregate_layer_name)
+        if aggregate_layer_name is not None
+        else source_vector.GetLayer()
     )
+    target_vector = ogr.GetDriverByName("GPKG").CreateDataSource(
+        str(target_vector_path)
+    )
+    target_srs = osr.SpatialReference()
+    target_srs.ImportFromWkt(raster_projection_wkt)
+    target_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    target_layer = target_vector.CreateLayer(
+        source_layer.GetName(),
+        srs=target_srs,
+        geom_type=ogr.wkbMultiPolygon,
+    )
+    source_layer_definition = source_layer.GetLayerDefn()
+    for field_index in range(source_layer_definition.GetFieldCount()):
+        target_layer.CreateField(source_layer_definition.GetFieldDefn(field_index))
+    target_layer_definition = target_layer.GetLayerDefn()
+    simplified_part_count = 0
+    size_capped_part_count = 0
+    target_layer.StartTransaction()
+    source_layer.ResetReading()
+    for source_feature in source_layer:
+        target_feature = ogr.Feature(target_layer_definition)
+        target_feature.SetFrom(source_feature)
+        source_geometry = source_feature.GetGeometryRef()
+        if source_geometry is not None:
+            (
+                target_geometry,
+                feature_simplified_part_count,
+                feature_size_capped_part_count,
+            ) = _simplify_polygonal_geometry_by_part(
+                source_geometry, simplify_tolerance
+            )
+            target_feature.SetGeometry(target_geometry)
+            simplified_part_count += feature_simplified_part_count
+            size_capped_part_count += feature_size_capped_part_count
+        target_layer.CreateFeature(target_feature)
+    target_layer.CommitTransaction()
+    source_layer = None
+    source_vector = None
+    target_layer = None
+    target_vector = None
     if tmp_reprojected_path:
         tmp_reprojected_path.unlink(missing_ok=True)
 
@@ -518,7 +709,13 @@ def _prepare_aggregate_vector_for_rasterization(
     aggregate_layer = None
     aggregate_vector = None
 
-    logger.debug("vector translate done | output=%s", target_vector_path)
+    logger.debug(
+        "vector copy/simplify done | output=%s | simplified_parts=%d | "
+        "size_capped_parts=%d",
+        target_vector_path,
+        simplified_part_count,
+        size_capped_part_count,
+    )
 
 
 def _iter_raster_tiles(raster_x_size, raster_y_size, tile_size):
@@ -927,7 +1124,8 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
     Returns:
         A dictionary with two top-level keys:
             - `project`: A dict containing validated project-level settings
-              (`name`, `global_work_dir`, `log_level`).
+              (`name`, `global_work_dir`, `log_level`, and
+              `max_simplify_tolerance_meters`).
             - `job_list`: A list of dicts, one per job, containing validated and
               resolved job configuration, including paths, fields, operations, and
               output locations.
@@ -961,6 +1159,25 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
     global_work_dir = Path(config["project"]["global_work_dir"].strip())
     if not global_work_dir.is_absolute():
         global_work_dir = cfg_dir / global_work_dir
+    max_simplify_tolerance_raw = config["project"].get(
+        "max_simplify_tolerance_meters",
+        str(_DEFAULT_MAX_SIMPLIFY_TOLERANCE_METERS),
+    ).strip()
+    try:
+        max_simplify_tolerance_meters = float(max_simplify_tolerance_raw)
+    except ValueError as error:
+        raise ValueError(
+            "[project].max_simplify_tolerance_meters must be a finite number "
+            "greater than or equal to 0"
+        ) from error
+    if (
+        not math.isfinite(max_simplify_tolerance_meters)
+        or max_simplify_tolerance_meters < 0
+    ):
+        raise ValueError(
+            "[project].max_simplify_tolerance_meters must be a finite number "
+            "greater than or equal to 0"
+        )
 
     job_tags = []
     jobs_sections = []
@@ -1265,6 +1482,7 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
                 "base_measure_vector": base_measure_vector,
                 "base_measure_layer": base_measure_layer,
                 "measure_crs": measure_crs,
+                "max_simplify_tolerance_meters": max_simplify_tolerance_meters,
                 "task_graph": None,
             }
         )
@@ -1274,6 +1492,7 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
             "name": project_name,
             "global_work_dir": global_work_dir,
             "log_level": log_level_str,
+            "max_simplify_tolerance_meters": max_simplify_tolerance_meters,
         },
         "job_list": job_list,
     }
@@ -1290,6 +1509,7 @@ def fast_zonal_statistics(
     percentile_list=None,
     calculate_area_ha=False,
     rasterize_worker_count=None,
+    max_simplify_tolerance_meters=_DEFAULT_MAX_SIMPLIFY_TOLERANCE_METERS,
     *,
     progress_queue,
     progress_id,
@@ -1312,7 +1532,7 @@ def fast_zonal_statistics(
     logger.debug(
         "fast_zonal_statistics start | raster=%s band=%s | vector=%s layer=%s "
         "fields=%s | ignore_nodata=%s | working_dir=%s clean=%s | "
-        "percentiles=%s | calculate_area_ha=%s",
+        "percentiles=%s | calculate_area_ha=%s | max_simplify_tolerance_meters=%s",
         raster_path,
         raster_band_index,
         str(aggregate_vector_path),
@@ -1323,6 +1543,7 @@ def fast_zonal_statistics(
         clean_working_dir,
         percentile_list,
         calculate_area_ha,
+        max_simplify_tolerance_meters,
     )
 
     percentile_list = [] if percentile_list is None else list(percentile_list)
@@ -1367,8 +1588,26 @@ def fast_zonal_statistics(
 
     raster_info = geoprocessing.get_raster_info(raster_path)
     raster_nodata = raster_info["nodata"][raster_band_index - 1]
-    raster_pixel_width = abs(raster_info["pixel_size"][0])
-    simplify_tolerance = raster_pixel_width * 0.5
+    simplification = _simplification_tolerance_in_crs_units(
+        raster_info, max_simplify_tolerance_meters
+    )
+    simplify_tolerance = simplification["tolerance_crs_units"]
+
+    logger.info(
+        "zonal geometry simplification | configured_tolerance=%.12g m | "
+        "effective_tolerance=%.12g CRS units | "
+        "unit_conversion=%s (%.12g m/CRS unit) | part_size_factor=%s",
+        max_simplify_tolerance_meters,
+        simplify_tolerance,
+        simplification["conversion_description"],
+        simplification["metres_per_crs_unit"],
+        _SIMPLIFICATION_PART_SIZE_FACTOR,
+    )
+    if simplify_tolerance > 0:
+        logger.info(
+            "Nonzero geometry simplification can change pixel membership; set "
+            "max_simplify_tolerance_meters = 0 for strict no-simplification mode"
+        )
 
     logger.debug(
         "raster loaded | nodata=%s | pixel_size=%s | bbox=%s",
@@ -2628,6 +2867,7 @@ def _raster_zonal_stats_dataframe(
     progress_queue,
     tag: str,
     rasterize_worker_count: int | None,
+    max_simplify_tolerance_meters: float,
 ) -> tuple[int, pd.DataFrame, list[str]]:
     """Compute one raster's zonal statistics and convert them to a dataframe.
 
@@ -2645,6 +2885,8 @@ def _raster_zonal_stats_dataframe(
         progress_queue: Queue for progress monitor events.
         tag: Job identifier used in progress IDs.
         rasterize_worker_count: Tile rasterization worker count for this raster.
+        max_simplify_tolerance_meters: Maximum physical simplification distance
+            in metres. Set to 0 to disable geometry simplification.
 
     Returns:
         Tuple of original raster index, result dataframe, and area-assumption
@@ -2667,6 +2909,7 @@ def _raster_zonal_stats_dataframe(
             percentile_list=pct_list,
             calculate_area_ha=calculate_area_ha,
             rasterize_worker_count=rasterize_worker_count,
+            max_simplify_tolerance_meters=max_simplify_tolerance_meters,
             progress_queue=progress_queue,
             progress_id=f"raster:{tag}:{base_raster_path.stem}",
         )
@@ -2712,6 +2955,7 @@ def run_zonal_stats_job(
     task_graph,
     progress_queue,
     raster_workers: int = 1,
+    max_simplify_tolerance_meters=_DEFAULT_MAX_SIMPLIFY_TOLERANCE_METERS,
 ):
     """Run a zonal statistics job over raster and/or vector base datasets.
 
@@ -2746,6 +2990,8 @@ def run_zonal_stats_job(
         task_graph: Task graph instance used to schedule raster and vector jobs.
         progress_queue: Queue for progress monitor events.
         raster_workers: Maximum number of rasters to process concurrently.
+        max_simplify_tolerance_meters: Maximum physical simplification distance
+            in metres. Set to 0 to disable geometry simplification.
 
     Raises:
         ValueError: If operation parsing fails or required inputs are inconsistent.
@@ -2812,6 +3058,7 @@ def run_zonal_stats_job(
                 progress_queue,
                 tag,
                 rasterize_worker_count,
+                max_simplify_tolerance_meters,
             )
             for raster_index, base_raster_path in enumerate(base_raster_path_list)
         ]

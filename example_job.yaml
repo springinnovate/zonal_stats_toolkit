@@ -20,6 +20,17 @@ global_work_dir = ./work
 # Standard Python logging level, such as DEBUG, INFO, WARNING, or ERROR.
 log_level = INFO
 
+# Aggregation geometries are simplified before rasterization for performance.
+# This project-wide value is the simplification tolerance in metres. It is
+# converted to each raster's CRS units without deriving a value from pixel size.
+# The conservative 15 m default follows the issue #60 evidence and retained
+# substantial vertex reduction in a representative complex-geometry test. Set
+# this to 0 for strict no-simplification behavior. Any positive tolerance can
+# change pixel membership and is not a mathematical guarantee that independently
+# processed parent and child masks will remain nested. Small/narrow MultiPolygon
+# members receive a per-part size cap that can only reduce this tolerance.
+max_simplify_tolerance_meters = 15
+
 
 # Raster zonal statistics.
 #

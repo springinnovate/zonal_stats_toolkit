@@ -1,4 +1,5 @@
 import logging
+import math
 import multiprocessing
 import queue
 import sys
@@ -8,7 +9,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
-from osgeo import gdal, osr
+from osgeo import gdal, ogr, osr
 from pyproj import CRS
 from shapely.geometry import LineString, MultiPolygon, Point, Polygon
 
@@ -279,6 +280,74 @@ def test_parse_and_validate_config_resolves_paths(
     assert job["output_csv"] == tmp_path / "output" / "results.csv"
     assert job["output_gpkg"] == tmp_path / "output" / "results.gpkg"
     assert job["workdir"] == tmp_path / "work" / "raster_job"
+    assert (
+        parsed["project"]["max_simplify_tolerance_meters"]
+        == runner._DEFAULT_MAX_SIMPLIFY_TOLERANCE_METERS
+    )
+    assert (
+        job["max_simplify_tolerance_meters"]
+        == runner._DEFAULT_MAX_SIMPLIFY_TOLERANCE_METERS
+    )
+
+
+@pytest.mark.parametrize("configured_value", ["-1", "nan", "infinity", "far"])
+def test_parse_and_validate_config_rejects_bad_simplification_distance(
+    tmp_path, projected_zone_vector, projected_raster, configured_value
+):
+    cfg_path = tmp_path / "project.yml"
+    cfg_path.write_text(
+        "\n".join(
+            [
+                "[project]",
+                "name = project",
+                "global_work_dir = work",
+                f"max_simplify_tolerance_meters = {configured_value}",
+                "",
+                "[job:bad]",
+                f"agg_vector = {projected_zone_vector.name}",
+                "agg_layer = zones",
+                "agg_field = STATE",
+                "operations = sum",
+                f"base_raster_pattern = {projected_raster.name}",
+                "output_csv = output.csv",
+            ]
+        )
+    )
+    with pytest.raises(ValueError, match="max_simplify_tolerance_meters"):
+        runner.parse_and_validate_config(cfg_path)
+
+
+def test_project_simplification_tolerance_propagates_to_all_raster_jobs(
+    tmp_path, projected_zone_vector, projected_raster
+):
+    cfg_path = tmp_path / "project.yml"
+    config_lines = [
+        "[project]",
+        "name = project",
+        "global_work_dir = work",
+        "max_simplify_tolerance_meters = 0",
+    ]
+    for job_tag in ("first", "second"):
+        config_lines.extend(
+            [
+                "",
+                f"[job:{job_tag}]",
+                f"agg_vector = {projected_zone_vector.name}",
+                "agg_layer = zones",
+                "agg_field = STATE",
+                "operations = sum",
+                f"base_raster_pattern = {projected_raster.name}",
+                f"output_csv = {job_tag}.csv",
+            ]
+        )
+    cfg_path.write_text("\n".join(config_lines))
+
+    parsed = runner.parse_and_validate_config(cfg_path)
+
+    assert parsed["project"]["max_simplify_tolerance_meters"] == 0.0
+    assert [
+        job["max_simplify_tolerance_meters"] for job in parsed["job_list"]
+    ] == [0.0, 0.0]
 
 
 def test_parse_and_validate_config_requires_layer_for_multilayer_vector(tmp_path):
@@ -419,6 +488,156 @@ def test_prepare_and_rasterize_aggregate_fids(
     ]
 
 
+def test_prepare_reprojects_before_part_aware_simplification(
+    tmp_path, projected_zone_vector
+):
+    prepared_vector = tmp_path / "reprojected.gpkg"
+
+    runner._prepare_aggregate_vector_for_rasterization(
+        projected_zone_vector,
+        "zones",
+        prepared_vector,
+        _projection_wkt(5070),
+        15.0,
+        True,
+    )
+
+    prepared_gdf = gpd.read_file(prepared_vector, layer="zones")
+    assert prepared_gdf.crs.to_epsg() == 5070
+    assert "original_fid" in prepared_gdf.columns
+    assert set(prepared_gdf.geometry.geom_type) == {"MultiPolygon"}
+    assert not prepared_gdf.geometry.is_empty.any()
+
+
+@pytest.mark.parametrize(
+    "epsg,pixel_size,bounding_box,expected_metres_per_unit",
+    [
+        (5070, (4000.0, -4000.0), (-2000, -2000, 2000, 2000), 1.0),
+        (
+            2263,
+            (4000.0, -4000.0),
+            (900000, 100000, 904000, 104000),
+            0.30480060960121924,
+        ),
+    ],
+)
+def test_simplification_tolerance_uses_projected_crs_units(
+    epsg, pixel_size, bounding_box, expected_metres_per_unit
+):
+    raster_info = {
+        "projection_wkt": _projection_wkt(epsg),
+        "pixel_size": pixel_size,
+        "bounding_box": bounding_box,
+    }
+    result = runner._simplification_tolerance_in_crs_units(raster_info, 15.0)
+    assert result["metres_per_crs_unit"] == pytest.approx(
+        expected_metres_per_unit
+    )
+    assert result["tolerance_crs_units"] == pytest.approx(
+        15.0 / expected_metres_per_unit
+    )
+    assert result["tolerance_distance_m"] == pytest.approx(15.0)
+
+
+@pytest.mark.parametrize(
+    "epsg,bounding_box",
+    [
+        (5070, (-2000, -2000, 2000, 2000)),
+        (4326, (-0.02, 44.98, 0.02, 45.02)),
+    ],
+)
+def test_simplification_tolerance_is_independent_of_raster_resolution(
+    epsg, bounding_box
+):
+    raster_info = {
+        "projection_wkt": _projection_wkt(epsg),
+        "bounding_box": bounding_box,
+    }
+    fine_result = runner._simplification_tolerance_in_crs_units(
+        {**raster_info, "pixel_size": (1.0, -1.0)}, 15.0
+    )
+    coarse_result = runner._simplification_tolerance_in_crs_units(
+        {**raster_info, "pixel_size": (4000.0, -4000.0)}, 15.0
+    )
+    assert fine_result["tolerance_crs_units"] == pytest.approx(
+        coarse_result["tolerance_crs_units"]
+    )
+    assert fine_result["tolerance_distance_m"] == 15.0
+    assert coarse_result["tolerance_distance_m"] == 15.0
+
+
+def test_simplification_tolerance_converts_geographic_units():
+    raster_info = {
+        "projection_wkt": _projection_wkt(4326),
+        "pixel_size": (0.04, -0.04),
+        "bounding_box": (-0.02, 44.98, 0.02, 45.02),
+    }
+    result = runner._simplification_tolerance_in_crs_units(raster_info, 15.0)
+    assert result["tolerance_crs_units"] < 0.001
+    assert result["tolerance_distance_m"] == pytest.approx(15.0)
+    assert "geographic" in result["conversion_description"]
+
+    strict_result = runner._simplification_tolerance_in_crs_units(raster_info, 0.0)
+    assert strict_result["tolerance_crs_units"] == 0.0
+    assert strict_result["tolerance_distance_m"] == 0.0
+
+
+def test_simplification_caps_each_small_and_narrow_polygon_part():
+    large_part = Point(0, 0).buffer(10000, quad_segs=500)
+    small_part = Point(25000, 0).buffer(20, quad_segs=20)
+    narrow_part = Polygon(
+        [(30000, 0), (32000, 0), (32000, 10), (30000, 10)]
+    )
+    multipart = MultiPolygon([large_part, small_part, narrow_part])
+    ogr_geometry = ogr.CreateGeometryFromWkb(bytes(multipart.wkb))
+
+    large_tolerance = runner._polygon_part_simplification_tolerance(
+        ogr_geometry.GetGeometryRef(0), 15.0
+    )
+    small_tolerance = runner._polygon_part_simplification_tolerance(
+        ogr_geometry.GetGeometryRef(1), 15.0
+    )
+    narrow_tolerance = runner._polygon_part_simplification_tolerance(
+        ogr_geometry.GetGeometryRef(2), 15.0
+    )
+    simplified, simplified_count, size_capped_count = (
+        runner._simplify_polygonal_geometry_by_part(ogr_geometry, 15.0)
+    )
+
+    assert large_tolerance == 15.0
+    assert small_tolerance < 2.1
+    assert narrow_tolerance < 1.1
+    assert simplified_count == 3
+    assert size_capped_count == 2
+    assert simplified.GetGeometryCount() == 3
+    assert all(
+        not simplified.GetGeometryRef(index).IsEmpty()
+        for index in range(simplified.GetGeometryCount())
+    )
+
+
+def test_representative_complex_geometry_retains_simplification_benefit():
+    point_count = 20000
+    coordinates = []
+    for index in range(point_count):
+        angle = 2.0 * math.pi * index / point_count
+        radius = 10000.0 + 8.0 * math.sin(997.0 * angle)
+        coordinates.append((radius * math.cos(angle), radius * math.sin(angle)))
+    complex_polygon = Polygon(coordinates)
+    ogr_geometry = ogr.CreateGeometryFromWkb(bytes(complex_polygon.wkb))
+
+    simplified, simplified_count, size_capped_count = (
+        runner._simplify_polygonal_geometry_by_part(ogr_geometry, 15.0)
+    )
+    simplified_vertex_count = (
+        simplified.GetGeometryRef(0).GetGeometryRef(0).GetPointCount()
+    )
+
+    assert simplified_count == 1
+    assert size_capped_count == 0
+    assert simplified_vertex_count < point_count * 0.05
+
+
 def test_rasterize_aggregate_fids_can_spawn_from_job_process(
     tmp_path, projected_zone_vector, projected_raster, multiprocessing_queue
 ):
@@ -500,6 +719,94 @@ def test_fast_zonal_statistics_computes_grouped_raster_stats(
     assert right["valid_count"] == 8
     assert right["sum"] == pytest.approx(76.0)
     assert right["proportion_valid_nonzero"] == pytest.approx(1.0)
+
+
+def test_coarse_grid_nested_masks_use_conservative_default_and_support_strict_mode(
+    tmp_path, multiprocessing_queue, caplog
+):
+    coordinates = []
+    for index in range(200):
+        angle = 2.0 * math.pi * index / 200
+        radius = (
+            10000.0
+            + 20.0 * math.sin(41.0 * angle)
+            + 14.0 * math.sin(55.0 * angle + 0.2)
+        )
+        coordinates.append((radius * math.cos(angle), radius * math.sin(angle)))
+    parent_geometry = Polygon(coordinates)
+    child_geometry = parent_geometry.buffer(-12.0)
+    assert parent_geometry.covers(child_geometry)
+
+    parent_vector = _write_vector(
+        tmp_path / "parent.gpkg",
+        gpd.GeoDataFrame(
+            {"ZONE": ["parent"], "geometry": [parent_geometry]}, crs="EPSG:5070"
+        ),
+        layer="zones",
+    )
+    child_vector = _write_vector(
+        tmp_path / "child.gpkg",
+        gpd.GeoDataFrame(
+            {"ZONE": ["child"], "geometry": [child_geometry]}, crs="EPSG:5070"
+        ),
+        layer="zones",
+    )
+    # This coarse-grid pixel center is in the child but not the parent after
+    # independent 30 m simplification. It remains nested with the 15 m default.
+    pixel_center = (9460.811180673316, 3223.7997723348044)
+    raster_path = _write_raster(
+        tmp_path / "coarse.tif",
+        np.array([[10.0]], dtype=np.float32),
+        epsg=5070,
+        nodata=-1,
+        origin=(pixel_center[0] - 2000.0, pixel_center[1] + 2000.0),
+        pixel_size=4000.0,
+    )
+
+    def _stats(vector_path, label, max_distance_m):
+        result = runner.fast_zonal_statistics(
+            (raster_path, 1),
+            vector_path,
+            ["ZONE"],
+            aggregate_layer_name="zones",
+            working_dir=tmp_path / f"work_{label}_{max_distance_m}",
+            clean_working_dir=True,
+            calculate_area_ha=True,
+            max_simplify_tolerance_meters=max_distance_m,
+            progress_queue=multiprocessing_queue,
+            progress_id=f"raster:{label}:{max_distance_m}",
+        )
+        return result[label]
+
+    caplog.set_level(logging.INFO, logger="runner")
+    default_parent = _stats(
+        parent_vector, "parent", runner._DEFAULT_MAX_SIMPLIFY_TOLERANCE_METERS
+    )
+    default_child = _stats(
+        child_vector, "child", runner._DEFAULT_MAX_SIMPLIFY_TOLERANCE_METERS
+    )
+    assert default_parent["valid_count"] == default_child["valid_count"] == 1
+    assert default_parent["area_ha_valid"] == default_child["area_ha_valid"] == 1600
+    assert default_parent["sum"] == default_child["sum"] == 10
+
+    strict_parent = _stats(parent_vector, "parent", 0.0)
+    strict_child = _stats(child_vector, "child", 0.0)
+    assert strict_parent["valid_count"] == 1
+    assert strict_child["valid_count"] == 0
+    assert strict_parent["area_ha_valid"] == 1600
+    assert strict_child["area_ha_valid"] == 0
+    assert strict_parent["sum"] == 10
+    assert strict_child["sum"] == 0
+
+    candidate_parent = _stats(parent_vector, "parent", 30.0)
+    candidate_child = _stats(child_vector, "child", 30.0)
+    assert candidate_child["valid_count"] > candidate_parent["valid_count"]
+    assert candidate_child["area_ha_valid"] > candidate_parent["area_ha_valid"]
+    assert candidate_child["sum"] > candidate_parent["sum"]
+
+    assert "configured_tolerance=15 m" in caplog.text
+    assert "effective_tolerance=15" in caplog.text
+    assert "strict no-simplification mode" in caplog.text
 
 
 def test_run_vector_stats_job_writes_nearest_attribute_stats(
@@ -692,10 +999,17 @@ def test_run_zonal_stats_job_parallelizes_multiple_rasters(
         aggregate_vector_field,
         *,
         rasterize_worker_count,
+        max_simplify_tolerance_meters,
         **kwargs,
     ):
         raster_path, _ = base_raster_path_band
-        calls.append((Path(raster_path).stem, rasterize_worker_count))
+        calls.append(
+            (
+                Path(raster_path).stem,
+                rasterize_worker_count,
+                max_simplify_tolerance_meters,
+            )
+        )
         return {"A": {"sum": 1 if Path(raster_path).stem == "first" else 2}}
 
     monkeypatch.setattr(runner, "ProcessPoolExecutor", FakeProcessPoolExecutor)
@@ -721,10 +1035,11 @@ def test_run_zonal_stats_job_parallelizes_multiple_rasters(
         task_graph=None,
         progress_queue=queue.Queue(),
         raster_workers=2,
+        max_simplify_tolerance_meters=7.5,
     )
 
     assert FakeProcessPoolExecutor.instances[0].max_workers == 2
-    assert calls == [("first", 1), ("second", 1)]
+    assert calls == [("first", 1, 7.5), ("second", 1, 7.5)]
 
     result = pd.read_csv(output_csv)
     assert list(result.columns) == ["STATE", "sum_first", "sum_second"]
