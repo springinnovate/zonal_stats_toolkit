@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import errno
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -16,6 +17,7 @@ from osgeo import gdal
 
 
 _SCHEMA = 1
+logger = logging.getLogger(__name__)
 _MANIFEST = "manifest.json"
 _LOCAL_VECTOR_DRIVERS = {
     "GPKG", "SQLite", "ESRI Shapefile", "OpenFileGDB", "FileGDB",
@@ -231,6 +233,7 @@ def artifact(cache_root, kind, key_data, filename, build, validate, notify=None)
             notify(f"Preparing shared {kind} cache")
         stage = Path(tempfile.mkdtemp(prefix=f"{key}.staging-", dir=parent))
         backup = None
+        primary_error = None
         try:
             target = stage / filename
             build(target)
@@ -254,11 +257,25 @@ def artifact(cache_root, kind, key_data, filename, build, validate, notify=None)
                     backup = None
                 raise
             return entry / filename, False
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
-            if stage.exists():
-                shutil.rmtree(stage)
-            if backup is not None:
-                if backup.is_dir() and not backup.is_symlink():
-                    shutil.rmtree(backup)
-                else:
-                    backup.unlink()
+            for remaining in (stage, backup):
+                if remaining is None:
+                    continue
+                try:
+                    if remaining.is_symlink():
+                        remaining.unlink()
+                    elif remaining.exists():
+                        if remaining.is_dir():
+                            shutil.rmtree(remaining)
+                        else:
+                            remaining.unlink()
+                except OSError as cleanup_error:
+                    if primary_error is None:
+                        raise
+                    message = f"Could not remove cache work path {remaining}: {cleanup_error}"
+                    logger.warning(message)
+                    if hasattr(primary_error, "add_note"):
+                        primary_error.add_note(message)
