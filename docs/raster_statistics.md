@@ -62,6 +62,14 @@ during a calculation cause it to fail instead of publishing results against a
 stale geometry snapshot. Cache checks include file hashing, so a hit still has
 an I/O cost.
 
+ID-raster validation accepts equivalent coordinate-system WKT serializations
+using OSR, including GeoTIFF's metadata normalization. Pixel alignment and
+dimensions still require exact matches; band count, data type, and NoData are
+also checked. Validation failures name the mismatched metadata and close GDAL
+handles before cleanup. If cleanup fails too, the original error is retained
+and the remaining work path is reported. Unpublished artifacts are never cache
+hits.
+
 Caching supports local GeoPackage, SQLite, Shapefile, File Geodatabase, GeoJSON,
 and FlatGeobuf inputs. Unsupported or indirect inputs, active database journals,
 and network-enabled or explicitly file-referenced coordinate transformations

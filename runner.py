@@ -1662,20 +1662,42 @@ def _id_raster_grid(base_raster_path):
     dataset = gdal.OpenEx(str(base_raster_path), gdal.OF_RASTER)
     if dataset is None:
         raise RuntimeError(f"Cannot read raster grid: {base_raster_path}")
-    band = dataset.GetRasterBand(1)
-    return {
-        "size": [dataset.RasterXSize, dataset.RasterYSize],
-        "transform": list(dataset.GetGeoTransform()),
-        "projection": dataset.GetProjection(),
-        # Keep storage layout in the key: iterblocks uses it to choose the
-        # reduction boundaries, which must remain identical for exact sums.
-        "source_block_size": band.GetBlockSize(),
-        "pixel_type": band.GetMetadata("IMAGE_STRUCTURE").get("PIXELTYPE"),
-        "creation_options": list(geoprocessing.DEFAULT_GTIFF_CREATION_TUPLE_OPTIONS),
-        "id_type": "Int32", "nodata": -1,
-        "tile_size": _RASTERIZE_TILE_SIZE,
-        "burn_options": ["ALL_TOUCHED=FALSE", "ATTRIBUTE=original_fid"],
-    }
+    band = None
+    try:
+        band = dataset.GetRasterBand(1)
+        return {
+            "size": [dataset.RasterXSize, dataset.RasterYSize],
+            "transform": list(dataset.GetGeoTransform()),
+            "projection": dataset.GetProjection(),
+            # Keep storage layout in the key: iterblocks uses it to choose the
+            # reduction boundaries, which must remain identical for exact sums.
+            "source_block_size": band.GetBlockSize(),
+            "pixel_type": band.GetMetadata("IMAGE_STRUCTURE").get("PIXELTYPE"),
+            "creation_options": list(geoprocessing.DEFAULT_GTIFF_CREATION_TUPLE_OPTIONS),
+            "id_type": "Int32", "nodata": -1,
+            "tile_size": _RASTERIZE_TILE_SIZE,
+            "burn_options": ["ALL_TOUCHED=FALSE", "ATTRIBUTE=original_fid"],
+        }
+    finally:
+        band = None
+        dataset = None
+
+
+def _equivalent_raster_crs(actual, expected):
+    """Allow equivalent WKT serializations, not different coordinate systems."""
+    if actual == expected:
+        return True
+    if not actual or not expected:
+        return False
+    actual_srs, expected_srs = osr.SpatialReference(), osr.SpatialReference()
+    try:
+        for srs, wkt in ((actual_srs, actual), (expected_srs, expected)):
+            if srs.ImportFromWkt(wkt) != 0:
+                return False
+            srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        return bool(actual_srs.IsSame(expected_srs))
+    except RuntimeError:
+        return False
 
 
 def _validate_prepared_geometry(path, layer_name, projection):
@@ -1683,14 +1705,20 @@ def _validate_prepared_geometry(path, layer_name, projection):
     dataset = gdal.OpenEx(str(path), gdal.OF_VECTOR)
     if dataset is None:
         raise ValueError("Unreadable prepared polygon cache")
-    layer = dataset.GetLayerByName(layer_name)
-    target_srs = osr.SpatialReference()
-    target_srs.ImportFromWkt(projection)
-    target_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-    if (layer is None or layer.GetSpatialRef() is None
-            or not layer.GetSpatialRef().IsSame(target_srs)
-            or layer.FindFieldIndex("original_fid", 1) == -1):
-        raise ValueError("Invalid prepared polygon cache metadata")
+    layer = None
+    try:
+        layer = dataset.GetLayerByName(layer_name)
+        target_srs = osr.SpatialReference()
+        target_srs.ImportFromWkt(projection)
+        target_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        if (layer is None or layer.GetSpatialRef() is None
+                or not layer.GetSpatialRef().IsSame(target_srs)
+                or layer.FindFieldIndex("original_fid", 1) == -1):
+            raise ValueError("Invalid prepared polygon cache metadata")
+    finally:
+        # A retained exception traceback must not keep the file open on Windows.
+        layer = None
+        dataset = None
 
 
 def _validate_id_raster(path, grid):
@@ -1698,13 +1726,25 @@ def _validate_id_raster(path, grid):
     dataset = gdal.OpenEx(str(path), gdal.OF_RASTER)
     if dataset is None:
         raise ValueError("Unreadable polygon-ID cache")
-    band = dataset.GetRasterBand(1)
-    if (dataset.RasterCount != 1
-            or [dataset.RasterXSize, dataset.RasterYSize] != grid["size"]
-            or list(dataset.GetGeoTransform()) != grid["transform"]
-            or dataset.GetProjection() != grid["projection"]
-            or band.DataType != gdal.GDT_Int32 or band.GetNoDataValue() != -1):
-        raise ValueError("Invalid polygon-ID cache metadata")
+    band = None
+    try:
+        if dataset.RasterCount != 1:
+            raise ValueError("Invalid polygon-ID cache metadata: expected one band")
+        band = dataset.GetRasterBand(1)
+        checks = {
+            "dimensions": [dataset.RasterXSize, dataset.RasterYSize] == grid["size"],
+            "geotransform": list(dataset.GetGeoTransform()) == grid["transform"],
+            # GeoTIFF can normalize WKT without changing the coordinate system.
+            "CRS": _equivalent_raster_crs(dataset.GetProjection(), grid["projection"]),
+            "data type": band.DataType == gdal.GDT_Int32,
+            "NoData": band.GetNoDataValue() == -1,
+        }
+        mismatches = [name for name, valid in checks.items() if not valid]
+        if mismatches:
+            raise ValueError(f"Invalid polygon-ID cache metadata: {', '.join(mismatches)}")
+    finally:
+        band = None
+        dataset = None
 
 
 def fast_zonal_statistics(

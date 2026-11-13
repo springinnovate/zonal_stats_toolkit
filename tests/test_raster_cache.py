@@ -406,6 +406,101 @@ def test_failed_publication_never_becomes_a_cache_hit(tmp_path, failure):
     assert path.read_text(encoding="utf-8") == "valid-complete"
 
 
+@pytest.mark.parametrize("failure", ["build", "validate"])
+def test_cleanup_failure_preserves_primary_error_and_retry_rebuilds(
+        tmp_path, monkeypatch, caplog, failure):
+    primary = (RuntimeError("primary build failure") if failure == "build"
+               else ValueError("primary validation failure"))
+    builds = []
+    failed_cleanups = []
+    rmtree = raster_cache.shutil.rmtree
+
+    def broken_build(path):
+        builds.append(path)
+        path.write_text("valid-partial", encoding="utf-8")
+        if failure == "build":
+            raise primary
+
+    def broken_validate(path):
+        raise primary
+
+    def locked_staging(path, *args, **kwargs):
+        if ".staging-" in Path(path).name:
+            failed_cleanups.append(Path(path))
+            error = PermissionError(13, "[WinError 32] File is being used", str(path))
+            error.winerror = 32
+            raise error
+        return rmtree(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(raster_cache.shutil, "rmtree", locked_staging)
+        with pytest.raises(type(primary), match="primary .* failure") as raised:
+            _text_artifact(tmp_path, broken_build, broken_validate)
+
+    assert raised.value is primary
+    assert len(failed_cleanups) == 1
+    failed_stage = failed_cleanups[0]
+    assert failed_stage == builds[0].parent
+    assert builds[0].read_text(encoding="utf-8") == "valid-partial"
+    assert not list(tmp_path.rglob("manifest.json"))
+    assert str(failed_stage) in caplog.text
+    assert "WinError 32" in caplog.text
+    if hasattr(primary, "add_note"):
+        assert any(str(failed_stage) in note and "WinError 32" in note
+                   for note in primary.__notes__)
+
+    def complete_build(path):
+        builds.append(path)
+        path.write_text("valid-complete", encoding="utf-8")
+
+    path, hit = _text_artifact(tmp_path, complete_build)
+    assert not hit
+    assert len(builds) == 2
+    assert builds[1].parent != failed_stage
+    assert path.read_text(encoding="utf-8") == "valid-complete"
+    assert _text_artifact(tmp_path, complete_build) == (path, True)
+    assert len(builds) == 2
+    assert failed_stage.exists()  # An unpublished leftover is never reused.
+    assert len(list(tmp_path.rglob("manifest.json"))) == 1
+
+
+def test_cleanup_failure_after_successful_publication_is_not_swallowed(
+        tmp_path, monkeypatch):
+    builds = []
+    failed_cleanups = []
+    cleanup_error = PermissionError(13, "[WinError 32] Old cache is being used")
+    cleanup_error.winerror = 32
+    rmtree = raster_cache.shutil.rmtree
+
+    def build(path):
+        builds.append(path)
+        path.write_text(f"valid-{len(builds)}", encoding="utf-8")
+
+    path, hit = _text_artifact(tmp_path, build)
+    assert not hit
+    path.write_text("corrupted", encoding="utf-8")
+
+    def locked_replaced_entry(target, *args, **kwargs):
+        if ".replaced-" in Path(target).name:
+            failed_cleanups.append(Path(target))
+            raise cleanup_error
+        return rmtree(target, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(raster_cache.shutil, "rmtree", locked_replaced_entry)
+        with pytest.raises(PermissionError, match="WinError 32") as raised:
+            _text_artifact(tmp_path, build)
+
+    assert raised.value is cleanup_error
+    assert len(failed_cleanups) == 1
+    assert failed_cleanups[0].exists()
+    assert len(builds) == 2
+    assert path.read_text(encoding="utf-8") == "valid-2"
+    assert (path.parent / "manifest.json").is_file()
+    assert _text_artifact(tmp_path, build) == (path, True)
+    assert len(builds) == 2
+
+
 def test_same_key_threads_publish_once(tmp_path):
     start = threading.Barrier(4)
     builds = []
