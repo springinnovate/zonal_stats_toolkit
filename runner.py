@@ -1,7 +1,14 @@
 from __future__ import annotations
 from threading import Thread
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from collections import defaultdict, deque
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 import collections
@@ -278,7 +285,8 @@ def _progress_monitor(progress_queue, total_jobs):
                 active_label = active_label or bar_descriptions.get(
                     progress_id, progress_id
                 )
-                job_prefix = f"{active_job_tag}: " if active_job_tag else ""
+                event_job_tag = event.get("tag", active_job_tag)
+                job_prefix = f"{event_job_tag}: " if event_job_tag else ""
                 job_bar.set_postfix_str(
                     f"{job_prefix}{active_label} - {phase}",
                     refresh=True,
@@ -1062,10 +1070,11 @@ def _rasterize_aggregate_fids(
         )
 
     try:
-        with ProcessPoolExecutor(max_workers=worker_count) as executor:
-            future_to_tile_spec = {
-                executor.submit(
-                    _rasterize_aggregate_fid_tile,
+        if worker_count == 1:
+            # A shared outer pool already owns the process budget. Do not
+            # create a child process merely to execute one tile at a time.
+            for tile, tile_path in tile_specs:
+                _rasterize_aggregate_fid_tile(
                     aggregate_vector_path,
                     aggregate_layer_name,
                     tile_path,
@@ -1073,13 +1082,28 @@ def _rasterize_aggregate_fids(
                     base_geotransform,
                     projection_wkt,
                     target_nodata,
-                ): (tile, tile_path)
-                for tile, tile_path in tile_specs
-            }
-            for future in as_completed(future_to_tile_spec):
-                future.result()
+                )
                 completed_tiles += 1
                 _report_tile_progress()
+        else:
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                future_to_tile_spec = {
+                    executor.submit(
+                        _rasterize_aggregate_fid_tile,
+                        aggregate_vector_path,
+                        aggregate_layer_name,
+                        tile_path,
+                        tile,
+                        base_geotransform,
+                        projection_wkt,
+                        target_nodata,
+                    ): (tile, tile_path)
+                    for tile, tile_path in tile_specs
+                }
+                for future in as_completed(future_to_tile_spec):
+                    future.result()
+                    completed_tiles += 1
+                    _report_tile_progress()
 
         progress_queue.put(
             {
@@ -3379,6 +3403,318 @@ def run_zonal_stats_job(
     )
 
 
+_SHARED_THREAD_ENV_VARS = (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "GDAL_NUM_THREADS",
+)
+
+
+class _TaggedProgressQueue:
+    """Attach the owning group to progress from concurrent raster tasks."""
+
+    def __init__(self, progress_queue, tag):
+        self.progress_queue = progress_queue
+        self.tag = tag
+
+    def put(self, event):
+        self.progress_queue.put({**event, "tag": self.tag})
+
+
+def _initialize_shared_worker(log_level):
+    """Keep native libraries inside the shared process budget."""
+    for name in _SHARED_THREAD_ENV_VARS:
+        os.environ[name] = "1"
+    gdal.SetConfigOption("GDAL_NUM_THREADS", "1")
+    _configure_logging(log_level)
+    _configure_gdal_cache()
+
+
+def _validate_shared_raster_jobs(job_run_list, total_workers):
+    """Reject unsupported jobs and output collisions before scheduling work."""
+    if (
+        isinstance(total_workers, bool)
+        or not isinstance(total_workers, int)
+        or total_workers < 1
+    ):
+        raise ValueError("--total-workers must be at least 1")
+    output_paths = set()
+    input_paths = set()
+    for output_label, job in job_run_list:
+        operations = {
+            str(operation).strip().lower() for operation in job["operations"]
+        }
+        if (
+            not job.get("base_raster_path_list")
+            or job.get("base_vector_path_list")
+            or job.get("base_measure_vector") is not None
+            or operations.intersection(MEASURE_OPERATIONS)
+        ):
+            raise ValueError(
+                "--total-workers supports raster-only jobs; "
+                f"group {job['tag']!r} ({output_label}) uses vector/measure inputs "
+                "or has no rasters"
+            )
+        raster_stems = [
+            Path(path).stem.casefold() for path in job["base_raster_path_list"]
+        ]
+        if len(raster_stems) != len(set(raster_stems)):
+            raise ValueError(
+                "--total-workers requires unique raster names in group "
+                f"{job['tag']!r}"
+            )
+        input_paths.update(
+            os.path.normcase(str(Path(path).resolve()))
+            for path in [job["agg_vector"], *job["base_raster_path_list"]]
+        )
+        for output_key in ("output_csv", "output_gpkg"):
+            if job.get(output_key) is None:
+                continue
+            output_path = Path(job[output_key])
+            canonical_path = os.path.normcase(str(output_path.resolve()))
+            if canonical_path in output_paths:
+                raise ValueError(f"Shared jobs have the same output path: {output_path}")
+            if output_path.exists():
+                raise FileExistsError(f"Shared job output already exists: {output_path}")
+            output_paths.add(canonical_path)
+    if output_paths.intersection(input_paths):
+        raise ValueError("Shared job outputs must not replace input datasets")
+
+
+def _shared_raster_task(job, raster_index, result_path, progress_queue):
+    """Compute one group/raster pair, spooling its table outside the parent."""
+    operations = [str(operation).strip().lower() for operation in job["operations"]]
+    core_ops = list(dict.fromkeys(
+        operation
+        for operation in operations
+        if operation and not _is_percentile_operation(operation)
+    ))
+    pct_list = sorted({
+        float(operation[1:])
+        for operation in operations
+        if _is_percentile_operation(operation)
+    })
+    pct_keys = [f"p{int(p) if p.is_integer() else p}" for p in pct_list]
+    result_path = Path(result_path)
+    tag = job.get("_shared_progress_tag", job["tag"])
+    # Each raster gets its own cache paths, including when two groups use the
+    # same source raster. Release large rasterization intermediates immediately.
+    with tempfile.TemporaryDirectory(
+        prefix="raster_", dir=result_path.parent,
+    ) as workdir:
+        _, result_table, assumptions = _raster_zonal_stats_dataframe(
+            raster_index,
+            Path(job["base_raster_path_list"][raster_index]),
+            job["agg_vector"],
+            job["agg_field"],
+            job["agg_layer"],
+            Path(workdir),
+            core_ops,
+            pct_list,
+            pct_keys,
+            bool(AREA_HECTARE_OPERATIONS.intersection(core_ops)),
+            _TaggedProgressQueue(progress_queue, tag),
+            tag,
+            1,
+            job.get(
+                "max_simplify_tolerance_meters",
+                _DEFAULT_MAX_SIMPLIFY_TOLERANCE_METERS,
+            ),
+        )
+        result_table.to_pickle(result_path)
+    return {"raster_index": raster_index, "area_hectare_assumptions": assumptions}
+
+
+def _shared_publish_task(job, result_paths):
+    """Merge a completed group in config order and publish its complete outputs.
+
+    Staging stays on each output's filesystem. Exclusive hard links publish
+    finished files without overwriting another run; roll back this group's
+    links if either output cannot be published.
+    """
+    combined_dataframe = None
+    for result_path in result_paths:
+        raster_frame = pd.read_pickle(result_path)
+        combined_dataframe = (
+            raster_frame
+            if combined_dataframe is None
+            else combined_dataframe.merge(
+                raster_frame, on=job["agg_field"], how="outer",
+            )
+        )
+    with ExitStack() as staging:
+        staged_outputs = {}
+        for output_key in ("output_csv", "output_gpkg"):
+            if job.get(output_key) is None:
+                staged_outputs[output_key] = None
+                continue
+            output_path = Path(job[output_key])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            stage_dir = Path(staging.enter_context(tempfile.TemporaryDirectory(
+                prefix=".zonal_publish_", dir=output_path.parent,
+            )))
+            staged_outputs[output_key] = stage_dir / output_path.name
+        _write_zonal_outputs(
+            combined_dataframe,
+            job["agg_vector"],
+            job["agg_layer"],
+            job["agg_field"],
+            staged_outputs["output_csv"],
+            staged_outputs["output_gpkg"],
+        )
+        published = []
+        try:
+            for output_key, staged_path in staged_outputs.items():
+                if staged_path is not None:
+                    final_path = Path(job[output_key])
+                    os.link(staged_path, final_path)
+                    published.append(final_path)
+        except BaseException:
+            for final_path in published:
+                final_path.unlink(missing_ok=True)
+            raise
+    for result_path in result_paths:
+        Path(result_path).unlink(missing_ok=True)
+
+
+def run_shared_raster_jobs(job_run_list, total_workers, log_level, progress_queue):
+    """Run raster groups in one bounded process pool.
+
+    Raster tasks enter the queue round-robin across groups. At most twice the
+    worker count is submitted at once, including completed-group publication.
+    Workers spool tables to private temporary files, so the coordinator keeps
+    only task metadata. Group merges and CSV/GPKG writes use the same pool and
+    budget as raster computation. Pending work is cancelled on failure, and
+    running work is joined before its temporary files are removed.
+    """
+    _validate_shared_raster_jobs(job_run_list, total_workers)
+    if not job_run_list:
+        return
+    previous_environment = {
+        name: os.environ.get(name) for name in _SHARED_THREAD_ENV_VARS
+    }
+    # Spawn imports NumPy before the initializer runs, so cap native threads in
+    # the inherited environment as well as in the worker initializer.
+    for name in _SHARED_THREAD_ENV_VARS:
+        os.environ[name] = "1"
+    pending = {}
+    executor = None
+    try:
+        with ExitStack() as temporary_files:
+            jobs = []
+            paths_by_job = []
+            tag_counts = collections.Counter(job["tag"] for _, job in job_run_list)
+            for job_index, (_, original_job) in enumerate(job_run_list):
+                job = dict(original_job)
+                job["_shared_progress_tag"] = (
+                    job["tag"]
+                    if tag_counts[job["tag"]] == 1
+                    else f"{job['tag']} [group {job_index + 1}]"
+                )
+                workdir = Path(job["workdir"])
+                workdir.mkdir(parents=True, exist_ok=True)
+                spool_dir = Path(temporary_files.enter_context(
+                    tempfile.TemporaryDirectory(prefix="shared_zonals_", dir=workdir),
+                ))
+                jobs.append(job)
+                paths_by_job.append([
+                    spool_dir / f"raster_{raster_index:06d}.pkl"
+                    for raster_index in range(len(job["base_raster_path_list"]))
+                ])
+            remaining = [len(paths) for paths in paths_by_job]
+            ready_rasters = deque((index, 0) for index in range(len(jobs)))
+            ready_to_publish = deque()
+            started = set()
+            executor = ProcessPoolExecutor(
+                max_workers=total_workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_initialize_shared_worker,
+                initargs=(log_level,),
+            )
+            try:
+                while ready_rasters or ready_to_publish or pending:
+                    while len(pending) < 2 * total_workers and (
+                        ready_rasters or ready_to_publish
+                    ):
+                        if ready_to_publish:
+                            job_index = ready_to_publish.popleft()
+                            future = executor.submit(
+                                _shared_publish_task,
+                                jobs[job_index],
+                                paths_by_job[job_index],
+                            )
+                            pending[future] = ("publish", job_index, None)
+                        else:
+                            job_index, raster_index = ready_rasters.popleft()
+                            job = jobs[job_index]
+                            if job_index not in started:
+                                progress_queue.put({
+                                    "event": "job_start",
+                                    "tag": job["_shared_progress_tag"],
+                                })
+                                started.add(job_index)
+                            future = executor.submit(
+                                _shared_raster_task,
+                                job,
+                                raster_index,
+                                paths_by_job[job_index][raster_index],
+                                progress_queue,
+                            )
+                            pending[future] = ("raster", job_index, raster_index)
+                            if raster_index + 1 < len(paths_by_job[job_index]):
+                                ready_rasters.append((job_index, raster_index + 1))
+                    completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        kind, job_index, raster_index = pending.pop(future)
+                        job = jobs[job_index]
+                        try:
+                            result = future.result()
+                        except BaseException as error:
+                            progress_queue.put({
+                                "event": "job_done",
+                                "tag": job["_shared_progress_tag"],
+                                "status": "failed",
+                            })
+                            detail = (
+                                f"raster {job['base_raster_path_list'][raster_index]}"
+                                if kind == "raster" else "output publication"
+                            )
+                            raise RuntimeError(
+                                f"Shared zonal group {job['tag']!r} failed "
+                                f"during {detail}: "
+                                f"{job_run_list[job_index][0]}"
+                            ) from error
+                        if kind == "raster":
+                            _AREA_HECTARE_ASSUMPTIONS.update(
+                                result["area_hectare_assumptions"],
+                            )
+                            remaining[job_index] -= 1
+                            if remaining[job_index] == 0:
+                                ready_to_publish.append(job_index)
+                        else:
+                            progress_queue.put({
+                                "event": "job_done",
+                                "tag": job["_shared_progress_tag"],
+                                "status": "done",
+                            })
+            finally:
+                for future in pending:
+                    future.cancel()
+                executor.shutdown(wait=True, cancel_futures=True)
+                executor = None
+    finally:
+        # Also cover failures during executor construction or temporary setup.
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        for name, previous_value in previous_environment.items():
+            if previous_value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous_value
+
+
 def main():
     """CLI entrypoint for validating zonal-stats runner configurations.
 
@@ -3414,12 +3750,30 @@ def main():
             "memory-constrained systems."
         ),
     )
+    parser.add_argument(
+        "--total-workers",
+        type=int,
+        default=None,
+        help=(
+            "Use one shared process pool of this size across raster-only jobs "
+            "and their rasters, including output publication. Cannot be "
+            "combined with --job-workers/--max-workers or --raster-workers."
+        ),
+    )
     parser.add_argument("--test", action="store_true")
     args = parser.parse_args()
     if args.job_workers is not None and args.job_workers < 1:
         raise ValueError("--job-workers must be at least 1")
     if args.raster_workers is not None and args.raster_workers < 1:
         raise ValueError("--raster-workers must be at least 1")
+    if args.total_workers is not None:
+        if args.total_workers < 1:
+            raise ValueError("--total-workers must be at least 1")
+        if args.job_workers is not None or args.raster_workers is not None:
+            raise ValueError(
+                "--total-workers cannot be combined with --job-workers/--max-workers "
+                "or --raster-workers"
+            )
 
     config_list = []
     for config_path in args.configs:
@@ -3461,6 +3815,8 @@ def main():
     if total_job_count == 0:
         logger.info("No jobs to run")
         return
+    if args.total_workers is not None:
+        _validate_shared_raster_jobs(job_run_list, args.total_workers)
 
     cpu_count = os.cpu_count() or 1
     job_workers = args.job_workers or max(1, min(4, cpu_count // 2))
@@ -3478,59 +3834,68 @@ def main():
     progress_thread.start()
 
     try:
-        logger.debug(
-            "running %d jobs sequentially with %d internal worker process(es) "
-            "and %d raster worker process(es)",
-            total_job_count,
-            job_workers,
-            raster_workers,
-        )
-        job_error = None
-        for output_label, job in job_run_list:
-            job = dict(job)
-            tag = job["tag"]
-            status = "done"
-            try:
-                job["progress_queue"] = progress_queue
-                job["raster_workers"] = raster_workers
-                progress_queue.put({"event": "job_start", "tag": tag})
-                with ProcessPoolExecutor(
-                    max_workers=1,
-                    mp_context=process_context,
-                ) as executor:
-                    future = executor.submit(
-                        _run_zonal_stats_job_process,
-                        output_label,
-                        job,
-                        log_level,
-                        job_workers,
+        if args.total_workers is not None:
+            logger.debug(
+                "running %d raster-only jobs with %d shared worker process(es)",
+                total_job_count, args.total_workers,
+            )
+            run_shared_raster_jobs(
+                job_run_list, args.total_workers, log_level, progress_queue,
+            )
+        else:
+            logger.debug(
+                "running %d jobs sequentially with %d internal worker process(es) "
+                "and %d raster worker process(es)",
+                total_job_count,
+                job_workers,
+                raster_workers,
+            )
+            job_error = None
+            for output_label, job in job_run_list:
+                job = dict(job)
+                tag = job["tag"]
+                status = "done"
+                try:
+                    job["progress_queue"] = progress_queue
+                    job["raster_workers"] = raster_workers
+                    progress_queue.put({"event": "job_start", "tag": tag})
+                    with ProcessPoolExecutor(
+                        max_workers=1,
+                        mp_context=process_context,
+                    ) as executor:
+                        future = executor.submit(
+                            _run_zonal_stats_job_process,
+                            output_label,
+                            job,
+                            log_level,
+                            job_workers,
+                        )
+                        result = future.result()
+                    _AREA_HECTARE_ASSUMPTIONS.update(
+                        result["area_hectare_assumptions"]
                     )
-                    result = future.result()
-                _AREA_HECTARE_ASSUMPTIONS.update(
-                    result["area_hectare_assumptions"]
-                )
-                _MEASURE_CRS_ASSUMPTIONS.update(
-                    result["measure_crs_assumptions"]
-                )
-                logger.debug("%s is complete", output_label)
-            except Exception as error:
-                status = "failed"
-                logger.exception("job failed for output %s", output_label)
-                job_error = (output_label, error)
-            finally:
-                progress_queue.put(
-                    {
-                        "event": "job_done",
-                        "tag": tag,
-                        "status": status,
-                    },
-                )
+                    _MEASURE_CRS_ASSUMPTIONS.update(
+                        result["measure_crs_assumptions"]
+                    )
+                    logger.debug("%s is complete", output_label)
+                except Exception as error:
+                    status = "failed"
+                    logger.exception("job failed for output %s", output_label)
+                    job_error = (output_label, error)
+                finally:
+                    progress_queue.put(
+                        {
+                            "event": "job_done",
+                            "tag": tag,
+                            "status": status,
+                        },
+                    )
 
-            if job_error is not None:
-                failed_output, error = job_error
-                raise RuntimeError(
-                    f"zonal statistics job failed: {failed_output}"
-                ) from error
+                if job_error is not None:
+                    failed_output, error = job_error
+                    raise RuntimeError(
+                        f"zonal statistics job failed: {failed_output}"
+                    ) from error
     finally:
         progress_queue.put({"event": "stop"})
         progress_thread.join()
