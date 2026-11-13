@@ -8,6 +8,7 @@ import collections
 import argparse
 import configparser
 import glob
+import hashlib
 import logging
 import math
 import multiprocessing
@@ -36,6 +37,7 @@ import pandas as pd
 import fiona
 import numpy as np
 import geopandas as gpd
+import raster_cache
 
 logging.getLogger("ecoshard").setLevel(logging.WARNING)
 logging.getLogger("fiona").setLevel(logging.WARNING)
@@ -48,6 +50,7 @@ _RASTERIZE_WORKER_COUNT = 4
 _DEFAULT_MAX_SIMPLIFY_TOLERANCE_METERS = 15.0
 _SIMPLIFICATION_PART_SIZE_FACTOR = 10.0
 _RASTER_GROUP_SORT_BUDGET_BYTES = 256 * 1024 * 1024
+_GEOMETRY_CACHE_VERSION = 1
 
 
 AREA_HECTARE_OPERATIONS = {
@@ -1596,6 +1599,90 @@ def _raster_stat_dependencies(operations):
     return fields
 
 
+def _geometry_cache_runtime(needs_reproject):
+    """Fingerprint code, spatial libraries, and local transformation resources."""
+    def digest(path):
+        checksum = hashlib.sha256()
+        with Path(path).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                checksum.update(chunk)
+        return checksum.hexdigest()
+
+    if needs_reproject and osr.GetPROJEnableNetwork():
+        raise ValueError("network-enabled coordinate transformations are not cached")
+    resources = {}
+    if needs_reproject:
+        for directory in osr.GetPROJSearchPaths():
+            root = Path(directory)
+            if root.is_dir():
+                for path in sorted(root.rglob("*")):
+                    if path.is_file() and path.name not in {"cache.db", "cache.db-wal", "cache.db-shm"}:
+                        resources[str(path.resolve())] = digest(path)
+    return {
+        "version": _GEOMETRY_CACHE_VERSION,
+        "runner": digest(__file__),
+        "cache": digest(raster_cache.__file__),
+        "geoprocessing": digest(geoprocessing.new_raster_from_base.__code__.co_filename),
+        "gdal": gdal.VersionInfo("--version"),
+        "geos": [ogr.GetGEOSVersionMajor(), ogr.GetGEOSVersionMinor(), ogr.GetGEOSVersionMicro()],
+        "proj": [osr.GetPROJVersionMajor(), osr.GetPROJVersionMinor(), osr.GetPROJVersionMicro()],
+        "config": gdal.GetConfigOptions(),
+        "environment": {key: value for key, value in sorted(os.environ.items())
+                        if key.startswith(("GDAL_", "OGR_", "OSR_", "PROJ_"))},
+        "projection_resources": resources,
+    }
+
+
+def _id_raster_grid(base_raster_path):
+    """Describe every base-raster property inherited by the ID-raster builder."""
+    dataset = gdal.OpenEx(str(base_raster_path), gdal.OF_RASTER)
+    if dataset is None:
+        raise RuntimeError(f"Cannot read raster grid: {base_raster_path}")
+    band = dataset.GetRasterBand(1)
+    return {
+        "size": [dataset.RasterXSize, dataset.RasterYSize],
+        "transform": list(dataset.GetGeoTransform()),
+        "projection": dataset.GetProjection(),
+        # Keep storage layout in the key: iterblocks uses it to choose the
+        # reduction boundaries, which must remain identical for exact sums.
+        "source_block_size": band.GetBlockSize(),
+        "pixel_type": band.GetMetadata("IMAGE_STRUCTURE").get("PIXELTYPE"),
+        "creation_options": list(geoprocessing.DEFAULT_GTIFF_CREATION_TUPLE_OPTIONS),
+        "id_type": "Int32", "nodata": -1,
+        "tile_size": _RASTERIZE_TILE_SIZE,
+        "burn_options": ["ALL_TOUCHED=FALSE", "ATTRIBUTE=original_fid"],
+    }
+
+
+def _validate_prepared_geometry(path, layer_name, projection):
+    """Check cached vector structure without modifying its geometry or FIDs."""
+    dataset = gdal.OpenEx(str(path), gdal.OF_VECTOR)
+    if dataset is None:
+        raise ValueError("Unreadable prepared polygon cache")
+    layer = dataset.GetLayerByName(layer_name)
+    target_srs = osr.SpatialReference()
+    target_srs.ImportFromWkt(projection)
+    target_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    if (layer is None or layer.GetSpatialRef() is None
+            or not layer.GetSpatialRef().IsSame(target_srs)
+            or layer.FindFieldIndex("original_fid", 1) == -1):
+        raise ValueError("Invalid prepared polygon cache metadata")
+
+
+def _validate_id_raster(path, grid):
+    """Check cached ID-raster metadata; the cache also verifies its checksum."""
+    dataset = gdal.OpenEx(str(path), gdal.OF_RASTER)
+    if dataset is None:
+        raise ValueError("Unreadable polygon-ID cache")
+    band = dataset.GetRasterBand(1)
+    if (dataset.RasterCount != 1
+            or [dataset.RasterXSize, dataset.RasterYSize] != grid["size"]
+            or list(dataset.GetGeoTransform()) != grid["transform"]
+            or dataset.GetProjection() != grid["projection"]
+            or band.DataType != gdal.GDT_Int32 or band.GetNoDataValue() != -1):
+        raise ValueError("Invalid polygon-ID cache metadata")
+
+
 def fast_zonal_statistics(
     base_raster_path_band,
     aggregate_vector_path,
@@ -1612,12 +1699,17 @@ def fast_zonal_statistics(
     progress_queue,
     progress_id,
     operations=None,
+    reuse_geometry=True,
+    geometry_cache_dir=None,
 ):
     """Summarize pixel-center samples, computing only requested dependencies.
 
     ``operations=None`` retains the full-statistics API. Explicit operations
     return only those fields and requested percentiles. Geometry preparation,
     NoData policy, within-feature pixel order, and block order are unchanged.
+    Geometry artifacts are reused by content and processing settings under
+    ``geometry_cache_dir`` (default: working_dir/geometry_cache). Set
+    ``reuse_geometry=False`` to build independent artifacts for comparison.
     """
     requested = None if operations is None else set(operations)
     if requested is not None:
@@ -1770,6 +1862,7 @@ def fast_zonal_statistics(
     )
 
     source_srs = source_layer.GetSpatialRef()
+    source_layer_name = source_layer.GetName()
     needs_reproject = True
     if source_srs is not None:
         source_srs = source_srs.Clone()
@@ -1793,6 +1886,19 @@ def fast_zonal_statistics(
     feature_id_raster_path = cache_working_dir / "agg_fid.tif"
     logger.debug("using zonal statistics cache dir: %s", cache_working_dir)
 
+    last_cache_message = None
+
+    def cache_message(message):
+        nonlocal last_cache_message
+        event = {"id": progress_id, "phase": message}
+        if message == last_cache_message:
+            event.update(event="analysis_update", increment=0)
+        else:
+            logger.info("%s | %s", progress_id, message)
+            event.update(event="analysis_phase", total=None, unit="step")
+        last_cache_message = message
+        progress_queue.put(event)
+
     def _raster_nodata_mask(value_array):
         finite_mask = np.isfinite(value_array)
         if raster_nodata is None:
@@ -1800,14 +1906,58 @@ def fast_zonal_statistics(
         return np.isclose(value_array, raster_nodata) | ~finite_mask
 
     try:
-        _prepare_aggregate_vector_for_rasterization(
-            aggregate_vector_path,
-            aggregate_layer_name,
-            projected_vector_path,
-            raster_info["projection_wkt"],
-            simplify_tolerance,
-            needs_reproject,
-        )
+        prepared_key = None
+        if reuse_geometry:
+            cache_message("checking prepared polygon cache")
+            try:
+                crs_text = (raster_info["projection_wkt"] +
+                            (source_srs.ExportToWkt() if source_srs is not None else "")).upper()
+                if needs_reproject and any(token in crs_text for token in (
+                    "PARAMETERFILE[", "+NADGRIDS=", "+GEOIDGRIDS=", "+PROJ=PIPELINE",
+                )):
+                    raise ValueError("custom CRS transformation-file references are not cached")
+                source_identity = raster_cache.fingerprint_vector(aggregate_vector_path)
+                runtime = _geometry_cache_runtime(needs_reproject)
+            except ValueError as error:
+                logger.warning("Geometry cache bypassed: %s", error)
+                reuse_geometry = False
+            else:
+                prepared_key = {
+                    "source": source_identity, "layer": source_layer_name,
+                    "target_projection": raster_info["projection_wkt"],
+                    "needs_reproject": needs_reproject,
+                    "simplification_meters": max_simplify_tolerance_meters,
+                    "simplification_units": simplify_tolerance,
+                    "part_size_factor": _SIMPLIFICATION_PART_SIZE_FACTOR,
+                    "runtime": runtime,
+                }
+        shared_cache = (Path(geometry_cache_dir) if geometry_cache_dir is not None
+                        else working_dir / "geometry_cache")
+
+        def verify_geometry_inputs():
+            if reuse_geometry and (
+                raster_cache.fingerprint_vector(aggregate_vector_path) != source_identity
+                or _geometry_cache_runtime(needs_reproject) != runtime
+            ):
+                raise RuntimeError("Polygon source or processing environment changed during calculation")
+
+        def prepare(target):
+            _prepare_aggregate_vector_for_rasterization(
+                aggregate_vector_path, aggregate_layer_name, target,
+                raster_info["projection_wkt"], simplify_tolerance, needs_reproject,
+            )
+            verify_geometry_inputs()
+
+        if reuse_geometry:
+            projected_vector_path, prepared_hit = raster_cache.artifact(
+                shared_cache, "polygons", prepared_key, "projected_vector.gpkg", prepare,
+                lambda path: _validate_prepared_geometry(path, source_layer_name, raster_info["projection_wkt"]),
+                notify=cache_message,
+            )
+            if prepared_hit:
+                cache_message("reusing prepared polygons")
+        else:
+            prepare(projected_vector_path)
         progress_n += 1
         progress_queue.put(
             {
@@ -1881,6 +2031,7 @@ def fast_zonal_statistics(
         )
 
         if has_no_intersection:
+            verify_geometry_inputs()
             logger.error(
                 "aggregate vector %s does not intersect with the raster %s: vector extent %s vs raster bounding box %s",
                 str(aggregate_vector_path),
@@ -1930,19 +2081,27 @@ def fast_zonal_statistics(
         aggregate_layer = None
         aggregate_vector = None
 
-        rasterize_start_progress = progress_n
-        rasterize_progress_count = _rasterize_aggregate_fids(
-            raster_path_for_stats,
-            projected_vector_path,
-            aggregate_layer_name,
-            feature_id_raster_path,
-            feature_id_raster_nodata,
-            progress_queue,
-            progress_id,
-            rasterize_start_progress,
-            rasterize_worker_count=rasterize_worker_count,
-        )
-        progress_n += rasterize_progress_count
+        grid = _id_raster_grid(raster_path_for_stats) if reuse_geometry else None
+
+        def rasterize(target):
+            _rasterize_aggregate_fids(
+                raster_path_for_stats, projected_vector_path, aggregate_layer_name,
+                target, feature_id_raster_nodata, progress_queue, progress_id,
+                progress_n, rasterize_worker_count=rasterize_worker_count,
+            )
+            if reuse_geometry and _id_raster_grid(raster_path_for_stats) != grid:
+                raise RuntimeError("Service raster grid changed during polygon rasterization")
+
+        if reuse_geometry:
+            feature_id_raster_path, ids_hit = raster_cache.artifact(
+                shared_cache, "ids", {"prepared": prepared_key, "grid": grid},
+                "agg_fid.tif", rasterize,
+                lambda path: _validate_id_raster(path, grid), notify=cache_message,
+            )
+            if ids_hit:
+                cache_message("reusing polygon-ID raster")
+        else:
+            rasterize(feature_id_raster_path)
         progress_queue.put(
             {
                 "event": "analysis_phase",
@@ -2144,6 +2303,7 @@ def fast_zonal_statistics(
             group_stats.pop("sumsq", None)
         logger.debug("grouping done | groups=%d", len(grouped_stats))
         logger.debug("fast_zonal_statistics done")
+        verify_geometry_inputs()
         result = _requested_result(grouped_stats)
         progress_queue.put({
             "event": "analysis_update", "id": progress_id, "increment": 1,

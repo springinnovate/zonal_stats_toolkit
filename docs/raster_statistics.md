@@ -29,6 +29,46 @@ worker memory. Raster blocks and other working arrays still use memory, and
 concurrent workers multiply that requirement. Dense blocks taking the fallback
 can remain slower than blocks using grouped reductions.
 
+## Reusing geometry
+
+Raster jobs automatically share prepared polygons and polygon-ID rasters under
+`<job working directory>/geometry_cache/`. A prepared polygon file can serve
+rasters with the same target CRS and preparation settings. A polygon-ID raster
+can serve rasters with the same complete grid and storage layout. Each service
+still reads its own pixel values, applies its own NoData rules, and computes
+fresh statistics.
+
+Cache keys include:
+
+- SHA-256 hashes of the source vector and its sidecars, including geometry,
+  attributes, feature order, and IDs; the selected layer is also part of the key.
+- Target CRS, reprojection and simplification settings, toolkit code, spatial
+  library versions, and relevant GDAL/PROJ configuration and local resources.
+- For polygon-ID rasters, the exact affine transform, dimensions, CRS, storage
+  block layout, rasterization options, tile size, and prepared-polygon identity.
+
+Matching pixel size alone is insufficient. Different grids or polygon shards
+use separate entries. Changing service-raster values or NoData does not require
+new polygon geometry, but it always produces freshly calculated statistics.
+
+Workers lock each cache entry while building or checking it. A completed entry
+is published atomically with a manifest; a hit requires checksum and metadata
+validation. Invalid or incomplete entries are rebuilt. Source changes detected
+during a calculation cause it to fail instead of publishing results against a
+stale geometry snapshot. Cache checks include file hashing, so a hit still has
+an I/O cost.
+
+Caching supports local GeoPackage, SQLite, Shapefile, File Geodatabase, GeoJSON,
+and FlatGeobuf inputs. Unsupported or indirect inputs, active database journals,
+and network-enabled or explicitly file-referenced coordinate transformations
+bypass reuse and use the independent calculation path.
+
+The cache persists when ordinary per-raster work files are cleaned. A later run
+using the same job working directory can reuse it; a new working directory
+starts a new cache. To reclaim space, remove that job's `geometry_cache`
+directory only when no process is using it. Interrupted builds may leave
+unpublished staging directories, which are never treated as cache hits.
+
 ## Reading progress
 
 Each raster reports separate phases for input preparation, polygon tile
@@ -42,6 +82,8 @@ Empty blocks count as completed after the polygon-ID check. Block sizes and
 feature counts differ, so the ETA is approximate; an individual raster read,
 sort, or geometry operation may have no intermediate update. Failed or cancelled
 work closes at its actual count rather than displaying successful completion.
+Cache messages distinguish building, waiting for another worker, and reusing a
+validated artifact.
 
 ## Python callers
 
@@ -49,3 +91,21 @@ work closes at its actual count rather than displaying successful completion.
 metrics, plus any percentiles requested through `percentile_list`. Omitting
 `operations` retains the full-statistics interface. The CLI supplies the job's
 requested operations automatically.
+
+Set `reuse_geometry=False` to compare against independently rebuilt geometry.
+Set `geometry_cache_dir` to share a cache across different working directories;
+the input and processing checks still apply. The default is
+`working_dir/geometry_cache`.
+
+## Benchmarking reuse
+
+`benchmarks/benchmark_geometry_cache.py` compares uncached calculations, an empty
+geometry cache shared by matching rasters, and a repeat with populated entries.
+It checks exact sums and reports elapsed time and preparation/rasterization call
+counts. Run it with `--help` for source-vector, raster-window, and repeat options.
+Use `--service-workers` to measure concurrent rasters; `--rasterize-workers`
+sets tile concurrency within each raster calculation. The benchmark includes
+service-worker startup and shutdown when using more than one service worker.
+The benchmark creates isolated temporary inputs; it does not modify the sources.
+Its cold-cache case refers to geometry artifacts, not the operating-system file
+cache. Subset results are not a forecast for a full parallel assessment.
