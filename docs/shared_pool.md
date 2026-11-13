@@ -30,6 +30,17 @@ event labeled by its own group. Results are staged until every raster for a
 group succeeds; a failed raster does not publish an incomplete group. Groups
 that finished before a later failure can remain published.
 
+Prepared polygons and polygon-ID rasters are cached in
+`<job working directory>/geometry_cache/`, shared by that job's raster tasks.
+Matching rasters reuse these artifacts under the existing cache locks and
+content checks; each service reads its own values and NoData settings.
+Temporary raster work and result tables are removed after use, while validated
+geometry entries remain available after success or failure. A later invocation
+can reuse them with the same job working directory and matching inputs/settings.
+A new working directory starts a new cache. See
+[geometry reuse](raster_statistics.md#reusing-geometry) for invalidation rules
+and safe cleanup.
+
 The worker budget controls concurrency, not whether previous results are
 reused. A calling pipeline remains responsible for selecting saved zonal
 outputs and passing only jobs that need computation.

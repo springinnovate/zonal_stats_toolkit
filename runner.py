@@ -3127,6 +3127,8 @@ def _raster_zonal_stats_dataframe(
     tag: str,
     rasterize_worker_count: int | None,
     max_simplify_tolerance_meters: float,
+    *,
+    geometry_cache_dir: Path | None = None,
 ) -> tuple[int, pd.DataFrame, list[str]]:
     """Compute one raster's zonal statistics and convert them to a dataframe.
 
@@ -3146,6 +3148,8 @@ def _raster_zonal_stats_dataframe(
         rasterize_worker_count: Tile rasterization worker count for this raster.
         max_simplify_tolerance_meters: Maximum physical simplification distance
             in metres. Set to 0 to disable geometry simplification.
+        geometry_cache_dir: Optional persistent cache outside per-raster
+            temporary work. Defaults to the cache under workdir.
 
     Returns:
         Tuple of original raster index, result dataframe, and area-assumption
@@ -3172,6 +3176,7 @@ def _raster_zonal_stats_dataframe(
             progress_queue=progress_queue,
             progress_id=f"raster:{tag}:{base_raster_path.stem}",
             operations=core_ops,
+            geometry_cache_dir=geometry_cache_dir,
         )
         raster_rows = []
         for group_value, statistics in grouped_stats.items():
@@ -3499,8 +3504,9 @@ def _shared_raster_task(job, raster_index, result_path, progress_queue):
     pct_keys = [f"p{int(p) if p.is_integer() else p}" for p in pct_list]
     result_path = Path(result_path)
     tag = job.get("_shared_progress_tag", job["tag"])
-    # Each raster gets its own cache paths, including when two groups use the
-    # same source raster. Release large rasterization intermediates immediately.
+    # Keep scratch private to each raster, but retain reusable geometry outside
+    # both temporary directories. Content keys and locks isolate distinct
+    # vectors/grids and coordinate workers using matching geometry.
     with tempfile.TemporaryDirectory(
         prefix="raster_", dir=result_path.parent,
     ) as workdir:
@@ -3522,6 +3528,7 @@ def _shared_raster_task(job, raster_index, result_path, progress_queue):
                 "max_simplify_tolerance_meters",
                 _DEFAULT_MAX_SIMPLIFY_TOLERANCE_METERS,
             ),
+            geometry_cache_dir=Path(job["workdir"]) / "geometry_cache",
         )
         result_table.to_pickle(result_path)
     return {"raster_index": raster_index, "area_hectare_assumptions": assumptions}
