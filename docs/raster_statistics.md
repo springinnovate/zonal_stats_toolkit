@@ -38,6 +38,10 @@ can serve rasters with the same complete grid and storage layout. Each service
 still reads its own pixel values, applies its own NoData rules, and computes
 fresh statistics.
 
+This also applies to the shared worker pool (`--total-workers`): per-raster
+temporary directories hold scratch files, while reusable geometry stays in
+the job's persistent cache directory.
+
 Cache keys include:
 
 - SHA-256 hashes of the source vector and its sidecars, including geometry,

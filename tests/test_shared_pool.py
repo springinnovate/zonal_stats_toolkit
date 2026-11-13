@@ -1,6 +1,7 @@
 """Exercise the shared budget with real spawned workers and tiny GIS inputs."""
 
 from concurrent.futures import ProcessPoolExecutor
+from collections import Counter
 import logging
 import multiprocessing
 import os
@@ -12,7 +13,7 @@ import threading
 import geopandas as gpd
 from geopandas.testing import assert_geodataframe_equal
 import numpy as np
-from osgeo import gdal, osr
+from osgeo import gdal, ogr, osr
 import pandas as pd
 import pytest
 from shapely.geometry import box
@@ -24,7 +25,8 @@ def _forbid_nested_pool(*args, **kwargs):
     raise AssertionError("a shared worker tried to create a nested process pool")
 
 
-def _tracked_task(function, args, kwargs, state, lock, first_pair, events):
+def _tracked_task(function, args, kwargs, state, lock, first_pair, events,
+                  cache_events=None, fail_after_raster=None):
     """Run in a spawned process; instrument actual raster and publish work."""
     assert all(os.environ.get(name) == "1" for name in runner._SHARED_THREAD_ENV_VARS)
     assert gdal.GetConfigOption("GDAL_NUM_THREADS") == "1"
@@ -35,12 +37,33 @@ def _tracked_task(function, args, kwargs, state, lock, first_pair, events):
         state["active"] += 1
         state["peak"] = max(state["peak"], state["active"])
     events.append((function.__name__, args[0]["tag"]))
+    prepare = runner._prepare_aggregate_vector_for_rasterization
+    burn = runner._rasterize_aggregate_fids
+    if cache_events is not None:
+        # Install spies inside spawned workers; parent monkeypatches do not
+        # cross the Windows spawn boundary. Record builds, not just manifests.
+        def observed_prepare(*build_args, **build_kwargs):
+            cache_events.append(("prepare", args[0]["tag"]))
+            return prepare(*build_args, **build_kwargs)
+
+        def observed_burn(*build_args, **build_kwargs):
+            cache_events.append(("burn", args[0]["tag"]))
+            return burn(*build_args, **build_kwargs)
+
+        runner._prepare_aggregate_vector_for_rasterization = observed_prepare
+        runner._rasterize_aggregate_fids = observed_burn
     try:
         # Both first workers must actually execute, not just be submitted.
         if sequence <= 2:
             first_pair.wait(timeout=40)
-        return function(*args, **kwargs)
+        result = function(*args, **kwargs)
+        if (function.__name__ == "_shared_raster_task"
+                and args[1] == fail_after_raster):
+            raise RuntimeError("injected failure after geometry caching")
+        return result
     finally:
+        runner._prepare_aggregate_vector_for_rasterization = prepare
+        runner._rasterize_aggregate_fids = burn
         with lock:
             state["active"] -= 1
 
@@ -48,7 +71,8 @@ def _tracked_task(function, args, kwargs, state, lock, first_pair, events):
 class _RecordingExecutor:
     """Delegate to a real spawn pool while recording the scheduler's budget."""
 
-    def __init__(self, state, lock, first_pair, events, *args, **kwargs):
+    def __init__(self, state, lock, first_pair, events, *args,
+                 cache_events=None, fail_after_raster=None, **kwargs):
         self.max_workers = kwargs["max_workers"]
         self.start_method = kwargs["mp_context"].get_start_method()
         self.pool = ProcessPoolExecutor(*args, **kwargs)
@@ -56,6 +80,8 @@ class _RecordingExecutor:
         self.lock = lock
         self.first_pair = first_pair
         self.events = events
+        self.cache_events = cache_events
+        self.fail_after_raster = fail_after_raster
         self.submissions = []
         self.pending = 0
         self.peak_pending = 0
@@ -69,6 +95,7 @@ class _RecordingExecutor:
         future = self.pool.submit(
             _tracked_task, function, args, kwargs,
             self.state, self.lock, self.first_pair, self.events,
+            self.cache_events, self.fail_after_raster,
         )
 
         def completed(_future):
@@ -167,6 +194,170 @@ def _drain_events(progress_queue):
             return events
 
 
+def _assert_no_shared_scratch(job):
+    # Completed cache artifacts persist; per-task/spooled scratch must not.
+    assert {path.name for path in Path(job["workdir"]).iterdir()} <= {"geometry_cache"}
+
+
+def _new_outputs(jobs, label):
+    return [dict(job, output_csv=job["output_csv"].with_name(f"{label}_{job['tag']}.csv"),
+                 output_gpkg=job["output_gpkg"].with_name(f"{label}_{job['tag']}.gpkg"))
+            for job in jobs]
+
+
+def _assert_matches_uncached_reference(job, tmp_path):
+    """Compare each published statistic with independently run, uncached zonals."""
+    actual = pd.read_csv(job["output_csv"], dtype={"GAP_Sts": str},
+                         float_precision="round_trip").set_index("feature_id").sort_index()
+    vector = gpd.read_file(job["output_gpkg"], layer="zones").set_index("feature_id").sort_index()
+    source = gpd.read_file(job["agg_vector"], layer="zones").set_index("feature_id").sort_index()
+    assert set(vector.columns) == set(actual.columns) | set(source.columns)
+    stored = pd.DataFrame(vector[actual.columns])
+    # CSV prints float32's shortest representation; restore its stored dtype
+    # before requiring exact equality, rather than comparing widened decimals.
+    restored = actual.copy()
+    for column in actual:
+        if stored[column].dtype == np.dtype("float32"):
+            restored[column] = restored[column].astype(np.float32)
+    pd.testing.assert_frame_equal(restored, stored, check_exact=True, check_dtype=False)
+    assert_geodataframe_equal(vector[source.columns], source)
+    for raster in job["base_raster_path_list"]:
+        expected = runner.fast_zonal_statistics(
+            (raster, 1), job["agg_vector"], job["agg_field"],
+            aggregate_layer_name="zones", operations=[operation for operation in job["operations"]
+                                                       if not operation.startswith("p")],
+            percentile_list=[50], working_dir=tmp_path / "reference" / job["tag"] / raster.stem,
+            rasterize_worker_count=1, max_simplify_tolerance_meters=0,
+            reuse_geometry=False, progress_queue=queue.Queue(), progress_id="reference",
+        )
+        for metric in next(iter(expected.values())):
+            expected_values = pd.Series({key: values[metric] for key, values in expected.items()}).sort_index()
+            actual_values = actual[f"{metric}_{raster.stem}"]
+            if expected_values.dtype == np.dtype("float32"):
+                actual_values = actual_values.astype(np.float32)
+            pd.testing.assert_series_equal(
+                actual_values, expected_values,
+                check_exact=True, check_dtype=False, check_names=False,
+            )
+
+
+@pytest.fixture
+def cache_tracking_pool(monkeypatch):
+    """Use the existing real-spawn recorder to observe cache work across runs."""
+    with multiprocessing.get_context("spawn").Manager() as manager:
+        cache_events = manager.list()
+
+        def run(jobs, progress, *, fail_after_raster=None):
+            state = manager.dict(started=0, active=0, peak=0)
+            lock, first_pair, events = manager.Lock(), manager.Barrier(2), manager.list()
+
+            def executor_factory(*args, **kwargs):
+                return _RecordingExecutor(
+                    state, lock, first_pair, events, *args, cache_events=cache_events,
+                    fail_after_raster=fail_after_raster, **kwargs,
+                )
+
+            with monkeypatch.context() as patch:
+                patch.setattr(runner, "ProcessPoolExecutor", executor_factory)
+                runner.run_shared_raster_jobs(_job_run_list(jobs), 2, logging.WARNING, progress)
+            assert state["peak"] <= 2
+
+        yield run, cache_events
+
+
+def test_shared_geometry_cache_survives_scratch_cleanup_and_recomputes_service_values(
+    tmp_path, raster_jobs, progress_queue, cache_tracking_pool,
+):
+    run, builds = cache_tracking_pool
+    run(raster_jobs, progress_queue)
+    assert Counter(builds) == Counter({(kind, job["tag"]): 1
+                                      for kind in ("prepare", "burn") for job in raster_jobs})
+    cold = []
+    for group_index, job in enumerate(raster_jobs):
+        _assert_no_shared_scratch(job)
+        _assert_matches_uncached_reference(job, tmp_path)
+        cache = job["workdir"] / "geometry_cache"
+        assert len(list((cache / "polygons").glob("*/manifest.json"))) == 1
+        assert len(list((cache / "ids").glob("*/manifest.json"))) == 1
+        actual = pd.read_csv(job["output_csv"])
+        base_sums = np.array([54, 76] if group_index == 0 else [100, 30])
+        for index, raster in enumerate(job["base_raster_path_list"], start=1):
+            np.testing.assert_array_equal(actual[f"sum_{raster.stem}"], base_sums * index)
+        cold.append(actual)
+
+    # The same raster path/grid now has different values and a different NoData.
+    # Its sums must be fresh, while both prepared geometry and ID pixels reuse.
+    dataset = gdal.Open(str(raster_jobs[0]["base_raster_path_list"][0]), gdal.GA_Update)
+    values = np.full((4, 4), 5, dtype=np.float32)
+    values[0, 0] = -9999
+    dataset.GetRasterBand(1).WriteArray(values)
+    dataset.GetRasterBand(1).SetNoDataValue(-9999)
+    dataset = None
+    before = list(builds)
+    warm = _new_outputs(raster_jobs, "warm")
+    run(warm, progress_queue)
+    assert list(builds) == before
+    for group_index, (job, previous) in enumerate(zip(warm, cold)):
+        _assert_no_shared_scratch(job)
+        _assert_matches_uncached_reference(job, tmp_path)
+        actual = pd.read_csv(job["output_csv"])
+        np.testing.assert_array_equal(actual["sum_z_value"],
+                                      [35, 40] if group_index == 0 else [40, 35])
+        assert not actual["sum_z_value"].equals(previous["sum_z_value"])
+        unchanged = [column for column in actual if not column.endswith("_z_value")]
+        pd.testing.assert_frame_equal(actual[unchanged], previous[unchanged], check_exact=True)
+
+
+@pytest.mark.parametrize("change", ["grid", "source"])
+def test_shared_geometry_cache_invalidates_changed_grid_or_source(
+    tmp_path, raster_jobs, progress_queue, cache_tracking_pool, change,
+):
+    run, builds = cache_tracking_pool
+    job = raster_jobs[0]
+    run([job], progress_queue)
+    assert Counter(builds) == Counter({("prepare", job["tag"]): 1, ("burn", job["tag"]): 1})
+    before = len(builds)
+    if change == "grid":
+        dataset = gdal.Open(str(job["base_raster_path_list"][0]), gdal.GA_Update)
+        dataset.SetGeoTransform((1, 1, 0, 4, 0, -1))
+        dataset = None
+    else:
+        dataset = ogr.Open(str(job["agg_vector"]), 1)
+        layer = dataset.GetLayerByName("zones")
+        feature = layer.GetFeature(1)
+        feature.SetGeometry(ogr.CreateGeometryFromWkt(box(0, 0, 1, 4).wkt))
+        feature.SetField("original_name", "Changed original name")
+        assert layer.SetFeature(feature) == 0
+        feature, layer, dataset = None, None, None
+    updated, = _new_outputs([job], "updated")
+    run([updated], progress_queue)
+    expected_builds = Counter({("burn", job["tag"]): 1})
+    if change == "source":
+        expected_builds[("prepare", job["tag"])] = 1
+    assert Counter(list(builds)[before:]) == expected_builds
+    _assert_no_shared_scratch(updated)
+    _assert_matches_uncached_reference(updated, tmp_path)
+
+
+def test_shared_geometry_cache_survives_failed_task_and_is_reused_on_retry(
+    tmp_path, raster_jobs, progress_queue, cache_tracking_pool,
+):
+    run, builds = cache_tracking_pool
+    job = raster_jobs[0]
+    with pytest.raises(RuntimeError, match="failed"):
+        run([job], progress_queue, fail_after_raster=0)
+    assert not job["output_csv"].exists()
+    assert not job["output_gpkg"].exists()
+    _assert_no_shared_scratch(job)
+    assert Counter(builds) == Counter({("prepare", job["tag"]): 1, ("burn", job["tag"]): 1})
+    before = list(builds)
+    retried, = _new_outputs([job], "retry")
+    run([retried], progress_queue)
+    assert list(builds) == before
+    _assert_no_shared_scratch(retried)
+    _assert_matches_uncached_reference(retried, tmp_path)
+
+
 def test_real_shared_pool_caps_workers_and_matches_legacy(
     monkeypatch, tmp_path, raster_jobs, progress_queue,
 ):
@@ -251,7 +442,7 @@ def test_real_shared_pool_caps_workers_and_matches_legacy(
         assert actual_gpkg["original_name"].tolist() == [
             "First original name", "Second original name"
         ]
-        assert not list(actual_job["workdir"].iterdir())
+        _assert_no_shared_scratch(actual_job)
 
 
 @pytest.mark.parametrize("extra_args", [
@@ -310,7 +501,7 @@ def test_shared_raster_failure_does_not_publish_partial_group(
     assert "missing_raster" in str(caught.value)
     assert not job["output_csv"].exists()
     assert not job["output_gpkg"].exists()
-    assert not list(job["workdir"].iterdir())
+    _assert_no_shared_scratch(job)
     assert os.environ["OMP_NUM_THREADS"] == "13"
 
 
