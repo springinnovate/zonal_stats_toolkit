@@ -59,6 +59,10 @@ agg_field = STATEFP,COUNTYFP,GEOID
 # used by `valid_count`.
 # `proportion_valid_nonzero` is the count of valid, nonzero pixels divided by
 # `total_count`, so nodata pixels are included in the denominator.
+# Request only the metrics you need. `operations = sum` computes sums without
+# accumulating counts, minima/maxima, squared sums, or percentiles. Other
+# operations compute their required dependencies automatically.
+# See docs/raster_statistics.md for calculation and progress details.
 operations = sum, mean, stdev, min, max, total_count, valid_count, p5, p50, p95, area_ha_total, area_ha_valid, proportion_valid_nonzero
 
 base_raster_pattern = ./rasters/*.tif

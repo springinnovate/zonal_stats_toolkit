@@ -15,6 +15,7 @@ import os
 import queue
 import shutil
 import tempfile
+import time
 
 for _thread_env_var in (
     "OPENBLAS_NUM_THREADS",
@@ -46,6 +47,7 @@ _RASTERIZE_TILE_SIZE = 1024
 _RASTERIZE_WORKER_COUNT = 4
 _DEFAULT_MAX_SIMPLIFY_TOLERANCE_METERS = 15.0
 _SIMPLIFICATION_PART_SIZE_FACTOR = 10.0
+_RASTER_GROUP_SORT_BUDGET_BYTES = 256 * 1024 * 1024
 
 
 AREA_HECTARE_OPERATIONS = {
@@ -215,6 +217,11 @@ def _run_zonal_stats_job_process(output_label, job_kwargs, log_level, job_worker
 def _progress_monitor(progress_queue, total_jobs):
     """Render runner progress events as tqdm bars.
 
+    ``analysis_phase`` starts a separately timed phase at zero. Its ``total``
+    may be None when the amount of work is unknown. ``analysis_update`` counts
+    completed units; an increment of zero only refreshes the phase message.
+    Failed or cancelled close events leave the actual completed count intact.
+
     Args:
         progress_queue: Queue-like object receiving progress event dictionaries.
         total_jobs: Number of `[job:...]` sections expected to finish.
@@ -248,9 +255,11 @@ def _progress_monitor(progress_queue, total_jobs):
                 continue
 
             if event_type == "job_done":
-                job_bar.update(1)
+                status = event.get("status", "done")
+                if status == "done":
+                    job_bar.update(1)
                 job_bar.set_postfix_str(
-                    f'{event.get("tag", "job")} {event.get("status", "done")}',
+                    f'{event.get("tag", "job")} {status}',
                     refresh=True,
                 )
                 continue
@@ -295,6 +304,20 @@ def _progress_monitor(progress_queue, total_jobs):
             if progress_bar is None:
                 continue
 
+            if event_type == "analysis_phase":
+                # A cheap rasterization tile and a large statistics block are
+                # different units of work. Reset timing as well as the count so
+                # the new phase's rate and ETA do not include the previous one.
+                progress_bar.total = event.get("total")
+                progress_bar.unit = event.get("unit", progress_bar.unit)
+                phase = event.get("phase")
+                if phase:
+                    progress_bar.set_postfix_str(phase, refresh=False)
+                progress_bar.reset(total=progress_bar.total)
+                if phase:
+                    _show_active_phase(phase)
+                continue
+
             if event_type == "analysis_total":
                 progress_bar.total = event.get("total", progress_bar.total)
                 progress_bar.unit = event.get("unit", progress_bar.unit)
@@ -330,8 +353,14 @@ def _progress_monitor(progress_queue, total_jobs):
                 if phase:
                     progress_bar.set_postfix_str(phase, refresh=True)
                     _show_active_phase(phase)
+                status = str(event.get("status", phase or "done")).lower()
+                unsuccessful = any(
+                    word in status for word in ("fail", "error", "cancel", "interrupt")
+                )
                 if (
-                    progress_bar.total is not None
+                    not unsuccessful
+                    and event.get("complete", True)
+                    and progress_bar.total is not None
                     and progress_bar.n < progress_bar.total
                 ):
                     progress_bar.update(progress_bar.total - progress_bar.n)
@@ -941,8 +970,8 @@ def _rasterize_aggregate_fids(
         target_nodata: Nodata value for pixels outside aggregation features.
         progress_queue: Queue-like object receiving progress events.
         progress_id: Progress bar identifier to update.
-        progress_start_value: Existing progress value before rasterization
-            starts.
+        progress_start_value: Legacy cumulative offset, retained for callers.
+            Displayed rasterization and stitching phases each start at zero.
         tile_size: Maximum tile width and height in pixels.
         rasterize_worker_count: Number of tile worker processes, or `None` to
             use the default.
@@ -1007,9 +1036,9 @@ def _rasterize_aggregate_fids(
     progress_steps = len(tile_specs) + 1
     progress_queue.put(
         {
-            "event": "analysis_total",
+            "event": "analysis_phase",
             "id": progress_id,
-            "total": progress_start_value + progress_steps,
+            "total": len(tile_specs),
             "unit": "tile",
             "phase": "rasterizing polygon tiles",
         },
@@ -1023,7 +1052,9 @@ def _rasterize_aggregate_fids(
                 "event": "analysis_update",
                 "id": progress_id,
                 "increment": 1,
-                "phase": "rasterizing polygon tiles",
+                "phase": (
+                    f"rasterizing polygon tiles {completed_tiles}/{len(tile_specs)}"
+                ),
             },
         )
 
@@ -1049,8 +1080,10 @@ def _rasterize_aggregate_fids(
 
         progress_queue.put(
             {
-                "event": "analysis_update",
+                "event": "analysis_phase",
                 "id": progress_id,
+                "total": 1,
+                "unit": "step",
                 "increment": 0,
                 "phase": "stitching rasterized tiles",
             },
@@ -1498,6 +1531,71 @@ def parse_and_validate_config(cfg_path: Path) -> dict:
     }
 
 
+def _group_raster_values(feature_ids, raster_values):
+    """Yield pixel values grouped by feature without repeated full-array scans.
+
+    Stable sorting keeps the original pixel order within each feature, so
+    NumPy reductions receive the same values in the same order as boolean
+    selection. Memory depends on pixel count, not the largest feature ID.
+    Dense blocks exceeding the sorting scratch-space estimate use the original
+    per-feature selection, preserving block boundaries and summation order.
+
+    Args:
+        feature_ids: One-dimensional integer IDs for occupied pixels.
+        raster_values: Matching one-dimensional source pixel values.
+
+    Yields:
+        Tuples of feature ID and the feature's contiguous value array.
+    """
+    if feature_ids.size == 0:
+        return
+    # Allow for the intp permutation, stable-sort workspace, boundary arrays,
+    # and ID/value copies, including the worst case of one group per pixel.
+    # This is a conservative allocation estimate, not a process RSS limit.
+    sort_bytes = feature_ids.size * (
+        8 * np.dtype(np.intp).itemsize
+        + 2 * feature_ids.dtype.itemsize + raster_values.dtype.itemsize
+    )
+    if sort_bytes > _RASTER_GROUP_SORT_BUDGET_BYTES:
+        for feature_id in np.unique(feature_ids):
+            yield feature_id, raster_values[feature_ids == feature_id]
+        return
+    order = np.argsort(feature_ids, kind="stable")
+    sorted_ids = feature_ids[order]
+    starts = np.r_[0, np.flatnonzero(sorted_ids[1:] != sorted_ids[:-1]) + 1]
+    ids = sorted_ids[starts]
+    ends = np.r_[starts[1:], sorted_ids.size]
+    del sorted_ids, feature_ids
+    sorted_values = raster_values[order]
+    del order, raster_values
+    for feature_id, start, end in zip(ids, starts, ends):
+        yield feature_id, sorted_values[start:end]
+
+
+def _raster_stat_dependencies(operations):
+    """Return per-feature accumulators needed for the requested raster metrics."""
+    if operations is None:
+        return {"min", "max", "total_count", "nodata_count",
+                "valid_nonzero_count", "sum", "sumsq"}
+    fields = set()
+    for operation in operations:
+        if operation in {"sum", "mean", "stdev"}:
+            fields.add("sum")
+        if operation == "stdev":
+            fields.add("sumsq")
+        if operation in {"min", "max"}:
+            fields.add(operation)
+        if operation in {"total_count", "valid_count", "mean", "stdev",
+                         "min", "max", "proportion_valid_nonzero",
+                         "area_ha_total", "area_ha_valid"}:
+            fields.add("total_count")
+        if operation in {"valid_count", "mean", "stdev", "min", "max", "area_ha_valid"}:
+            fields.add("nodata_count")
+        if operation == "proportion_valid_nonzero":
+            fields.add("valid_nonzero_count")
+    return fields
+
+
 def fast_zonal_statistics(
     base_raster_path_band,
     aggregate_vector_path,
@@ -1513,7 +1611,21 @@ def fast_zonal_statistics(
     *,
     progress_queue,
     progress_id,
+    operations=None,
 ):
+    """Summarize pixel-center samples, computing only requested dependencies.
+
+    ``operations=None`` retains the full-statistics API. Explicit operations
+    return only those fields and requested percentiles. Geometry preparation,
+    NoData policy, within-feature pixel order, and block order are unchanged.
+    """
+    requested = None if operations is None else set(operations)
+    if requested is not None:
+        invalid = requested - (VALID_OPERATIONS - MEASURE_OPERATIONS)
+        if invalid:
+            raise ValueError(f"Unsupported raster operations: {sorted(invalid)}")
+        calculate_area_ha = bool(requested & AREA_HECTARE_OPERATIONS)
+    stat_fields = _raster_stat_dependencies(requested)
     raster_path, raster_band_index = base_raster_path_band
     aggregate_vector_fields = aggregate_vector_field
     aggregate_vector_field_label = ",".join(aggregate_vector_fields)
@@ -1569,6 +1681,7 @@ def fast_zonal_statistics(
         "area_ha_total": 0.0,
         "area_ha_valid": 0.0,
         "sum": 0.0,
+        "mean": None,
         "stdev": None,
         **percentile_default_values,
     }
@@ -1585,6 +1698,29 @@ def fast_zonal_statistics(
         "sum": 0.0,
         "sumsq": 0.0,
     }
+    feature_stats_template = {
+        field: value for field, value in feature_stats_template.items()
+        if field in stat_fields
+    }
+    if requested is not None:
+        output_fields = requested | set(percentile_keys)
+        empty_group_stats_template = {
+            field: value for field, value in empty_group_stats_template.items()
+            if field in output_fields
+        }
+        grouped_stats_working_template = {
+            field: value for field, value in grouped_stats_working_template.items()
+            if field in output_fields | stat_fields
+        }
+
+    def _requested_result(grouped_stats):
+        if requested is None:
+            return dict(grouped_stats)
+        fields = sorted(requested | set(percentile_keys))
+        return {
+            group: {field: values[field] for field in fields}
+            for group, values in grouped_stats.items()
+        }
 
     raster_info = geoprocessing.get_raster_info(raster_path)
     raster_nodata = raster_info["nodata"][raster_band_index - 1]
@@ -1768,7 +1904,7 @@ def fast_zonal_statistics(
                     "phase": "no intersection",
                 },
             )
-            return grouped_stats
+            return _requested_result(grouped_stats)
 
         raster_path_for_stats = raster_path
         logger.debug("opening raster for read: %s", raster_path_for_stats)
@@ -1809,9 +1945,10 @@ def fast_zonal_statistics(
         progress_n += rasterize_progress_count
         progress_queue.put(
             {
-                "event": "analysis_update",
+                "event": "analysis_phase",
                 "id": progress_id,
-                "increment": 1,
+                "total": None,
+                "unit": "step",
                 "phase": "preparing raster blocks",
             },
         )
@@ -1830,11 +1967,11 @@ def fast_zonal_statistics(
         )
         progress_queue.put(
             {
-                "event": "analysis_total",
+                "event": "analysis_phase",
                 "id": progress_id,
-                "total": progress_n + len(feature_id_raster_offsets) + 2,
+                "total": len(feature_id_raster_offsets),
                 "unit": "block",
-                "phase": "processing raster blocks",
+                "phase": f"completed raster blocks 0/{len(feature_id_raster_offsets)}",
             },
         )
 
@@ -1847,46 +1984,56 @@ def fast_zonal_statistics(
         group_sketch = None
         if percentile_list:
             group_sketch = defaultdict(lambda: kll_floats_sketch(k=200))
+        def _report_completed_block(block_index):
+            progress_queue.put({
+                "event": "analysis_update", "id": progress_id, "increment": 1,
+                "phase": f"completed raster blocks {block_index + 1}/{len(feature_id_raster_offsets)}",
+            })
+
         for block_index, feature_id_offset in enumerate(feature_id_raster_offsets):
-            progress_queue.put(
-                {
-                    "event": "analysis_update",
-                    "id": progress_id,
-                    "increment": 1,
-                    "phase": (
-                        f"processing raster blocks {block_index + 1}/"
-                        f"{len(feature_id_raster_offsets)}"
-                    ),
-                },
-            )
-
+            block_label = f"processing raster block {block_index + 1}/{len(feature_id_raster_offsets)}"
+            progress_queue.put({
+                "event": "analysis_update", "id": progress_id, "increment": 0,
+                "phase": block_label,
+            })
             feature_id_block = feature_id_raster_band.ReadAsArray(**feature_id_offset)
-            raster_value_block = raster_band.ReadAsArray(**feature_id_offset)
-
             in_polygon_mask = feature_id_block != feature_id_raster_nodata
             if not np.any(in_polygon_mask):
+                _report_completed_block(block_index)
                 continue
 
+            raster_value_block = raster_band.ReadAsArray(**feature_id_offset)
             block_feature_ids = feature_id_block[in_polygon_mask]
             block_raster_values = raster_value_block[in_polygon_mask]
+            grouped_values = _group_raster_values(block_feature_ids, block_raster_values)
+            del feature_id_block, raster_value_block, in_polygon_mask
+            del block_feature_ids, block_raster_values
 
-            for feature_id in np.unique(block_feature_ids):
-                feature_values = block_raster_values[block_feature_ids == feature_id]
+            last_progress = time.monotonic()
+            for feature_index, (feature_id, feature_values) in enumerate(
+                grouped_values, start=1
+            ):
+                if feature_index % 256 == 0 and time.monotonic() - last_progress >= 1.0:
+                    progress_queue.put({
+                        "event": "analysis_update", "id": progress_id, "increment": 0,
+                        "phase": f"{block_label}; {feature_index - 1} feature groups complete",
+                    })
+                    last_progress = time.monotonic()
                 total_count = feature_values.size
                 if total_count == 0:
                     continue
 
-                feature_nodata_mask = _raster_nodata_mask(feature_values)
-                nodata_count = int(np.count_nonzero(feature_nodata_mask))
-                valid_feature_values = feature_values[~feature_nodata_mask]
-                valid_nonzero_count = int(
-                    np.count_nonzero(valid_feature_values != 0)
-                )
-
                 feature_stats = feature_stats_by_id[feature_id]
-                feature_stats["total_count"] += total_count
-                feature_stats["nodata_count"] += nodata_count
-                feature_stats["valid_nonzero_count"] += valid_nonzero_count
+                if "total_count" in stat_fields:
+                    feature_stats["total_count"] += total_count
+                if (ignore_nodata or "nodata_count" in stat_fields
+                        or "valid_nonzero_count" in stat_fields):
+                    feature_nodata_mask = _raster_nodata_mask(feature_values)
+                    valid_feature_values = feature_values[~feature_nodata_mask]
+                    if "nodata_count" in stat_fields:
+                        feature_stats["nodata_count"] += int(np.count_nonzero(feature_nodata_mask))
+                    if "valid_nonzero_count" in stat_fields:
+                        feature_stats["valid_nonzero_count"] += int(np.count_nonzero(valid_feature_values != 0))
 
                 if ignore_nodata:
                     feature_values = valid_feature_values
@@ -1898,27 +2045,29 @@ def fast_zonal_statistics(
                     sk = group_sketch[group_value]
                     sk.update(feature_values.astype(np.float32, copy=False).ravel())
 
-                block_min_value = np.min(feature_values)
-                block_max_value = np.max(feature_values)
-                if feature_stats["min"] is None:
-                    feature_stats["min"] = block_min_value
-                    feature_stats["max"] = block_max_value
-                else:
-                    feature_stats["min"] = min(feature_stats["min"], block_min_value)
-                    feature_stats["max"] = max(feature_stats["max"], block_max_value)
-
-                feature_stats["sum"] += np.sum(feature_values)
-                feature_stats["sumsq"] += np.sum(
-                    feature_values * feature_values, dtype=np.float64
-                )
+                for operation, reduce in (("min", np.min), ("max", np.max)):
+                    if operation in stat_fields:
+                        block_value = reduce(feature_values)
+                        previous = feature_stats[operation]
+                        feature_stats[operation] = (block_value if previous is None else
+                                                    (min(previous, block_value) if operation == "min"
+                                                     else max(previous, block_value)))
+                if "sum" in stat_fields:
+                    feature_stats["sum"] += np.sum(feature_values)
+                if "sumsq" in stat_fields:
+                    feature_stats["sumsq"] += np.sum(
+                        feature_values * feature_values, dtype=np.float64
+                    )
+            _report_completed_block(block_index)
 
         logger.debug("aggregating done")
         progress_n += len(feature_id_raster_offsets)
         progress_queue.put(
             {
-                "event": "analysis_update",
+                "event": "analysis_phase",
                 "id": progress_id,
-                "increment": 1,
+                "total": 1,
+                "unit": "step",
                 "phase": "grouping feature statistics",
             },
         )
@@ -1950,41 +2099,16 @@ def fast_zonal_statistics(
             feature_stats = feature_stats_by_id[feature_id]
             group_stats = grouped_stats[group_value]
 
-            group_stats["total_count"] += feature_stats["total_count"]
-            group_stats["nodata_count"] += feature_stats["nodata_count"]
-            group_stats["valid_nonzero_count"] += feature_stats[
-                "valid_nonzero_count"
-            ]
-            group_stats["sum"] += feature_stats["sum"]
-            group_stats["sumsq"] += feature_stats["sumsq"]
-
-            feature_valid_count = (
-                feature_stats["total_count"] - feature_stats["nodata_count"]
-            )
-            if feature_valid_count > 0:
-                if group_stats["min"] is None:
-                    group_stats["min"] = feature_stats["min"]
-                    group_stats["max"] = feature_stats["max"]
-                else:
-                    group_stats["min"] = min(group_stats["min"], feature_stats["min"])
-                    group_stats["max"] = max(group_stats["max"], feature_stats["max"])
-
-        for group_value, group_stats in grouped_stats.items():
-            valid_count = group_stats["total_count"] - group_stats["nodata_count"]
-            group_stats["valid_count"] = valid_count
-            group_stats["proportion_valid_nonzero"] = (
-                group_stats["valid_nonzero_count"] / group_stats["total_count"]
-                if group_stats["total_count"] > 0
-                else 0.0
-            )
-            if raster_pixel_area_ha is not None:
-                group_stats["area_ha_total"] = (
-                    group_stats["total_count"] * raster_pixel_area_ha
-                )
-                group_stats["area_ha_valid"] = valid_count * raster_pixel_area_ha
-            group_stats["mean"] = (
-                (group_stats["sum"] / valid_count) if valid_count > 0 else None
-            )
+            for field in stat_fields - {"min", "max"}:
+                group_stats[field] += feature_stats[field]
+            if stat_fields & {"min", "max"}:
+                feature_valid_count = feature_stats["total_count"] - feature_stats["nodata_count"]
+                if feature_valid_count > 0:
+                    for operation, reduce in (("min", min), ("max", max)):
+                        if operation in stat_fields:
+                            value = feature_stats[operation]
+                            previous = group_stats[operation]
+                            group_stats[operation] = value if previous is None else reduce(previous, value)
 
         if group_sketch is not None:
             for group_value, sk in group_sketch.items():
@@ -1993,93 +2117,38 @@ def fast_zonal_statistics(
                         f"p{int(p) if float(p).is_integer() else p}"
                     ] = (None if sk.is_empty() else sk.get_quantile(p / 100.0))
 
-        for group_value, group_stats in grouped_stats.items():
-            logger.debug(
-                "group=%r start total_count=%r nodata_count=%r sum=%r sumsq=%r keys=%r",
-                group_value,
-                group_stats.get("total_count"),
-                group_stats.get("nodata_count"),
-                group_stats.get("sum"),
-                group_stats.get("sumsq"),
-                sorted(group_stats.keys()),
-            )
-
-            valid_count = group_stats["total_count"] - group_stats["nodata_count"]
-            group_stats["valid_count"] = valid_count
-            group_stats["proportion_valid_nonzero"] = (
-                group_stats["valid_nonzero_count"] / group_stats["total_count"]
-                if group_stats["total_count"] > 0
-                else 0.0
-            )
+        for group_stats in grouped_stats.values():
+            if "nodata_count" in stat_fields:
+                valid_count = group_stats["total_count"] - group_stats["nodata_count"]
+                group_stats["valid_count"] = valid_count
+            if "valid_nonzero_count" in stat_fields:
+                group_stats["proportion_valid_nonzero"] = (
+                    group_stats["valid_nonzero_count"] / group_stats["total_count"]
+                    if group_stats["total_count"] > 0 else 0.0
+                )
             if raster_pixel_area_ha is not None:
-                group_stats["area_ha_total"] = (
-                    group_stats["total_count"] * raster_pixel_area_ha
-                )
-                group_stats["area_ha_valid"] = valid_count * raster_pixel_area_ha
-            logger.debug("group=%r computed valid_count=%r", group_value, valid_count)
-
-            if valid_count > 0:
-                mean_value = group_stats["sum"] / valid_count
-                logger.debug(
-                    "group=%r mean_value=%r (sum=%r / valid_count=%r)",
-                    group_value,
-                    mean_value,
-                    group_stats["sum"],
-                    valid_count,
-                )
-
-                variance_value = (group_stats["sumsq"] / valid_count) - (
-                    mean_value * mean_value
-                )
-                logger.debug(
-                    "group=%r raw variance_value=%r (sumsq/valid_count=%r - mean^2=%r)",
-                    group_value,
-                    variance_value,
-                    group_stats["sumsq"] / valid_count,
-                    mean_value * mean_value,
-                )
-
-                if variance_value < 0:
-                    logger.debug(
-                        "group=%r variance_value < 0, clamping to 0.0 (was %r)",
-                        group_value,
-                        variance_value,
-                    )
-                    variance_value = 0.0
-
-                stdev_value = float(np.sqrt(variance_value))
-                group_stats["stdev"] = stdev_value
-                logger.debug(
-                    "group=%r stdev=%r sqrt(variance_value=%r)",
-                    group_value,
-                    stdev_value,
-                    variance_value,
-                )
-            else:
-                group_stats["stdev"] = None
-                logger.debug(
-                    "group=%r stdev=None because valid_count <= 0 (total_count=%r nodata_count=%r)",
-                    group_value,
-                    group_stats["total_count"],
-                    group_stats["nodata_count"],
-                )
-
-            logger.debug(
-                "group=%r deleting sumsq (current sumsq=%r)",
-                group_value,
-                group_stats.get("sumsq"),
-            )
-            del group_stats["sumsq"]
-
-            logger.debug(
-                "group=%r end valid_count=%r stdev=%r keys_now=%r",
-                group_value,
-                group_stats.get("valid_count"),
-                group_stats.get("stdev"),
-                sorted(group_stats.keys()),
-            )
+                if requested is None or "area_ha_total" in requested:
+                    group_stats["area_ha_total"] = group_stats["total_count"] * raster_pixel_area_ha
+                if requested is None or "area_ha_valid" in requested:
+                    group_stats["area_ha_valid"] = group_stats["valid_count"] * raster_pixel_area_ha
+            if requested is None or requested & {"mean", "stdev"}:
+                valid_count = group_stats["valid_count"]
+                if valid_count > 0:
+                    mean_value = group_stats["sum"] / valid_count
+                    group_stats["mean"] = mean_value
+                    if "sumsq" in stat_fields:
+                        variance_value = group_stats["sumsq"] / valid_count - mean_value * mean_value
+                        if variance_value < 0:
+                            variance_value = 0.0
+                        group_stats["stdev"] = float(np.sqrt(variance_value))
+            group_stats.pop("sumsq", None)
         logger.debug("grouping done | groups=%d", len(grouped_stats))
         logger.debug("fast_zonal_statistics done")
+        result = _requested_result(grouped_stats)
+        progress_queue.put({
+            "event": "analysis_update", "id": progress_id, "increment": 1,
+            "phase": "grouped feature statistics",
+        })
         progress_queue.put(
             {
                 "event": "analysis_close",
@@ -2087,7 +2156,13 @@ def fast_zonal_statistics(
                 "phase": "done",
             },
         )
-        return dict(grouped_stats)
+        return result
+    except Exception:
+        progress_queue.put({
+            "event": "analysis_close", "id": progress_id,
+            "phase": "failed", "status": "failed",
+        })
+        raise
     finally:
         if clean_working_dir:
             logger.debug("cleaning zonal statistics cache dir: %s", cache_working_dir)
@@ -2912,6 +2987,7 @@ def _raster_zonal_stats_dataframe(
             max_simplify_tolerance_meters=max_simplify_tolerance_meters,
             progress_queue=progress_queue,
             progress_id=f"raster:{tag}:{base_raster_path.stem}",
+            operations=core_ops,
         )
         raster_rows = []
         for group_value, statistics in grouped_stats.items():
